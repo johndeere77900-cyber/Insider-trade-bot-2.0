@@ -1,1 +1,0 @@
-# Insider-trade-bot-2.0
