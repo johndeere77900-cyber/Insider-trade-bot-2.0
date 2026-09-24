@@ -21,7 +21,7 @@ class SECFilingClientError(
 
 
 class SECFilingRequestError(
-    SEC filingClientError
+    SECFilingClientError
 ):
     """Raised when an SEC filing request fails."""
 
