@@ -42,7 +42,7 @@ jobs:
           modules = [
               "core.models",
               "data.normalization",
-              "data.validation",
+              "validation.records",
               "data.ingestion_pipeline",
               "database.connection",
               "storage.repository",
