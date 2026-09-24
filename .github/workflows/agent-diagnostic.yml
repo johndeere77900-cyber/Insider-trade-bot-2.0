@@ -1,0 +1,87 @@
+name: Insider Trade Bot 2.0 - Diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  diagnostic:
+    name: Full Agent Diagnostic
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Show environment
+        run: |
+          python --version
+          pip --version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Compile Python files
+        run: |
+          python -m compileall -q .
+
+      - name: Test core module imports
+        run: |
+          python - <<'PY'
+          modules = [
+              "core.models",
+              "data.normalization",
+              "data.validation",
+              "data.ingestion_pipeline",
+              "database.connection",
+              "storage.repository",
+              "backtesting.engine",
+              "outcomes.engine",
+              "research.performance",
+              "signals.signal_engine",
+              "trading.portfolio",
+              "application.service",
+          ]
+
+          failures = []
+
+          for module in modules:
+              try:
+                  __import__(module)
+                  print(f"PASS: {module}")
+              except Exception as exc:
+                  print(f"FAIL: {module}")
+                  print(f"  {type(exc).__name__}: {exc}")
+                  failures.append(module)
+
+          if failures:
+              print("\nFailed imports:")
+              for module in failures:
+                  print(f" - {module}")
+              raise SystemExit(1)
+          PY
+
+      - name: Run pytest
+        run: |
+          pytest -q
+
+      - name: Diagnostic summary
+        if: always()
+        run: |
+          echo "========================================"
+          echo "Insider Trade Bot 2.0 Diagnostic"
+          echo "========================================"
+          echo "Python compilation, imports, and tests"
+          echo "were executed above."
+          echo "========================================"
