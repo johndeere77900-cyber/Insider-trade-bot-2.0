@@ -199,8 +199,7 @@ class SECClient:
         Retrieve one historical SEC submissions file.
 
         The filename must be a plain SEC submissions filename rather
-        than an arbitrary path. This prevents callers from turning this
-        method into a general path traversal mechanism.
+        than an arbitrary path.
         """
 
         normalized_filename = str(
@@ -225,4 +224,4 @@ class SECClient:
         return self.get_json(
             f"/files/submissions/"
             f"{normalized_filename}"
-  )
+      )
