@@ -1,12 +1,11 @@
 """
 Record validation for Insider Trade Bot.
 
-Validation happens before permanent storage. These functions check the
-basic structural and logical requirements of normalized records.
+Validation happens before permanent storage. These functions validate
+the basic structural and logical requirements expected by the agent's
+record-processing layer.
 
-Validation does not claim that a record is historically complete or that
-the source itself is authoritative. Source verification and reconciliation
-are handled by higher-level components.
+Validation failures raise RecordValidationError.
 """
 
 from __future__ import annotations
@@ -15,10 +14,12 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 
+class RecordValidationError(ValueError):
+    """Raised when a record fails validation."""
+
+
 def _record_to_dict(record: Any) -> dict[str, Any]:
-    """
-    Convert a supported record object into a dictionary.
-    """
+    """Convert a supported record object into a dictionary."""
 
     if is_dataclass(record):
         return asdict(record)
@@ -26,171 +27,198 @@ def _record_to_dict(record: Any) -> dict[str, Any]:
     if isinstance(record, dict):
         return dict(record)
 
-    raise TypeError(
+    raise RecordValidationError(
         "Record must be a dataclass instance or dictionary."
     )
 
 
-def validate_insider_transaction(
-    record: Any,
-) -> list[str]:
+def _require_fields(
+    data: dict[str, Any],
+    fields: tuple[str, ...],
+) -> None:
+    """Ensure required fields are present and non-empty."""
+
+    missing = [
+        field
+        for field in fields
+        if data.get(field) is None
+        or str(data.get(field)).strip() == ""
+    ]
+
+    if missing:
+        raise RecordValidationError(
+            "Missing required field(s): "
+            + ", ".join(missing)
+        )
+
+
+def validate_insider_record(record: Any) -> bool:
     """
-    Validate an insider transaction.
+    Validate an insider transaction record.
 
-    Returns:
-        A list of validation errors.
-
-    An empty list means that the basic structural validation passed.
+    Returns True when valid.
+    Raises RecordValidationError when invalid.
     """
 
     data = _record_to_dict(record)
-    errors: list[str] = []
 
-    required_fields = (
-        "source",
-        "accession_number",
-        "issuer_cik",
+    _require_fields(
+        data,
+        (
+            "symbol",
+            "insider_name",
+            "transaction_date",
+            "transaction_type",
+            "source",
+            "accession_number",
+        ),
     )
 
-    for field in required_fields:
-        value = data.get(field)
+    transaction_type = str(
+        data["transaction_type"]
+    ).strip().upper()
 
-        if value is None or str(value).strip() == "":
-            errors.append(
-                f"{field} is required."
-            )
+    allowed_transaction_types = {
+        "BUY",
+        "SELL",
+        "PURCHASE",
+        "SALE",
+    }
+
+    if transaction_type not in allowed_transaction_types:
+        raise RecordValidationError(
+            f"Invalid transaction_type: "
+            f"{data['transaction_type']}"
+        )
 
     shares = data.get("shares")
 
     if shares is not None:
         if not isinstance(shares, (int, float)):
-            errors.append(
+            raise RecordValidationError(
                 "shares must be numeric."
+            )
+
+        if shares < 0:
+            raise RecordValidationError(
+                "shares cannot be negative."
             )
 
     price = data.get("price")
 
     if price is not None:
         if not isinstance(price, (int, float)):
-            errors.append(
+            raise RecordValidationError(
                 "price must be numeric."
             )
 
-    return errors
+        if price < 0:
+            raise RecordValidationError(
+                "price cannot be negative."
+            )
+
+    return True
 
 
-def validate_market_price(
-    record: Any,
-) -> list[str]:
+def validate_market_price_record(record: Any) -> bool:
     """
-    Validate a normalized market-price record.
+    Validate a market-price record.
+
+    Returns True when valid.
+    Raises RecordValidationError when invalid.
     """
 
     data = _record_to_dict(record)
-    errors: list[str] = []
 
-    required_fields = (
-        "symbol",
-        "price_date",
-        "source",
+    _require_fields(
+        data,
+        (
+            "symbol",
+            "price_date",
+            "source",
+        ),
     )
 
-    for field in required_fields:
-        value = data.get(field)
-
-        if value is None or str(value).strip() == "":
-            errors.append(
-                f"{field} is required."
-            )
-
     numeric_fields = (
-        "open",
-        "high",
-        "low",
-        "close",
-        "adjusted_close",
+        "open_price",
+        "high_price",
+        "low_price",
+        "close_price",
         "volume",
     )
 
     for field in numeric_fields:
         value = data.get(field)
 
-        if value is not None and not isinstance(
-            value,
-            (int, float),
-        ):
-            errors.append(
-                f"{field} must be numeric."
-            )
+        if value is not None:
+            if not isinstance(value, (int, float)):
+                raise RecordValidationError(
+                    f"{field} must be numeric."
+                )
 
-    for field in (
-        "open",
-        "high",
-        "low",
-        "close",
-        "adjusted_close",
-        "volume",
+            if value < 0:
+                raise RecordValidationError(
+                    f"{field} cannot be negative."
+                )
+
+    open_price = data.get("open_price")
+    high_price = data.get("high_price")
+    low_price = data.get("low_price")
+    close_price = data.get("close_price")
+
+    if (
+        high_price is not None
+        and low_price is not None
+        and high_price < low_price
     ):
-        value = data.get(field)
+        raise RecordValidationError(
+            "high_price cannot be lower than low_price."
+        )
 
-        if isinstance(value, (int, float)) and value < 0:
-            errors.append(
-                f"{field} cannot be negative."
-            )
+    if (
+        open_price is not None
+        and high_price is not None
+        and open_price > high_price
+    ):
+        raise RecordValidationError(
+            "open_price cannot exceed high_price."
+        )
 
-    return errors
+    if (
+        open_price is not None
+        and low_price is not None
+        and open_price < low_price
+    ):
+        raise RecordValidationError(
+            "open_price cannot be below low_price."
+        )
 
+    if (
+        close_price is not None
+        and high_price is not None
+        and close_price > high_price
+    ):
+        raise RecordValidationError(
+            "close_price cannot exceed high_price."
+        )
 
-def validate_corporate_action(
-    record: Any,
-) -> list[str]:
-    """
-    Validate a normalized corporate-action record.
-    """
+    if (
+        close_price is not None
+        and low_price is not None
+        and close_price < low_price
+    ):
+        raise RecordValidationError(
+            "close_price cannot be below low_price."
+        )
 
-    data = _record_to_dict(record)
-    errors: list[str] = []
-
-    required_fields = (
-        "symbol",
-        "action_type",
-        "action_date",
-        "source",
-    )
-
-    for field in required_fields:
-        value = data.get(field)
-
-        if value is None or str(value).strip() == "":
-            errors.append(
-                f"{field} is required."
-            )
-
-    cash_amount = data.get("cash_amount")
-
-    if cash_amount is not None:
-        if not isinstance(
-            cash_amount,
-            (int, float),
-        ):
-            errors.append(
-                "cash_amount must be numeric."
-            )
-        elif cash_amount < 0:
-            errors.append(
-                "cash_amount cannot be negative."
-            )
-
-    return errors
+    return True
 
 
 def validate_required_text(
     value: Any,
     field_name: str,
 ) -> list[str]:
-    """
-    Validate a required text field.
-    """
+    """Validate a required text field."""
 
     if value is None or str(value).strip() == "":
         return [f"{field_name} is required."]
