@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-class SEC filingClientError(
+class SECFilingClientError(
     Exception
 ):
     """Base exception for SEC filing retrieval failures."""
