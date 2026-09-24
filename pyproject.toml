@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insider-trade-bot-2"
+version = "2.0.0"
+description = "Research, validation, backtesting, paper-trading, and controlled execution system for insider-trading analysis."
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31,<3",
+    "python-dotenv>=1.0,<2",
+    "python-telegram-bot>=21,<23",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-ra"
+
+[tool.setuptools]
+include-package-data = true
