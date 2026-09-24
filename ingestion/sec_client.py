@@ -224,4 +224,4 @@ class SECClient:
         return self.get_json(
             f"/files/submissions/"
             f"{normalized_filename}"
-      )
+          )
