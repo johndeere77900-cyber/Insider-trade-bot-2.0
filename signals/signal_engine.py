@@ -16,8 +16,7 @@ from typing import Iterable
 
 from core.hashing import sha256_record
 from core.models import Signal
-from research.event_study import EventStudySummary
-
+from research.research.event_study import EventStudySummary
 
 @dataclass(frozen=True)
 class SignalCriteria:
