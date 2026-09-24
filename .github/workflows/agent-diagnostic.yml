@@ -31,6 +31,7 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
+          python -m pip install pytest
 
       - name: Compile Python files
         run: |
