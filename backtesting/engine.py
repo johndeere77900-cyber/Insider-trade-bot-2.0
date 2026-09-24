@@ -4,6 +4,12 @@ Historical backtesting engine for Insider Trade Bot.
 This module evaluates stored signal candidates against historical market
 prices. It performs simulation only. It does not submit orders and has no
 connection to the live-trading execution path.
+
+The module exposes both:
+
+1. The historical function-based API used by the agent.
+2. BacktestEngine, a compatibility interface used by the application
+   and test suite.
 """
 
 from __future__ import annotations
@@ -14,9 +20,7 @@ from typing import Iterable, Mapping
 
 @dataclass(frozen=True)
 class BacktestTrade:
-    """
-    One simulated trade generated from a historical signal.
-    """
+    """One simulated trade generated from a historical signal."""
 
     signal_key: str
     symbol: str
@@ -34,9 +38,7 @@ class BacktestTrade:
 
 @dataclass(frozen=True)
 class BacktestSummary:
-    """
-    Aggregate results from a backtest run.
-    """
+    """Aggregate results from a backtest run."""
 
     trade_count: int
 
@@ -54,9 +56,7 @@ class BacktestSummary:
 
 @dataclass(frozen=True)
 class BacktestResult:
-    """
-    Complete result of a backtest execution.
-    """
+    """Complete result of a backtest execution."""
 
     trades: tuple[BacktestTrade, ...]
     summary: BacktestSummary
@@ -66,9 +66,7 @@ def _validate_price(
     price: float,
     field_name: str,
 ) -> None:
-    """
-    Validate a price used by the backtesting engine.
-    """
+    """Validate a price used by the backtesting engine."""
 
     if not isinstance(price, (int, float)):
         raise TypeError(
@@ -84,9 +82,7 @@ def _validate_price(
 def _ordered_prices(
     prices: Mapping[str, float],
 ) -> list[tuple[str, float]]:
-    """
-    Normalize a date-to-price mapping into chronological order.
-    """
+    """Normalize a date-to-price mapping into chronological order."""
 
     if not prices:
         raise ValueError(
@@ -126,9 +122,7 @@ def calculate_return_pct(
     entry_price: float,
     exit_price: float,
 ) -> float:
-    """
-    Calculate the percentage return of a simulated long position.
-    """
+    """Calculate the percentage return of a simulated long position."""
 
     _validate_price(
         entry_price,
@@ -150,12 +144,7 @@ def find_exit_observation(
     entry_date: str,
     holding_periods: int,
 ) -> tuple[str, float]:
-    """
-    Find the historical market observation used as the exit.
-
-    holding_periods represents available market-price observations after
-    the entry date, rather than calendar days.
-    """
+    """Find the historical market observation used as the exit."""
 
     if holding_periods < 1:
         raise ValueError(
@@ -202,9 +191,7 @@ def simulate_trade(
     prices: Mapping[str, float],
     holding_periods: int,
 ) -> BacktestTrade:
-    """
-    Simulate one historical trade.
-    """
+    """Simulate one historical trade."""
 
     normalized_signal_key = str(
         signal_key
@@ -264,9 +251,7 @@ def simulate_trade(
 def summarize_trades(
     trades: Iterable[BacktestTrade],
 ) -> BacktestSummary:
-    """
-    Calculate aggregate backtest statistics.
-    """
+    """Calculate aggregate backtest statistics."""
 
     records = list(trades)
 
@@ -399,4 +384,81 @@ def run_backtest(
     return BacktestResult(
         trades=tuple(results),
         summary=summary,
-  )
+    )
+
+
+class BacktestEngine:
+    """
+    Compatibility interface for simple trade-list backtesting.
+
+    The application/test interface supplies trades containing only:
+
+        entry_price
+        exit_price
+
+    This wrapper returns decimal returns rather than percentage returns.
+
+    Example:
+        100 -> 110 = 0.10
+        200 -> 190 = -0.05
+    """
+
+    def run(
+        self,
+        trades: Iterable[Mapping[str, object]],
+    ) -> dict[str, object]:
+        """Run simple trades and return dictionary-based results."""
+
+        records = list(trades)
+
+        if not records:
+            return {
+                "total_return": 0.0,
+                "trade_count": 0,
+                "trade_returns": [],
+            }
+
+        trade_returns: list[float] = []
+
+        for index, trade in enumerate(records):
+            if "entry_price" not in trade:
+                raise ValueError(
+                    f"Trade {index} is missing entry_price."
+                )
+
+            if "exit_price" not in trade:
+                raise ValueError(
+                    f"Trade {index} is missing exit_price."
+                )
+
+            entry_price = trade["entry_price"]
+            exit_price = trade["exit_price"]
+
+            _validate_price(
+                entry_price,
+                "entry_price",
+            )
+
+            _validate_price(
+                exit_price,
+                "exit_price",
+            )
+
+            trade_return = (
+                float(exit_price)
+                / float(entry_price)
+            ) - 1.0
+
+            trade_returns.append(
+                trade_return
+            )
+
+        return {
+            "total_return": sum(
+                trade_returns
+            ),
+            "trade_count": len(
+                trade_returns
+            ),
+            "trade_returns": trade_returns,
+        }
