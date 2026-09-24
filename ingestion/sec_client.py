@@ -224,38 +224,4 @@ class SECClient:
         return self.get_json(
             f"/files/submissions/"
             f"{normalized_filename}"
-          )
-    def get_submission_file(
-        self,
-        filename: str,
-    ) -> object:
-        """
-        Retrieve one historical SEC submissions file.
-
-        The filename must be a plain SEC submissions filename rather
-        than an arbitrary path.
-        """
-
-        normalized_filename = str(
-            filename
-        ).strip()
-
-        if not normalized_filename:
-            raise ValueError(
-                "SEC submissions filename cannot be empty."
-            )
-
-        if (
-            "/" in normalized_filename
-            or "\\" in normalized_filename
-            or normalized_filename in {".", ".."}
-            or ".." in normalized_filename
-        ):
-            raise ValueError(
-                "SEC submissions filename must be a plain filename."
-            )
-
-        return self.get_json(
-            f"/files/submissions/"
-            f"{normalized_filename}"
-      )
+  )
