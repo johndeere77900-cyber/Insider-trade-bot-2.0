@@ -10,11 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from backtesting.engine import BacktestEngine
-from outcomes.engine import OutcomeEngine
-from research.event_study import EventStudyEngine
-from research.performance import ResearchPerformance
-from signals.signal_engine import SignalEngine
+from backtesting.engine import run_backtest
+from outcomes.engine import evaluate_signal
+from research.performance import summarize_outcomes
+from research.research.event_study import run_event_study
+from signals.signal_engine import create_signal_batch
 from trading.portfolio import Portfolio
 
 
@@ -34,8 +34,8 @@ class ApplicationService:
     """
     Unified application service.
 
-    This class coordinates existing domain components. It does not replace
-    their business logic and does not directly execute live trades.
+    This class coordinates the actual function-based domain components.
+    It does not directly execute live trades.
     """
 
     def __init__(
@@ -45,11 +45,11 @@ class ApplicationService:
         paper_trading_enabled: bool = True,
         live_trading_enabled: bool = False,
         historical_data_available: bool = False,
-        event_study_engine: Optional[EventStudyEngine] = None,
-        signal_engine: Optional[SignalEngine] = None,
-        backtest_engine: Optional[BacktestEngine] = None,
-        outcome_engine: Optional[OutcomeEngine] = None,
-        research_performance: Optional[ResearchPerformance] = None,
+        event_study_engine: Any = None,
+        signal_engine: Any = None,
+        backtest_engine: Any = None,
+        outcome_engine: Any = None,
+        research_performance: Any = None,
         portfolio: Optional[Portfolio] = None,
     ) -> None:
         self.environment = environment
@@ -57,11 +57,36 @@ class ApplicationService:
         self.live_trading_enabled = live_trading_enabled
         self.historical_data_available = historical_data_available
 
-        self.event_study_engine = event_study_engine
-        self.signal_engine = signal_engine
-        self.backtest_engine = backtest_engine
-        self.outcome_engine = outcome_engine
-        self.research_performance = research_performance
+        self.event_study_engine = (
+            event_study_engine
+            if event_study_engine is not None
+            else run_event_study
+        )
+
+        self.signal_engine = (
+            signal_engine
+            if signal_engine is not None
+            else create_signal_batch
+        )
+
+        self.backtest_engine = (
+            backtest_engine
+            if backtest_engine is not None
+            else run_backtest
+        )
+
+        self.outcome_engine = (
+            outcome_engine
+            if outcome_engine is not None
+            else evaluate_signal
+        )
+
+        self.research_performance = (
+            research_performance
+            if research_performance is not None
+            else summarize_outcomes
+        )
+
         self.portfolio = portfolio
 
     def status(self) -> Mapping[str, Any]:
@@ -82,25 +107,25 @@ class ApplicationService:
         **kwargs: Any,
     ) -> Mapping[str, Any]:
         """
-        Run an event-study research request through the configured engine.
+        Run an event-study research request.
 
-        The method intentionally fails clearly when the required engine has
-        not yet been connected.
+        The underlying research function is called only when a research
+        request is explicitly made.
         """
-
-        if self.event_study_engine is None:
-            return {
-                "status": "unavailable",
-                "reason": "Research engine is not connected.",
-            }
 
         if events is None:
             events = []
 
-        result = self.event_study_engine.run(
-            events=events,
-            **kwargs,
-        )
+        try:
+            result = self.event_study_engine(
+                events=events,
+                **kwargs,
+            )
+        except TypeError:
+            result = self.event_study_engine(
+                events,
+                **kwargs,
+            )
 
         return {
             "status": "completed",
@@ -113,21 +138,21 @@ class ApplicationService:
         transactions: Optional[Sequence[Mapping[str, Any]]] = None,
         **kwargs: Any,
     ) -> Mapping[str, Any]:
-        """Generate signals through the configured signal engine."""
-
-        if self.signal_engine is None:
-            return {
-                "status": "unavailable",
-                "reason": "Signal engine is not connected.",
-            }
+        """Generate signals through the configured signal component."""
 
         if transactions is None:
             transactions = []
 
-        result = self.signal_engine.generate(
-            transactions=transactions,
-            **kwargs,
-        )
+        try:
+            result = self.signal_engine(
+                transactions=transactions,
+                **kwargs,
+            )
+        except TypeError:
+            result = self.signal_engine(
+                transactions,
+                **kwargs,
+            )
 
         return {
             "status": "completed",
@@ -140,21 +165,21 @@ class ApplicationService:
         signals: Optional[Sequence[Mapping[str, Any]]] = None,
         **kwargs: Any,
     ) -> Mapping[str, Any]:
-        """Run a backtest through the configured backtesting engine."""
-
-        if self.backtest_engine is None:
-            return {
-                "status": "unavailable",
-                "reason": "Backtesting engine is not connected.",
-            }
+        """Run a backtest through the configured backtesting function."""
 
         if signals is None:
             signals = []
 
-        result = self.backtest_engine.run(
-            signals=signals,
-            **kwargs,
-        )
+        try:
+            result = self.backtest_engine(
+                signals=signals,
+                **kwargs,
+            )
+        except TypeError:
+            result = self.backtest_engine(
+                signals,
+                **kwargs,
+            )
 
         return {
             "status": "completed",
@@ -162,7 +187,7 @@ class ApplicationService:
         }
 
     def portfolio_status(self) -> Mapping[str, Any]:
-        """Return the current portfolio state when a portfolio is connected."""
+        """Return the current portfolio state when connected."""
 
         if self.portfolio is None:
             return {
@@ -190,21 +215,21 @@ class ApplicationService:
         records: Optional[Sequence[Mapping[str, Any]]] = None,
         **kwargs: Any,
     ) -> Mapping[str, Any]:
-        """Process outcome records through the configured outcome engine."""
-
-        if self.outcome_engine is None:
-            return {
-                "status": "unavailable",
-                "reason": "Outcome engine is not connected.",
-            }
+        """Process outcome records through the outcome component."""
 
         if records is None:
             records = []
 
-        result = self.outcome_engine.process(
-            records=records,
-            **kwargs,
-        )
+        try:
+            result = self.outcome_engine(
+                records=records,
+                **kwargs,
+            )
+        except TypeError:
+            result = self.outcome_engine(
+                records,
+                **kwargs,
+            )
 
         return {
             "status": "completed",
@@ -217,34 +242,23 @@ class ApplicationService:
         records: Optional[Sequence[Mapping[str, Any]]] = None,
         **kwargs: Any,
     ) -> Mapping[str, Any]:
-        """Calculate research performance through the performance component."""
-
-        if self.research_performance is None:
-            return {
-                "status": "unavailable",
-                "reason": "Research performance component is not connected.",
-            }
+        """Calculate research performance."""
 
         if records is None:
             records = []
 
-        if hasattr(self.research_performance, "calculate"):
-            result = self.research_performance.calculate(
+        try:
+            result = self.research_performance(
                 records=records,
                 **kwargs,
             )
-        elif hasattr(self.research_performance, "evaluate"):
-            result = self.research_performance.evaluate(
-                records=records,
+        except TypeError:
+            result = self.research_performance(
+                records,
                 **kwargs,
             )
-        else:
-            return {
-                "status": "unavailable",
-                "reason": "Research performance component has no supported calculation method.",
-            }
 
         return {
             "status": "completed",
             "result": result,
-  }
+    }
