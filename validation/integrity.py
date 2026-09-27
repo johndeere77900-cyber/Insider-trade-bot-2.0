@@ -1,26 +1,56 @@
 """
 Integrity-checking layer for Insider Trade Bot.
 
-This module provides database-level integrity checks for permanent records.
-It detects structural problems such as missing tables, invalid counts,
-duplicate identifiers, and invalid provenance relationships.
-
-It reports problems rather than silently repairing data.
+Provides both record-level hash verification and database-level
+integrity auditing.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping, Any
 
+from core.hashing import generate_record_hash
 from database.connection import connect
 
 
 @dataclass(frozen=True)
+class IntegrityCheckResult:
+    """Result of a single record-integrity check."""
+
+    valid: bool
+    expected_hash: str
+    actual_hash: str
+
+
+def check_record_integrity(
+    *,
+    record: Mapping[str, Any],
+    expected_hash: str,
+) -> IntegrityCheckResult:
+    """
+    Verify that a record produces the expected deterministic hash.
+    """
+
+    actual_hash = generate_record_hash(record)
+
+    normalized_expected = str(
+        expected_hash
+    ).strip()
+
+    return IntegrityCheckResult(
+        valid=(
+            bool(normalized_expected)
+            and actual_hash == normalized_expected
+        ),
+        expected_hash=normalized_expected,
+        actual_hash=actual_hash,
+    )
+
+
+@dataclass(frozen=True)
 class IntegrityIssue:
-    """
-    One detected integrity problem.
-    """
+    """One detected integrity problem."""
 
     check_name: str
     severity: str
@@ -29,13 +59,10 @@ class IntegrityIssue:
 
 @dataclass(frozen=True)
 class IntegrityReport:
-    """
-    Complete result of an integrity audit.
-    """
+    """Complete result of an integrity audit."""
 
     checks_run: int
     issues: tuple[IntegrityIssue, ...]
-
     passed: bool
 
 
@@ -57,9 +84,6 @@ CORE_TABLES = (
 def _check_required_tables(
     database_url: str,
 ) -> list[IntegrityIssue]:
-    """
-    Verify that all required permanent-storage tables exist.
-    """
 
     issues: list[IntegrityIssue] = []
 
@@ -96,9 +120,6 @@ def _check_required_tables(
 def _check_negative_market_values(
     database_url: str,
 ) -> list[IntegrityIssue]:
-    """
-    Detect impossible negative market-price values.
-    """
 
     issues: list[IntegrityIssue] = []
 
@@ -110,7 +131,7 @@ def _check_negative_market_values(
                 symbol,
                 price_date
             FROM market_prices
-            WHERE (
+            WHERE
                 (open IS NOT NULL AND open < 0)
                 OR (high IS NOT NULL AND high < 0)
                 OR (low IS NOT NULL AND low < 0)
@@ -120,7 +141,6 @@ def _check_negative_market_values(
                     AND adjusted_close < 0
                 )
                 OR (volume IS NOT NULL AND volume < 0)
-            )
             """
         ).fetchall()
 
@@ -144,12 +164,6 @@ def _check_negative_market_values(
 def _check_duplicate_market_prices(
     database_url: str,
 ) -> list[IntegrityIssue]:
-    """
-    Detect duplicate market-price identities.
-
-    The current permanent-storage identity is:
-        symbol + price_date + source
-    """
 
     issues: list[IntegrityIssue] = []
 
@@ -176,7 +190,7 @@ def _check_duplicate_market_prices(
                 check_name="duplicate_market_prices",
                 severity="error",
                 message=(
-                    f"Duplicate market-price identity detected: "
+                    "Duplicate market-price identity detected: "
                     f"{row['symbol']} / "
                     f"{row['price_date']} / "
                     f"{row['source']} "
@@ -191,9 +205,6 @@ def _check_duplicate_market_prices(
 def _check_duplicate_signals(
     database_url: str,
 ) -> list[IntegrityIssue]:
-    """
-    Detect duplicate signal keys.
-    """
 
     issues: list[IntegrityIssue] = []
 
@@ -227,9 +238,6 @@ def _check_duplicate_signals(
 def _check_invalid_trade_modes(
     database_url: str,
 ) -> list[IntegrityIssue]:
-    """
-    Detect trading-run records outside the permitted paper/live modes.
-    """
 
     issues: list[IntegrityIssue] = []
 
@@ -263,9 +271,6 @@ def _check_invalid_trade_modes(
 def _check_provenance_status(
     database_url: str,
 ) -> list[IntegrityIssue]:
-    """
-    Detect provenance records with empty validation status.
-    """
 
     issues: list[IntegrityIssue] = []
 
@@ -301,13 +306,6 @@ def _check_provenance_status(
 def _check_orphaned_provenance(
     database_url: str,
 ) -> list[IntegrityIssue]:
-    """
-    Detect provenance records whose referenced permanent record does not
-    exist.
-
-    Only record types with directly identifiable primary/hash references
-    are checked here.
-    """
 
     issues: list[IntegrityIssue] = []
 
@@ -331,6 +329,7 @@ def _check_orphaned_provenance(
 
     with connect(database_url) as connection:
         for record_type, table_name, column_name in checks:
+
             rows = connection.execute(
                 """
                 SELECT
@@ -343,6 +342,7 @@ def _check_orphaned_provenance(
             ).fetchall()
 
             for row in rows:
+
                 referenced = connection.execute(
                     f"""
                     SELECT 1
@@ -356,9 +356,7 @@ def _check_orphaned_provenance(
                 if referenced is None:
                     issues.append(
                         IntegrityIssue(
-                            check_name=(
-                                "orphaned_provenance"
-                            ),
+                            check_name="orphaned_provenance",
                             severity="error",
                             message=(
                                 f"Provenance record "
@@ -377,21 +375,6 @@ def run_integrity_audit(
     *,
     checks: Iterable[str] | None = None,
 ) -> IntegrityReport:
-    """
-    Run the permanent-storage integrity audit.
-
-    Supported checks:
-
-        required_tables
-        negative_market_values
-        duplicate_market_prices
-        duplicate_signals
-        trade_modes
-        provenance_status
-        orphaned_provenance
-
-    If checks is omitted, every supported check is executed.
-    """
 
     available_checks = {
         "required_tables": _check_required_tables,
@@ -426,6 +409,7 @@ def run_integrity_audit(
     issues: list[IntegrityIssue] = []
 
     for check_name in selected_checks:
+
         if check_name not in available_checks:
             raise IntegrityError(
                 f"Unsupported integrity check: {check_name}"
@@ -447,4 +431,4 @@ def run_integrity_audit(
         checks_run=len(selected_checks),
         issues=tuple(issues),
         passed=not issues,
-  )
+        )
