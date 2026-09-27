@@ -15,6 +15,7 @@ from execution.interface import (
     ExecutionRequest,
     ExecutionResult,
 )
+from execution.mode import ExecutionMode
 
 
 class LiveAdapterNotConfiguredError(
@@ -63,6 +64,20 @@ class LiveExecutionAdapter(
         self.configured = bool(
             configured
         )
+
+        self.mode = ExecutionMode.LIVE
+
+    def is_enabled(
+        self,
+    ) -> bool:
+        """
+        Return whether live execution is explicitly enabled.
+
+        The adapter is disabled by default. Creating a live adapter
+        does not automatically enable live execution.
+        """
+
+        return self.configured
 
     def _require_configuration(
         self,
@@ -154,5 +169,5 @@ class LiveExecutionAdapter(
 
         raise LiveAdapterNotConfiguredError(
             "A provider-specific live status implementation has not "
-            "been installed."
-    )
+            "been installed. No live order was submitted."
+        )
