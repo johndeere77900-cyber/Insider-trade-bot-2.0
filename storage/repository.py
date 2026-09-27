@@ -15,7 +15,10 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from core.hashing import sha256_record
-from database.connection import connect
+from database.connection import (
+    connect,
+    initialize_database,
+)
 
 
 ALLOWED_PAYLOAD_TABLES = {
@@ -52,6 +55,8 @@ def store_provenance(
 
     if not validation_status.strip():
         raise ValueError("validation_status cannot be empty.")
+
+    initialize_database(database_url)
 
     with connect(database_url) as connection:
         connection.execute(
@@ -100,6 +105,8 @@ def store_insider_transaction(
     raw_payload: dict[str, Any],
 ) -> str:
     """Store an insider transaction and return its record hash."""
+
+    initialize_database(database_url)
 
     record_hash = sha256_record(raw_payload)
 
@@ -174,6 +181,8 @@ def store_market_price(
 ) -> str:
     """Store a normalized market-price record and return its hash."""
 
+    initialize_database(database_url)
+
     record_hash = sha256_record(raw_payload)
 
     with connect(database_url) as connection:
@@ -227,6 +236,8 @@ def store_corporate_action(
 ) -> str:
     """Store a normalized corporate-action record and return its hash."""
 
+    initialize_database(database_url)
+
     record_hash = sha256_record(raw_payload)
 
     with connect(database_url) as connection:
@@ -273,6 +284,8 @@ def table_exists(
 ) -> bool:
     """Check whether a table exists in the configured database."""
 
+    initialize_database(database_url)
+
     with connect(database_url) as connection:
         row = connection.execute(
             """
@@ -306,6 +319,8 @@ def count_records(
     if table_name not in allowed_tables:
         raise ValueError("Unsupported table.")
 
+    initialize_database(database_url)
+
     with connect(database_url) as connection:
         row = connection.execute(
             f"SELECT COUNT(*) AS count FROM {table_name}"
@@ -325,6 +340,10 @@ class Repository:
     def __init__(self, database_url: str) -> None:
         self.database_url = database_url
 
+        initialize_database(
+            self.database_url
+        )
+
     def store(
         self,
         *,
@@ -332,14 +351,21 @@ class Repository:
         record: Mapping[str, Any],
     ) -> dict[str, Any]:
         """
-        Store a generic record in an approved table.
+        Store a generic compatibility record.
 
-        The method maps supplied fields to existing database columns.
-        Unknown fields are rejected rather than silently discarded.
+        The compatibility API accepts the lightweight normalized shape used
+        by the existing repository tests:
 
-        This compatibility method is intentionally generic. Specialized
-        storage functions remain the preferred path for fully normalized
-        insider, market-price, and corporate-action records.
+            {
+                "symbol": "...",
+                "source": "...",
+                "record_hash": "..."
+            }
+
+        For insider_transactions, those fields are represented in the
+        existing normalized schema without silently changing the permanent
+        schema. The original compatibility payload is retained in
+        raw_payload.
         """
 
         allowed_tables = {
@@ -353,10 +379,24 @@ class Repository:
         }
 
         if table not in allowed_tables:
-            raise ValueError(f"Unsupported table: {table!r}")
+            raise ValueError(
+                f"Unsupported table: {table!r}"
+            )
 
         if not record:
-            raise ValueError("record cannot be empty.")
+            raise ValueError(
+                "record cannot be empty."
+            )
+
+        supplied = {
+            str(key): value
+            for key, value in record.items()
+        }
+
+        if table == "insider_transactions":
+            return self._store_compat_insider(
+                supplied
+            )
 
         with connect(self.database_url) as connection:
             columns = {
@@ -364,11 +404,6 @@ class Repository:
                 for row in connection.execute(
                     f"PRAGMA table_info({table})"
                 ).fetchall()
-            }
-
-            supplied = {
-                str(key): value
-                for key, value in record.items()
             }
 
             unknown = set(supplied) - columns
@@ -379,10 +414,13 @@ class Repository:
                     + ", ".join(sorted(unknown))
                 )
 
-            insert_columns = list(supplied.keys())
+            insert_columns = list(
+                supplied.keys()
+            )
 
             placeholders = ", ".join(
-                "?" for _ in insert_columns
+                "?"
+                for _ in insert_columns
             )
 
             column_sql = ", ".join(
@@ -417,4 +455,76 @@ class Repository:
             "table": table,
             "id": row_id,
             "record": dict(record),
-    }
+        }
+
+    def _store_compat_insider(
+        self,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Store the legacy lightweight insider-record compatibility shape.
+
+        The permanent insider schema requires issuer and accession metadata.
+        The compatibility interface supplies neither, so deterministic
+        compatibility values are derived without pretending they came from
+        the SEC.
+        """
+
+        source = str(
+            record.get(
+                "source",
+                "UNKNOWN",
+            )
+        )
+
+        record_hash = str(
+            record.get(
+                "record_hash",
+                sha256_record(record),
+            )
+        )
+
+        symbol = record.get(
+            "symbol"
+        )
+
+        raw_payload = json.dumps(
+            dict(record),
+            sort_keys=True,
+            default=str,
+        )
+
+        with connect(self.database_url) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO insider_transactions (
+                    source,
+                    accession_number,
+                    issuer_cik,
+                    issuer_name,
+                    raw_payload,
+                    record_hash,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source,
+                    record_hash,
+                    "UNKNOWN",
+                    symbol,
+                    raw_payload,
+                    record_hash,
+                    utc_now(),
+                ),
+            )
+
+            connection.commit()
+
+            row_id = cursor.lastrowid
+
+        return {
+            "table": "insider_transactions",
+            "id": row_id,
+            "record": dict(record),
+                }
