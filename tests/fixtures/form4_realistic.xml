@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ownershipDocument>
+  <schemaVersion>X0306</schemaVersion>
+  <documentType>4</documentType>
+  <periodOfReport>2026-09-23</periodOfReport>
+
+  <issuer>
+    <issuerCik>0001234567</issuerCik>
+    <issuerName>Example Holdings Inc.</issuerName>
+    <issuerTradingSymbol>EXMP</issuerTradingSymbol>
+  </issuer>
+
+  <reportingOwner>
+    <rptOwnerName>Jane Doe</rptOwnerName>
+    <rptOwnerCik>0007654321</rptOwnerCik>
+  </reportingOwner>
+
+  <nonDerivativeTable>
+
+    <nonDerivativeTransaction>
+      <securityTitle>
+        <value>Common Stock</value>
+      </securityTitle>
+
+      <transactionDate>
+        <value>2026-09-23</value>
+      </transactionDate>
+
+      <transactionCoding>
+        <transactionFormType>4</transactionFormType>
+        <transactionCode>P</transactionCode>
+        <equitySwapInvolved>0</equitySwapInvolved>
+      </transactionCoding>
+
+      <transactionAmounts>
+        <transactionShares>
+          <value>1000</value>
+        </transactionShares>
+
+        <transactionPricePerShare>
+          <value>25.50</value>
+        </transactionPricePerShare>
+      </transactionAmounts>
+
+      <postTransactionAmounts>
+        <sharesOwnedFollowingTransaction>
+          <value>11000</value>
+        </sharesOwnedFollowingTransaction>
+      </postTransactionAmounts>
+
+      <ownershipNature>
+        <directOrIndirectOwnership>
+          <value>D</value>
+        </directOrIndirectOwnership>
+      </ownershipNature>
+    </nonDerivativeTransaction>
+
+    <nonDerivativeTransaction>
+      <securityTitle>
+        <value>Common Stock</value>
+      </securityTitle>
+
+      <transactionDate>
+        <value>2026-09-23</value>
+      </transactionDate>
+
+      <transactionCoding>
+        <transactionFormType>4</transactionFormType>
+        <transactionCode>S</transactionCode>
+        <equitySwapInvolved>0</equitySwapInvolved>
+      </transactionCoding>
+
+      <transactionAmounts>
+        <transactionShares>
+          <value>250</value>
+        </transactionShares>
+
+        <transactionPricePerShare>
+          <value>26.75</value>
+        </transactionPricePerShare>
+      </transactionAmounts>
+
+      <postTransactionAmounts>
+        <sharesOwnedFollowingTransaction>
+          <value>10750</value>
+        </sharesOwnedFollowingTransaction>
+      </postTransactionAmounts>
+
+      <ownershipNature>
+        <directOrIndirectOwnership>
+          <value>I</value>
+        </directOrIndirectOwnership>
+
+        <natureOfOwnership>
+          <value>Family Trust</value>
+        </natureOfOwnership>
+      </ownershipNature>
+    </nonDerivativeTransaction>
+
+  </nonDerivativeTable>
+
+  <signature>
+    <signatureName>Jane Doe</signatureName>
+    <signatureDate>2026-09-24</signatureDate>
+  </signature>
+</ownershipDocument>
