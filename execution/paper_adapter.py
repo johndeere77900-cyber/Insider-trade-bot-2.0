@@ -15,8 +15,12 @@ from execution.interface import (
     ExecutionRequest,
     ExecutionResult,
 )
+from execution.mode import ExecutionMode
 from trading.paper_engine import (
     PaperTradingEngine,
+)
+from trading.portfolio import (
+    Portfolio,
 )
 
 
@@ -30,8 +34,13 @@ class PaperExecutionAdapter(
     def __init__(
         self,
         *,
-        engine: PaperTradingEngine,
+        engine: PaperTradingEngine | None = None,
     ) -> None:
+        if engine is None:
+            engine = PaperTradingEngine(
+                portfolio=Portfolio()
+            )
+
         if not isinstance(
             engine,
             PaperTradingEngine,
@@ -41,6 +50,8 @@ class PaperExecutionAdapter(
             )
 
         self.engine = engine
+
+        self.mode = ExecutionMode.PAPER
 
         self._request_map: dict[
             str,
@@ -203,4 +214,4 @@ class PaperExecutionAdapter(
             message=(
                 "Paper-trading order status."
             ),
-          )
+                )
