@@ -583,9 +583,19 @@ def _extract_insider_metadata(
 ) -> tuple[str | None, str | None]:
     """
     Extract reporting-owner name and CIK from SEC ownership XML when present.
+
+    SEC XML converted to dictionaries may contain reportingOwner beneath
+    the ownershipDocument root. Therefore this function searches the full
+    payload recursively instead of requiring reportingOwner to be a
+    top-level key.
     """
 
-    reporting_owner = payload.get("reportingOwner")
+    reporting_owner = _deep_find(
+        payload,
+        (
+            "reportingOwner",
+        ),
+    )
 
     if isinstance(reporting_owner, list):
         reporting_owner = (
