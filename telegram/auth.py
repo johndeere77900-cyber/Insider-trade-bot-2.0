@@ -25,11 +25,11 @@ class TelegramAuthorizer:
     Authorize Telegram users against an explicit numeric user-ID allowlist.
 
     An empty allowlist denies access to everyone. This fail-closed behavior
-    prevents accidental exposure of the agent if authorization has not been
-    configured.
+    prevents accidental exposure of the agent if authorization has not
+    been configured.
     """
 
-    def __init__(self, allowed_user_ids: Iterable[int]) -> None:
+    def __init__(self, allowed_user_ids: Iterable[int | str]) -> None:
         self._allowed_user_ids = frozenset(
             int(user_id) for user_id in allowed_user_ids
         )
@@ -39,7 +39,7 @@ class TelegramAuthorizer:
         """Return the configured immutable authorization set."""
         return self._allowed_user_ids
 
-    def is_authorized(self, user_id: int | None) -> bool:
+    def is_authorized(self, user_id: int | str | None) -> bool:
         """Return whether a Telegram user ID is explicitly authorized."""
         if user_id is None:
             return False
@@ -51,7 +51,7 @@ class TelegramAuthorizer:
 
         return normalized_user_id in self._allowed_user_ids
 
-    def check(self, user_id: int | None) -> AuthorizationResult:
+    def check(self, user_id: int | str | None) -> AuthorizationResult:
         """Return a structured authorization result."""
         if user_id is None:
             return AuthorizationResult(
@@ -83,12 +83,7 @@ class TelegramAuthorizer:
         )
 
     def check_update(self, update: Any) -> AuthorizationResult:
-        """
-        Extract a Telegram user ID from a Telegram-style update object.
-
-        The method intentionally supports both attribute-based Telegram
-        objects and simple test doubles/dictionaries.
-        """
+        """Extract and authorize the Telegram user from an update."""
         user_id = self._extract_user_id(update)
         return self.check(user_id)
 
@@ -118,3 +113,14 @@ class TelegramAuthorizer:
             return update.get("user_id")
 
         return None
+
+
+class TelegramAuthenticator(TelegramAuthorizer):
+    """
+    Backward-compatible authentication interface.
+
+    Existing callers and tests use the name TelegramAuthenticator while the
+    underlying implementation remains TelegramAuthorizer.
+    """
+
+    pass
