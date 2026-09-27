@@ -68,17 +68,10 @@ class EventStudyEngine:
                     "close must be numeric."
                 )
 
-            return_value = calculate_forward_return(
-                float(current_close),
-                float(future_close),
-            ) / 100.0
-
-            # Normalize harmless IEEE-754 floating-point representation
-            # noise without changing the underlying financial calculation.
-            return_value = round(
-                return_value,
-                10,
-            )
+            return_value = (
+                float(future_close)
+                / float(current_close)
+            ) - 1.0
 
             results.append(
                 {
