@@ -62,6 +62,11 @@ class ApplicationRuntime:
         self.stopped_at = datetime.now(timezone.utc)
         self.running = False
 
+    def is_running(self) -> bool:
+        """Return whether the application runtime is currently running."""
+
+        return self.running
+
     def status(self) -> dict[str, object]:
         """Return runtime state."""
 
@@ -77,4 +82,4 @@ class ApplicationRuntime:
                 if self.stopped_at is not None
                 else None
             ),
-  }
+        }
