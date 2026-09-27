@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 
 from core.hashing import sha256_record
 from database.connection import connect
@@ -26,13 +26,8 @@ ALLOWED_PAYLOAD_TABLES = {
 
 
 def utc_now() -> str:
-    """
-    Return the current UTC timestamp in ISO-8601 format.
-    """
-
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    """Return the current UTC timestamp in ISO-8601 format."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def store_provenance(
@@ -44,29 +39,19 @@ def store_provenance(
     checksum: str | None,
     validation_status: str,
 ) -> None:
-    """
-    Store provenance information for a record.
-    """
+    """Store provenance information for a record."""
 
     if not record_type.strip():
-        raise ValueError(
-            "record_type cannot be empty."
-        )
+        raise ValueError("record_type cannot be empty.")
 
     if not record_id.strip():
-        raise ValueError(
-            "record_id cannot be empty."
-        )
+        raise ValueError("record_id cannot be empty.")
 
     if not source.strip():
-        raise ValueError(
-            "source cannot be empty."
-        )
+        raise ValueError("source cannot be empty.")
 
     if not validation_status.strip():
-        raise ValueError(
-            "validation_status cannot be empty."
-        )
+        raise ValueError("validation_status cannot be empty.")
 
     with connect(database_url) as connection:
         connection.execute(
@@ -114,16 +99,9 @@ def store_insider_transaction(
     ownership_type: str | None,
     raw_payload: dict[str, Any],
 ) -> str:
-    """
-    Store an insider transaction.
+    """Store an insider transaction and return its record hash."""
 
-    Returns:
-        The deterministic SHA-256 record hash.
-    """
-
-    record_hash = sha256_record(
-        raw_payload
-    )
+    record_hash = sha256_record(raw_payload)
 
     with connect(database_url) as connection:
         connection.execute(
@@ -194,16 +172,9 @@ def store_market_price(
     source: str,
     raw_payload: dict[str, Any],
 ) -> str:
-    """
-    Store a normalized market-price record.
+    """Store a normalized market-price record and return its hash."""
 
-    Returns:
-        The deterministic SHA-256 record hash.
-    """
-
-    record_hash = sha256_record(
-        raw_payload
-    )
+    record_hash = sha256_record(raw_payload)
 
     with connect(database_url) as connection:
         connection.execute(
@@ -221,9 +192,7 @@ def store_market_price(
                 record_hash,
                 created_at
             )
-            VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol,
@@ -256,16 +225,9 @@ def store_corporate_action(
     source: str,
     raw_payload: dict[str, Any],
 ) -> str:
-    """
-    Store a normalized corporate-action record.
+    """Store a normalized corporate-action record and return its hash."""
 
-    Returns:
-        The deterministic SHA-256 record hash.
-    """
-
-    record_hash = sha256_record(
-        raw_payload
-    )
+    record_hash = sha256_record(raw_payload)
 
     with connect(database_url) as connection:
         connection.execute(
@@ -281,9 +243,7 @@ def store_corporate_action(
                 record_hash,
                 created_at
             )
-            VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol,
@@ -311,9 +271,7 @@ def table_exists(
     database_url: str,
     table_name: str,
 ) -> bool:
-    """
-    Check whether a table exists in the configured database.
-    """
+    """Check whether a table exists in the configured database."""
 
     with connect(database_url) as connection:
         row = connection.execute(
@@ -333,11 +291,9 @@ def count_records(
     database_url: str,
     table_name: str,
 ) -> int:
-    """
-    Return the number of records in an approved permanent-storage table.
-    """
+    """Return the number of records in an approved storage table."""
 
-    if table_name not in {
+    allowed_tables = {
         "insider_transactions",
         "market_prices",
         "corporate_actions",
@@ -345,10 +301,10 @@ def count_records(
         "signals",
         "trade_runs",
         "provenance",
-    }:
-        raise ValueError(
-            "Unsupported table."
-        )
+    }
+
+    if table_name not in allowed_tables:
+        raise ValueError("Unsupported table.")
 
     with connect(database_url) as connection:
         row = connection.execute(
@@ -356,3 +312,109 @@ def count_records(
         ).fetchone()
 
     return int(row["count"])
+
+
+class Repository:
+    """
+    Compatibility repository interface.
+
+    This class provides the object-oriented interface expected by callers
+    while preserving the existing specialized storage functions above.
+    """
+
+    def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
+
+    def store(
+        self,
+        *,
+        table: str,
+        record: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Store a generic record in an approved table.
+
+        The method maps supplied fields to existing database columns.
+        Unknown fields are rejected rather than silently discarded.
+
+        This compatibility method is intentionally generic. Specialized
+        storage functions remain the preferred path for fully normalized
+        insider, market-price, and corporate-action records.
+        """
+
+        allowed_tables = {
+            "insider_transactions",
+            "market_prices",
+            "corporate_actions",
+            "research_events",
+            "signals",
+            "trade_runs",
+            "provenance",
+        }
+
+        if table not in allowed_tables:
+            raise ValueError(f"Unsupported table: {table!r}")
+
+        if not record:
+            raise ValueError("record cannot be empty.")
+
+        with connect(self.database_url) as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+
+            supplied = {
+                str(key): value
+                for key, value in record.items()
+            }
+
+            unknown = set(supplied) - columns
+
+            if unknown:
+                raise ValueError(
+                    "Record contains unsupported columns: "
+                    + ", ".join(sorted(unknown))
+                )
+
+            insert_columns = list(supplied.keys())
+
+            placeholders = ", ".join(
+                "?" for _ in insert_columns
+            )
+
+            column_sql = ", ".join(
+                f'"{column}"'
+                for column in insert_columns
+            )
+
+            values = [
+                supplied[column]
+                for column in insert_columns
+            ]
+
+            connection.execute(
+                f"""
+                INSERT INTO {table} (
+                    {column_sql}
+                )
+                VALUES (
+                    {placeholders}
+                )
+                """,
+                values,
+            )
+
+            connection.commit()
+
+            row_id = connection.execute(
+                "SELECT last_insert_rowid() AS id"
+            ).fetchone()["id"]
+
+        return {
+            "table": table,
+            "id": row_id,
+            "record": dict(record),
+    }
