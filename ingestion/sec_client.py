@@ -35,19 +35,32 @@ class SECClient:
 
     A descriptive User-Agent is required by the SEC and must be supplied
     through application configuration rather than hard-coded credentials.
+
+    The base URL is optional at construction time so the client can be
+    instantiated for configuration and capability tests. Any actual SEC
+    request requires a configured base URL.
     """
 
     def __init__(
         self,
-        base_url: str,
-        user_agent: str,
+        base_url: str = "",
+        user_agent: str = "",
         timeout: int = 30,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.user_agent = user_agent.strip()
+        self.base_url = str(
+            base_url
+        ).strip().rstrip("/")
+
+        self.user_agent = str(
+            user_agent
+        ).strip()
+
         self.timeout = timeout
 
-    def _build_url(self, path: str) -> str:
+    def _build_url(
+        self,
+        path: str,
+    ) -> str:
         """
         Build an absolute SEC URL from a relative path.
         """
@@ -55,6 +68,11 @@ class SECClient:
         if not path:
             raise ValueError(
                 "SEC request path cannot be empty."
+            )
+
+        if not self.base_url:
+            raise SECRequestError(
+                "SEC base_url is not configured."
             )
 
         return (
@@ -224,4 +242,4 @@ class SECClient:
         return self.get_json(
             f"/files/submissions/"
             f"{normalized_filename}"
-  )
+      )
