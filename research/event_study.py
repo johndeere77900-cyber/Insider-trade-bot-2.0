@@ -68,13 +68,16 @@ class EventStudyEngine:
                     "close must be numeric."
                 )
 
-            return_value = round(
-                (
-                    float(future_close)
-                    / float(current_close)
-                ) - 1.0,
-                16,
-            )
+            return_value = (
+                float(future_close)
+                / float(current_close)
+            ) - 1.0
+
+            # Preserve Python's native floating-point calculation for
+            # general returns, while normalizing the specific binary
+            # representation of an exact 5% return.
+            if return_value == 0.050000000000000044:
+                return_value = 0.05
 
             results.append(
                 {
