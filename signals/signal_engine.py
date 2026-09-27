@@ -18,14 +18,12 @@ from core.hashing import sha256_record
 from core.models import Signal
 from research.research.event_study import EventStudySummary
 
+
 @dataclass(frozen=True)
 class SignalCriteria:
     """
     Explicit criteria used to determine whether a research result can
     produce a signal candidate.
-
-    These thresholds are methodology parameters, not guarantees of future
-    performance.
     """
 
     minimum_event_count: int = 30
@@ -35,16 +33,12 @@ class SignalCriteria:
 
 @dataclass(frozen=True)
 class SignalDecision:
-    """
-    Result of evaluating one research summary against signal criteria.
-    """
+    """Result of evaluating one research summary against signal criteria."""
 
     qualified: bool
-
     event_count: int
     positive_event_rate_pct: float | None
     mean_return_pct: float | None
-
     reasons: tuple[str, ...]
 
 
@@ -52,12 +46,7 @@ def evaluate_event_study(
     summary: EventStudySummary,
     criteria: SignalCriteria,
 ) -> SignalDecision:
-    """
-    Evaluate an event-study summary against explicit signal criteria.
-
-    Every criterion is checked independently. A signal qualifies only when
-    all required criteria are satisfied.
-    """
+    """Evaluate an event-study summary against explicit criteria."""
 
     if criteria.minimum_event_count < 1:
         raise ValueError(
@@ -98,9 +87,7 @@ def evaluate_event_study(
     return SignalDecision(
         qualified=not reasons,
         event_count=summary.event_count,
-        positive_event_rate_pct=(
-            summary.positive_event_rate_pct
-        ),
+        positive_event_rate_pct=summary.positive_event_rate_pct,
         mean_return_pct=summary.mean_return_pct,
         reasons=tuple(reasons),
     )
@@ -109,16 +96,7 @@ def evaluate_event_study(
 def calculate_signal_score(
     summary: EventStudySummary,
 ) -> float | None:
-    """
-    Calculate a deterministic descriptive signal score.
-
-    The score combines:
-        - positive-event rate
-        - mean return
-
-    It is a research metric only. It is not a probability, guarantee,
-    expected profit, or trading instruction.
-    """
+    """Calculate a deterministic descriptive signal score."""
 
     if (
         summary.positive_event_rate_pct is None
@@ -141,35 +119,23 @@ def create_signal(
     methodology_version: str,
     criteria: SignalCriteria,
 ) -> Signal | None:
-    """
-    Create a signal candidate if the research summary qualifies.
+    """Create a signal candidate if the research summary qualifies."""
 
-    Returns:
-        Signal when all criteria pass.
-        None when the research result does not qualify.
-    """
-
-    normalized_symbol = str(
-        symbol
-    ).strip()
+    normalized_symbol = str(symbol).strip()
 
     if not normalized_symbol:
         raise ValueError(
             "symbol cannot be empty."
         )
 
-    normalized_date = str(
-        signal_date
-    ).strip()
+    normalized_date = str(signal_date).strip()
 
     if not normalized_date:
         raise ValueError(
             "signal_date cannot be empty."
         )
 
-    normalized_type = str(
-        signal_type
-    ).strip()
+    normalized_type = str(signal_type).strip()
 
     if not normalized_type:
         raise ValueError(
@@ -193,9 +159,7 @@ def create_signal(
     if not decision.qualified:
         return None
 
-    score = calculate_signal_score(
-        summary
-    )
+    score = calculate_signal_score(summary)
 
     signal_identity = {
         "symbol": normalized_symbol,
@@ -206,9 +170,7 @@ def create_signal(
         "event_count": summary.event_count,
     }
 
-    signal_key = sha256_record(
-        signal_identity
-    )
+    signal_key = sha256_record(signal_identity)
 
     rationale = (
         "Qualified from event-study research. "
@@ -240,12 +202,7 @@ def create_signal_batch(
     methodology_version: str,
     criteria: SignalCriteria,
 ) -> list[Signal]:
-    """
-    Generate a signal list from one research summary.
-
-    The list-based interface makes the output compatible with later
-    persistence and downstream signal-processing components.
-    """
+    """Generate a signal list from one research summary."""
 
     signal = create_signal(
         symbol=symbol,
@@ -265,9 +222,7 @@ def create_signal_batch(
 def signal_to_dict(
     signal: Signal,
 ) -> dict[str, object]:
-    """
-    Convert a Signal model into a serializable dictionary.
-    """
+    """Convert a Signal model into a serializable dictionary."""
 
     return {
         "signal_key": signal.signal_key,
@@ -276,19 +231,12 @@ def signal_to_dict(
         "signal_type": signal.signal_type,
         "score": signal.score,
         "rationale": signal.rationale,
-        "methodology_version": (
-            signal.methodology_version
-        ),
+        "methodology_version": signal.methodology_version,
     }
 
 
 def build_signal_date() -> str:
-    """
-    Return the current UTC date in YYYY-MM-DD format.
-
-    This helper is intended for live system orchestration when a signal
-    date has not been explicitly supplied.
-    """
+    """Return the current UTC date in YYYY-MM-DD format."""
 
     return datetime.now(
         timezone.utc
@@ -298,12 +246,7 @@ def build_signal_date() -> str:
 def validate_signal_collection(
     signals: Iterable[Signal],
 ) -> list[str]:
-    """
-    Validate a collection of generated signals.
-
-    Returns a list of validation errors. An empty list means the collection
-    passed structural validation.
-    """
+    """Validate a collection of generated signals."""
 
     errors: list[str] = []
     seen_keys: set[str] = set()
@@ -341,8 +284,116 @@ def validate_signal_collection(
                 f"{prefix}.signal_key is duplicated."
             )
 
-        seen_keys.add(
-            signal.signal_key
-        )
+        seen_keys.add(signal.signal_key)
 
     return errors
+
+
+class SignalEngine:
+    """
+    Compatibility interface expected by the application and tests.
+
+    The underlying production signal functions remain available above.
+    This class provides the simpler generate_signal() interface used by
+    the current application/test layer.
+    """
+
+    def __init__(
+        self,
+        *,
+        minimum_event_count: int = 30,
+        minimum_positive_rate: float = 0.55,
+        minimum_mean_return: float = 0.0,
+    ) -> None:
+        if minimum_event_count < 1:
+            raise ValueError(
+                "minimum_event_count must be at least 1."
+            )
+
+        self.minimum_event_count = minimum_event_count
+        self.minimum_positive_rate = minimum_positive_rate
+        self.minimum_mean_return = minimum_mean_return
+
+    def generate_signal(
+        self,
+        *,
+        symbol: str,
+        event_returns: Iterable[float],
+    ) -> dict[str, object]:
+        """
+        Generate a descriptive signal result from historical event returns.
+
+        This method does not execute trades.
+        """
+
+        normalized_symbol = str(symbol).strip()
+
+        if not normalized_symbol:
+            raise ValueError(
+                "symbol cannot be empty."
+            )
+
+        returns = [
+            float(value)
+            for value in event_returns
+        ]
+
+        if len(returns) < self.minimum_event_count:
+            return {
+                "symbol": normalized_symbol,
+                "signal": "INSUFFICIENT_DATA",
+                "positive_rate": (
+                    self._positive_rate(returns)
+                ),
+                "mean_return": (
+                    self._mean_return(returns)
+                ),
+            }
+
+        positive_rate = self._positive_rate(
+            returns
+        )
+
+        mean_return = self._mean_return(
+            returns
+        )
+
+        if (
+            positive_rate >= self.minimum_positive_rate
+            and mean_return >= self.minimum_mean_return
+        ):
+            signal = "SIGNAL"
+        else:
+            signal = "NO_SIGNAL"
+
+        return {
+            "symbol": normalized_symbol,
+            "signal": signal,
+            "positive_rate": positive_rate,
+            "mean_return": mean_return,
+        }
+
+    @staticmethod
+    def _positive_rate(
+        returns: list[float],
+    ) -> float:
+        if not returns:
+            return 0.0
+
+        return (
+            sum(
+                1
+                for value in returns
+                if value > 0
+            )
+            / len(returns)
+        )
+
+    @staticmethod
+    def _mean_return(
+        returns: list[float],
+    ) -> float:
+        if not returns:
+            return 0.0
+
+        return sum(returns) / len(returns)
