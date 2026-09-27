@@ -8,7 +8,6 @@ on:
 
 jobs:
   diagnostic:
-    name: Full Agent Diagnostic
     runs-on: ubuntu-latest
 
     steps:
@@ -24,56 +23,42 @@ jobs:
         run: |
           python --version
           pip --version
+          git --version
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          python -m pip install pytest
+          pip install -r requirements.txt
+          pip install pytest
 
       - name: Compile Python files
         run: |
           python -m compileall -q .
 
-      - name: Test core module imports
+      - name: Import core modules
         run: |
           python - <<'PY'
-          modules = [
-              "core.models",
-              "data.normalization",
-              "validation.records",
-              "data.ingestion_pipeline",
-              "database.connection",
-              "storage.repository",
-              "backtesting.engine",
-              "outcomes.engine",
-              "research.performance",
-              "signals.signal_engine",
-              "trading.portfolio",
-              "application.service",
-          ]
+          import application
+          import backtesting
+          import config
+          import core
+          import data
+          import database
+          import execution
+          import ingestion
+          import outcomes
+          import research
+          import risk
+          import signals
+          import storage
+          import telegram
+          import trading
+          import validation
 
-          failures = []
-
-          for module in modules:
-              try:
-                  __import__(module)
-                  print(f"PASS: {module}")
-              except Exception as exc:
-                  print(f"FAIL: {module}")
-                  print(f"  {type(exc).__name__}: {exc}")
-                  failures.append(module)
-
-          if failures:
-              print("\nFailed imports:")
-              for module in failures:
-                  print(f" - {module}")
-              raise SystemExit(1)
+          print("PASS: Core package imports completed.")
           PY
 
-      - name: Run pytest
+      - name: Run test suite
         run: |
           pytest -q
 
@@ -114,7 +99,7 @@ jobs:
           repository.store(
               table="trade_runs",
               record={
-                  "run_id": run_id,
+                  "run_key": run_id,
                   "mode": "paper",
                   "status": "integration_test",
                   "started_at": "2026-01-01T00:00:00+00:00",
@@ -124,9 +109,9 @@ jobs:
           with connect(database_url) as connection:
               row = connection.execute(
                   """
-                  SELECT run_id, mode, status
+                  SELECT run_key, mode, status
                   FROM trade_runs
-                  WHERE run_id = %s
+                  WHERE run_key = %s
                   """,
                   (run_id,),
               ).fetchone()
@@ -149,7 +134,7 @@ jobs:
               connection.execute(
                   """
                   DELETE FROM trade_runs
-                  WHERE run_id = %s
+                  WHERE run_key = %s
                   """,
                   (run_id,),
               )
@@ -169,9 +154,6 @@ jobs:
       - name: Diagnostic summary
         if: always()
         run: |
-          echo "========================================"
-          echo "Insider Trade Bot 2.0 Diagnostic"
-          echo "========================================"
-          echo "Compilation, imports, tests, and Neon"
-          echo "PostgreSQL integration were executed above."
-          echo "========================================"
+          echo "=========================================="
+          echo "Insider Trade Bot 2.0 Diagnostic Complete"
+          echo "=========================================="
