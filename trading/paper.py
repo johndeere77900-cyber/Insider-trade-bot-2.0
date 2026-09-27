@@ -57,6 +57,9 @@ class PaperTradingEngine:
     ) -> None:
         self.enabled = enabled
 
+        self._positions: dict[str, float] = {}
+        self._orders: list[PaperOrder] = []
+
     @staticmethod
     def _utc_now() -> str:
         """
@@ -108,6 +111,34 @@ class PaperTradingEngine:
             raise PaperTradingError(
                 "reference_price must be greater than zero."
             )
+
+    def get_positions(
+        self,
+    ) -> dict[str, float]:
+        """
+        Return the current simulated paper positions.
+
+        A copy is returned so callers cannot directly mutate the engine's
+        internal state.
+        """
+
+        return dict(
+            self._positions
+        )
+
+    def get_orders(
+        self,
+    ) -> list[PaperOrder]:
+        """
+        Return all simulated paper orders.
+
+        A copy is returned so callers cannot directly mutate the engine's
+        internal order list.
+        """
+
+        return list(
+            self._orders
+        )
 
     def create_order(
         self,
@@ -162,7 +193,7 @@ class PaperTradingEngine:
             f"PAPER-{uuid4().hex}"
         )
 
-        return PaperOrder(
+        order = PaperOrder(
             order_id=order_id,
             signal_key=signal.signal_key,
             symbol=signal.symbol,
@@ -174,6 +205,42 @@ class PaperTradingEngine:
             status="simulated",
             created_at=self._utc_now(),
         )
+
+        self._orders.append(
+            order
+        )
+
+        normalized_symbol = (
+            signal.symbol.strip().upper()
+        )
+
+        current_quantity = self._positions.get(
+            normalized_symbol,
+            0.0,
+        )
+
+        if normalized_side == "buy":
+            self._positions[
+                normalized_symbol
+            ] = current_quantity + float(quantity)
+
+        elif normalized_side == "sell":
+            remaining_quantity = (
+                current_quantity
+                - float(quantity)
+            )
+
+            if remaining_quantity <= 0:
+                self._positions.pop(
+                    normalized_symbol,
+                    None,
+                )
+            else:
+                self._positions[
+                    normalized_symbol
+                ] = remaining_quantity
+
+        return order
 
     def cancel_order(
         self,
@@ -193,7 +260,7 @@ class PaperTradingEngine:
                 "order must be a PaperOrder instance."
             )
 
-        return PaperOrder(
+        cancelled_order = PaperOrder(
             order_id=order.order_id,
             signal_key=order.signal_key,
             symbol=order.symbol,
@@ -202,4 +269,15 @@ class PaperTradingEngine:
             reference_price=order.reference_price,
             status="cancelled",
             created_at=order.created_at,
-  )
+        )
+
+        for index, existing_order in enumerate(
+            self._orders
+        ):
+            if existing_order.order_id == order.order_id:
+                self._orders[
+                    index
+                ] = cancelled_order
+                break
+
+        return cancelled_order
