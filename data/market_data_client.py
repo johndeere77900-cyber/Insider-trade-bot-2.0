@@ -40,24 +40,28 @@ class MarketDataClient:
 
     The provider URL is supplied by configuration so that the rest of the
     system remains independent of a specific market-data vendor.
-
-    Provider-specific authentication and endpoint details are intentionally
-    handled through configuration rather than hard-coded credentials.
     """
 
     def __init__(
         self,
-        base_url: str,
+        base_url: str = "",
         api_key: str = "",
         timeout: int = 30,
         api_key_parameter: str = "apikey",
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key.strip()
+        self.base_url = str(
+            base_url
+        ).strip().rstrip("/")
+
+        self.api_key = str(
+            api_key
+        ).strip()
+
         self.timeout = timeout
-        self.api_key_parameter = (
-            api_key_parameter.strip()
-        )
+
+        self.api_key_parameter = str(
+            api_key_parameter
+        ).strip()
 
     def _build_url(
         self,
@@ -68,14 +72,19 @@ class MarketDataClient:
         Build an HTTP URL with optional query parameters.
         """
 
-        if not path.strip():
+        if not str(path).strip():
             raise ValueError(
                 "Market-data request path cannot be empty."
             )
 
+        if not self.base_url:
+            raise MarketDataRequestError(
+                "Market-data base_url is not configured."
+            )
+
         url = (
             f"{self.base_url}/"
-            f"{path.lstrip('/')}"
+            f"{str(path).lstrip('/')}"
         )
 
         query_parameters: dict[str, str] = {}
@@ -153,7 +162,7 @@ class MarketDataClient:
                     200 <= status < 300
                 ):
                     raise MarketDataResponseError(
-                        f"Market-data provider returned "
+                        "Market-data provider returned "
                         f"HTTP status {status}."
                     )
 
@@ -161,7 +170,7 @@ class MarketDataClient:
 
         except HTTPError as exc:
             raise MarketDataRequestError(
-                f"Market-data request failed with "
+                "Market-data request failed with "
                 f"HTTP {exc.code}: {exc.reason}"
             ) from exc
 
@@ -178,7 +187,8 @@ class MarketDataClient:
 
         except OSError as exc:
             raise MarketDataRequestError(
-                f"Market-data network operation failed: {exc}"
+                "Market-data network operation failed: "
+                f"{exc}"
             ) from exc
 
         try:
@@ -203,9 +213,6 @@ class MarketDataClient:
     ) -> object:
         """
         Retrieve arbitrary JSON data from the configured provider.
-
-        This method is intentionally generic because the exact market-data
-        provider will be selected and configured separately.
         """
 
         return self._request_json(
@@ -272,4 +279,4 @@ class MarketDataClient:
         return self._request_json(
             path,
             parameters,
-)
+            )
