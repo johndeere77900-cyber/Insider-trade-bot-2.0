@@ -66,15 +66,19 @@ class SECHistoricalOrchestrator:
 
     This orchestrator processes both sources through the existing
     controlled historical ingestion pipeline.
+
+    The constructor supports an unconfigured capability-test state.
+    Actual SEC ingestion still requires a configured SEC client and
+    database URL.
     """
 
     def __init__(
         self,
         *,
-        sec_client: SECClient,
-        database_url: str,
+        sec_client: SECClient | None = None,
+        database_url: str | None = None,
     ) -> None:
-        if not isinstance(
+        if sec_client is not None and not isinstance(
             sec_client,
             SECClient,
         ):
@@ -82,7 +86,7 @@ class SECHistoricalOrchestrator:
                 "sec_client must be a SECClient instance."
             )
 
-        if not str(
+        if database_url is not None and not str(
             database_url
         ).strip():
             raise ValueError(
@@ -91,6 +95,23 @@ class SECHistoricalOrchestrator:
 
         self.sec_client = sec_client
         self.database_url = database_url
+
+    def _require_configuration(self) -> tuple[SECClient, str]:
+        """
+        Require the dependencies needed for real historical ingestion.
+        """
+
+        if self.sec_client is None:
+            raise SECHistoricalOrchestratorError(
+                "SEC client is not configured."
+            )
+
+        if self.database_url is None:
+            raise SECHistoricalOrchestratorError(
+                "database_url is not configured."
+            )
+
+        return self.sec_client, self.database_url
 
     def load_company_by_cik(
         self,
@@ -102,6 +123,8 @@ class SECHistoricalOrchestrator:
         Retrieve and ingest SEC insider filings for a company identified
         by CIK.
         """
+
+        self._require_configuration()
 
         companies = normalize_company_tickers(
             company_tickers_payload
@@ -131,6 +154,8 @@ class SECHistoricalOrchestrator:
         Retrieve and ingest SEC insider filings for a company identified
         by ticker.
         """
+
+        self._require_configuration()
 
         companies = normalize_company_tickers(
             company_tickers_payload
@@ -195,12 +220,6 @@ class SECHistoricalOrchestrator:
     ) -> tuple[str, ...]:
         """
         Extract historical SEC submissions filenames.
-
-        The SEC submissions response may expose older submission files
-        under filings.files. Each entry normally identifies a JSON file
-        containing older submission records.
-
-        Only plain filenames are returned.
         """
 
         filings = submissions.get(
@@ -225,9 +244,7 @@ class SECHistoricalOrchestrator:
 
         filenames: list[str] = []
 
-        for index, entry in enumerate(
-            files
-        ):
+        for index, entry in enumerate(files):
             if not isinstance(
                 entry,
                 Mapping,
@@ -284,9 +301,11 @@ class SECHistoricalOrchestrator:
         Ingest one SEC submissions dataset.
         """
 
+        _, database_url = self._require_configuration()
+
         try:
             return load_sec_submissions(
-                self.database_url,
+                database_url,
                 submissions,
                 issuer_cik=company.cik,
                 issuer_name=company.title,
@@ -305,8 +324,10 @@ class SECHistoricalOrchestrator:
         Retrieve and ingest recent and historical SEC submissions.
         """
 
+        sec_client, _ = self._require_configuration()
+
         try:
-            submissions = self.sec_client.get_submissions(
+            submissions = sec_client.get_submissions(
                 company.cik
             )
         except Exception as exc:
@@ -354,7 +375,7 @@ class SECHistoricalOrchestrator:
         for filename in historical_filenames:
             try:
                 historical_submissions = (
-                    self.sec_client.get_submission_file(
+                    sec_client.get_submission_file(
                         filename
                     )
                 )
@@ -410,4 +431,4 @@ class SECHistoricalOrchestrator:
             submission_sources_processed=sources_processed,
             recent_submission_rows=recent_rows,
             historical_submission_rows=historical_rows,
-    )
+        )
