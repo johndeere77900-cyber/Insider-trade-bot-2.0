@@ -73,6 +73,13 @@ class EventStudyEngine:
                 float(future_close),
             ) / 100.0
 
+            # Normalize harmless IEEE-754 floating-point representation
+            # noise without changing the underlying financial calculation.
+            return_value = round(
+                return_value,
+                10,
+            )
+
             results.append(
                 {
                     "date": future.get("date"),
