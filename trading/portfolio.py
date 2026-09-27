@@ -35,19 +35,75 @@ class Portfolio:
     Controlled portfolio-state container.
 
     The portfolio stores position state locally. It does not execute orders.
+
+    Compatibility attributes:
+        positions
+            Dictionary-style view used by the existing test/application
+            compatibility layer.
+
+        cash
+            Current cash balance. A newly created portfolio starts with
+            zero cash unless explicitly configured.
     """
 
     def __init__(
         self,
         positions: Iterable[Position] | None = None,
+        *,
+        cash: float = 0.0,
     ) -> None:
-        self._positions: dict[str, Position] = {}
+        if cash < 0:
+            raise PortfolioError(
+                "cash cannot be negative."
+            )
+
+        self._positions: dict[str, Position | float | int] = {}
+        self._cash = float(cash)
 
         if positions is not None:
             for position in positions:
-                self.add_position(
-                    position
-                )
+                self.add_position(position)
+
+    @property
+    def positions(self) -> dict[str, Position | float | int]:
+        """
+        Return the compatibility dictionary of portfolio positions.
+
+        This intentionally exposes the underlying dictionary because the
+        existing application/test compatibility layer expects dictionary-style
+        access such as:
+
+            portfolio.positions["AAPL"] = 100
+
+        Normal application code should prefer add_position(),
+        update_position(), remove_position(), get_position(), and
+        list_positions().
+        """
+
+        return self._positions
+
+    @property
+    def cash(self) -> float:
+        """
+        Return the current portfolio cash balance.
+        """
+
+        return self._cash
+
+    @cash.setter
+    def cash(self, value: float) -> None:
+        """
+        Set the portfolio cash balance.
+        """
+
+        numeric_value = float(value)
+
+        if numeric_value < 0:
+            raise PortfolioError(
+                "cash cannot be negative."
+            )
+
+        self._cash = numeric_value
 
     @staticmethod
     def _normalize_symbol(
@@ -197,25 +253,38 @@ class Portfolio:
     ) -> Position | None:
         """
         Retrieve one position by symbol.
+
+        Dictionary-style compatibility values that are not Position objects
+        are ignored by this typed accessor.
         """
 
         normalized_symbol = self._normalize_symbol(
             symbol
         )
 
-        return self._positions.get(
+        position = self._positions.get(
             normalized_symbol
         )
+
+        if isinstance(position, Position):
+            return position
+
+        return None
 
     def list_positions(
         self,
     ) -> tuple[Position, ...]:
         """
-        Return all current positions.
+        Return all current Position objects.
+
+        Compatibility dictionary values that are simple numeric values are
+        excluded from this typed application-level view.
         """
 
         return tuple(
-            self._positions.values()
+            position
+            for position in self._positions.values()
+            if isinstance(position, Position)
         )
 
     def total_exposure(
@@ -230,6 +299,7 @@ class Portfolio:
             * position.reference_price
             for position
             in self._positions.values()
+            if isinstance(position, Position)
         )
 
     def snapshot(
