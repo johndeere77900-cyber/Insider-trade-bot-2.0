@@ -1,15 +1,14 @@
 """
 Data normalization layer for Insider Trade Bot.
 
-This module converts externally retrieved data into the normalized domain
-models used by validation, storage, research, and downstream components.
-
-Normalization does not prove that the source data is correct or complete.
-That responsibility belongs to validation and reconciliation layers.
+Normalization converts external records into stable internal representations.
+Compatibility helpers return dictionaries for lightweight callers/tests,
+while the existing model-based functions remain available for ingestion.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any, Mapping
 
 from core.models import (
@@ -23,34 +22,19 @@ class NormalizationError(Exception):
     """Raised when external data cannot be normalized safely."""
 
 
-def _text(
-    value: Any,
-) -> str | None:
-    """
-    Normalize a value into stripped text.
-
-    Empty values become None.
-    """
-
+def _text(value: Any) -> str | None:
     if value is None:
         return None
 
     result = str(value).strip()
 
-    if not result:
-        return None
-
-    return result
+    return result or None
 
 
 def _required_text(
     value: Any,
     field_name: str,
 ) -> str:
-    """
-    Normalize a required text field.
-    """
-
     result = _text(value)
 
     if result is None:
@@ -65,63 +49,44 @@ def _number(
     value: Any,
     field_name: str,
 ) -> float | None:
-    """
-    Normalize a numeric value.
-
-    Commas and surrounding whitespace are accepted for textual numbers.
-    """
-
     if value is None:
         return None
 
-    if isinstance(
-        value,
-        bool,
-    ):
+    if isinstance(value, bool):
         raise NormalizationError(
             f"{field_name} must be numeric."
         )
 
-    if isinstance(
-        value,
-        (int, float),
-    ):
-        return float(value)
+    if isinstance(value, (int, float)):
+        result = float(value)
+    else:
+        text_value = str(value).strip()
 
-    text_value = str(
-        value
-    ).strip()
+        if not text_value:
+            return None
 
-    if not text_value:
-        return None
+        text_value = text_value.replace(",", "")
 
-    text_value = text_value.replace(
-        ",",
-        "",
-    )
+        try:
+            result = float(text_value)
+        except ValueError as exc:
+            raise NormalizationError(
+                f"{field_name} must be numeric."
+            ) from exc
 
-    try:
-        return float(
-            text_value
-        )
-    except ValueError as exc:
+    if not math.isfinite(result):
         raise NormalizationError(
-            f"{field_name} must be numeric."
-        ) from exc
+            f"{field_name} must be finite."
+        )
+
+    return result
 
 
 def _mapping(
     value: Any,
     field_name: str,
 ) -> Mapping[str, Any]:
-    """
-    Ensure a supplied object behaves like a mapping.
-    """
-
-    if not isinstance(
-        value,
-        Mapping,
-    ):
+    if not isinstance(value, Mapping):
         raise NormalizationError(
             f"{field_name} must be an object or mapping."
         )
@@ -129,18 +94,27 @@ def _mapping(
     return value
 
 
+def _first_present(
+    data: Mapping[str, Any],
+    *keys: str,
+) -> Any:
+    """
+    Return the first value whose key actually exists.
+
+    Unlike `a or b`, this preserves legitimate zero values.
+    """
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+
+    return None
+
+
 def normalize_insider_transaction(
     payload: Mapping[str, Any],
     *,
     source: str,
 ) -> InsiderTransaction:
-    """
-    Normalize one externally retrieved insider transaction.
-
-    The function accepts common field aliases so that different upstream
-    data representations can be mapped into one internal model.
-    """
-
     data = _mapping(
         payload,
         "payload",
@@ -152,16 +126,22 @@ def normalize_insider_transaction(
     )
 
     accession_number = _required_text(
-        data.get("accession_number")
-        or data.get("accessionNumber")
-        or data.get("accession"),
+        _first_present(
+            data,
+            "accession_number",
+            "accessionNumber",
+            "accession",
+        ),
         "accession_number",
     )
 
     issuer_cik = _required_text(
-        data.get("issuer_cik")
-        or data.get("issuerCik")
-        or data.get("cik"),
+        _first_present(
+            data,
+            "issuer_cik",
+            "issuerCik",
+            "cik",
+        ),
         "issuer_cik",
     )
 
@@ -170,51 +150,83 @@ def normalize_insider_transaction(
         accession_number=accession_number,
         issuer_cik=issuer_cik,
         issuer_name=_text(
-            data.get("issuer_name")
-            or data.get("issuerName")
-            or data.get("issuer")
+            _first_present(
+                data,
+                "issuer_name",
+                "issuerName",
+                "issuer",
+            )
         ),
         insider_name=_text(
-            data.get("insider_name")
-            or data.get("insiderName")
-            or data.get("reporting_owner_name")
+            _first_present(
+                data,
+                "insider_name",
+                "insiderName",
+                "reporting_owner_name",
+                "insider",
+            )
         ),
         insider_cik=_text(
-            data.get("insider_cik")
-            or data.get("insiderCik")
-            or data.get("reporting_owner_cik")
+            _first_present(
+                data,
+                "insider_cik",
+                "insiderCik",
+                "reporting_owner_cik",
+            )
         ),
         transaction_date=_text(
-            data.get("transaction_date")
-            or data.get("transactionDate")
-            or data.get("transaction_date_formatted")
+            _first_present(
+                data,
+                "transaction_date",
+                "transactionDate",
+                "transaction_date_formatted",
+            )
         ),
         filing_date=_text(
-            data.get("filing_date")
-            or data.get("filingDate")
+            _first_present(
+                data,
+                "filing_date",
+                "filingDate",
+            )
         ),
         form_type=_text(
-            data.get("form_type")
-            or data.get("formType")
-            or data.get("form")
+            _first_present(
+                data,
+                "form_type",
+                "formType",
+                "form",
+            )
         ),
         transaction_code=_text(
-            data.get("transaction_code")
-            or data.get("transactionCode")
-            or data.get("code")
+            _first_present(
+                data,
+                "transaction_code",
+                "transactionCode",
+                "code",
+                "transaction_type",
+            )
         ),
         shares=_number(
-            data.get("shares"),
+            _first_present(
+                data,
+                "shares",
+            ),
             "shares",
         ),
         price=_number(
-            data.get("price")
-            or data.get("transaction_price"),
+            _first_present(
+                data,
+                "price",
+                "transaction_price",
+            ),
             "price",
         ),
         ownership_type=_text(
-            data.get("ownership_type")
-            or data.get("ownershipType")
+            _first_present(
+                data,
+                "ownership_type",
+                "ownershipType",
+            )
         ),
     )
 
@@ -224,10 +236,6 @@ def normalize_market_price(
     *,
     source: str,
 ) -> MarketPrice:
-    """
-    Normalize one market-price record.
-    """
-
     data = _mapping(
         payload,
         "payload",
@@ -239,15 +247,21 @@ def normalize_market_price(
     )
 
     symbol = _required_text(
-        data.get("symbol")
-        or data.get("ticker"),
+        _first_present(
+            data,
+            "symbol",
+            "ticker",
+        ),
         "symbol",
     )
 
     price_date = _required_text(
-        data.get("price_date")
-        or data.get("priceDate")
-        or data.get("date"),
+        _first_present(
+            data,
+            "price_date",
+            "priceDate",
+            "date",
+        ),
         "price_date",
     )
 
@@ -255,29 +269,32 @@ def normalize_market_price(
         symbol=symbol.upper(),
         price_date=price_date,
         open=_number(
-            data.get("open"),
+            _first_present(data, "open"),
             "open",
         ),
         high=_number(
-            data.get("high"),
+            _first_present(data, "high"),
             "high",
         ),
         low=_number(
-            data.get("low"),
+            _first_present(data, "low"),
             "low",
         ),
         close=_number(
-            data.get("close"),
+            _first_present(data, "close"),
             "close",
         ),
         adjusted_close=_number(
-            data.get("adjusted_close")
-            or data.get("adjustedClose")
-            or data.get("adj_close"),
+            _first_present(
+                data,
+                "adjusted_close",
+                "adjustedClose",
+                "adj_close",
+            ),
             "adjusted_close",
         ),
         volume=_number(
-            data.get("volume"),
+            _first_present(data, "volume"),
             "volume",
         ),
         source=normalized_source,
@@ -289,10 +306,6 @@ def normalize_corporate_action(
     *,
     source: str,
 ) -> CorporateAction:
-    """
-    Normalize one corporate-action record.
-    """
-
     data = _mapping(
         payload,
         "payload",
@@ -304,22 +317,31 @@ def normalize_corporate_action(
     )
 
     symbol = _required_text(
-        data.get("symbol")
-        or data.get("ticker"),
+        _first_present(
+            data,
+            "symbol",
+            "ticker",
+        ),
         "symbol",
     )
 
     action_type = _required_text(
-        data.get("action_type")
-        or data.get("actionType")
-        or data.get("type"),
+        _first_present(
+            data,
+            "action_type",
+            "actionType",
+            "type",
+        ),
         "action_type",
     )
 
     action_date = _required_text(
-        data.get("action_date")
-        or data.get("actionDate")
-        or data.get("date"),
+        _first_present(
+            data,
+            "action_date",
+            "actionDate",
+            "date",
+        ),
         "action_date",
     )
 
@@ -328,16 +350,180 @@ def normalize_corporate_action(
         action_type=action_type,
         action_date=action_date,
         ratio=_text(
-            data.get("ratio")
+            _first_present(
+                data,
+                "ratio",
+            )
         ),
         cash_amount=_number(
-            data.get("cash_amount")
-            or data.get("cashAmount")
-            or data.get("amount"),
+            _first_present(
+                data,
+                "cash_amount",
+                "cashAmount",
+                "amount",
+            ),
             "cash_amount",
         ),
         source=normalized_source,
     )
+
+
+def normalize_insider_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """
+    Compatibility normalizer used by lightweight callers.
+
+    Returns a plain dictionary rather than a domain dataclass.
+    """
+
+    data = _mapping(
+        record,
+        "record",
+    )
+
+    symbol = _required_text(
+        _first_present(
+            data,
+            "symbol",
+            "ticker",
+        ),
+        "symbol",
+    )
+
+    insider_name = _text(
+        _first_present(
+            data,
+            "insider_name",
+            "insiderName",
+            "insider",
+            "reporting_owner_name",
+        )
+    )
+
+    transaction_date = _text(
+        _first_present(
+            data,
+            "transaction_date",
+            "transactionDate",
+        )
+    )
+
+    transaction_type = _text(
+        _first_present(
+            data,
+            "transaction_type",
+            "transactionType",
+            "transaction_code",
+            "transactionCode",
+        )
+    )
+
+    shares = _number(
+        _first_present(
+            data,
+            "shares",
+        ),
+        "shares",
+    )
+
+    price = _number(
+        _first_present(
+            data,
+            "price",
+            "transaction_price",
+        ),
+        "price",
+    )
+
+    source = _required_text(
+        _first_present(
+            data,
+            "source",
+        ),
+        "source",
+    )
+
+    accession_number = _text(
+        _first_present(
+            data,
+            "accession_number",
+            "accessionNumber",
+            "accession",
+        )
+    )
+
+    return {
+        "symbol": symbol.upper(),
+        "insider_name": insider_name,
+        "transaction_date": transaction_date,
+        "transaction_type": transaction_type,
+        "shares": shares,
+        "price": price,
+        "source": source,
+        "accession_number": accession_number,
+    }
+
+
+def normalize_market_price_record(
+    record: Mapping[str, Any],
+) -> dict[str, Any]:
+    """
+    Compatibility dictionary normalizer for market-price records.
+    """
+
+    data = _mapping(
+        record,
+        "record",
+    )
+
+    symbol = _required_text(
+        _first_present(
+            data,
+            "symbol",
+            "ticker",
+        ),
+        "symbol",
+    )
+
+    price_date = _required_text(
+        _first_present(
+            data,
+            "price_date",
+            "priceDate",
+            "date",
+        ),
+        "price_date",
+    )
+
+    return {
+        "symbol": symbol.upper(),
+        "price_date": price_date,
+        "open_price": _number(
+            _first_present(data, "open", "open_price"),
+            "open",
+        ),
+        "high_price": _number(
+            _first_present(data, "high", "high_price"),
+            "high",
+        ),
+        "low_price": _number(
+            _first_present(data, "low", "low_price"),
+            "low",
+        ),
+        "close_price": _number(
+            _first_present(data, "close", "close_price"),
+            "close",
+        ),
+        "volume": _number(
+            _first_present(data, "volume"),
+            "volume",
+        ),
+        "source": _required_text(
+            _first_present(data, "source"),
+            "source",
+        ),
+    }
 
 
 def normalize_batch(
@@ -350,16 +536,6 @@ def normalize_batch(
     | MarketPrice
     | CorporateAction
 ]:
-    """
-    Normalize a homogeneous batch of records.
-
-    Supported record types:
-
-        insider_transaction
-        market_price
-        corporate_action
-    """
-
     normalized_type = str(
         record_type
     ).strip().lower()
@@ -386,13 +562,11 @@ def normalize_batch(
                     record,
                     source=source,
                 )
-
             elif normalized_type == "market_price":
                 result = normalize_market_price(
                     record,
                     source=source,
                 )
-
             else:
                 result = normalize_corporate_action(
                     record,
