@@ -6,6 +6,9 @@ records and provenance information.
 
 Raw external data must not be treated as validated merely because it was
 retrieved successfully.
+
+The repository supports both SQLite and PostgreSQL through the database
+backend selected by database_url.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from core.hashing import sha256_record
 from database.connection import (
     connect,
     initialize_database,
+    is_postgresql_url,
 )
 
 
@@ -31,6 +35,84 @@ ALLOWED_PAYLOAD_TABLES = {
 def utc_now() -> str:
     """Return the current UTC timestamp in ISO-8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _placeholder(database_url: str) -> str:
+    """Return the SQL parameter placeholder for the configured backend."""
+    return "%s" if is_postgresql_url(database_url) else "?"
+
+
+def _row_value(row: Any, key: str, index: int = 0) -> Any:
+    """
+    Read a value from either a mapping-style row or a tuple-style row.
+
+    SQLite is configured with sqlite3.Row. PostgreSQL psycopg connections
+    may return ordinary tuples unless a row factory is explicitly configured.
+    """
+    if row is None:
+        return None
+
+    if isinstance(row, Mapping):
+        return row[key]
+
+    return row[index]
+
+
+def _quote_identifier(identifier: str) -> str:
+    """
+    Quote a trusted SQL identifier.
+
+    Identifiers passed here are always checked against an explicit allowlist
+    before this helper is used.
+    """
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _table_columns(
+    database_url: str,
+    table: str,
+) -> set[str]:
+    """Return the columns for an approved table."""
+
+    if is_postgresql_url(database_url):
+        query = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+        """
+        parameters = (table,)
+    else:
+        query = f"""
+            PRAGMA table_info({_quote_identifier(table)})
+        """
+        parameters = ()
+
+    with connect(database_url) as connection:
+        cursor = connection.execute(
+            query,
+            parameters,
+        )
+        rows = cursor.fetchall()
+
+    if is_postgresql_url(database_url):
+        return {
+            str(_row_value(row, "column_name"))
+            for row in rows
+        }
+
+    return {
+        str(_row_value(row, "name"))
+        for row in rows
+    }
+
+
+def _insert_ignore_sql(database_url: str) -> str:
+    """Return the backend-specific conflict-ignore clause."""
+    if is_postgresql_url(database_url):
+        return "ON CONFLICT DO NOTHING"
+
+    return "INSERT OR IGNORE"
 
 
 def store_provenance(
@@ -58,9 +140,11 @@ def store_provenance(
 
     initialize_database(database_url)
 
+    placeholder = _placeholder(database_url)
+
     with connect(database_url) as connection:
         connection.execute(
-            """
+            f"""
             INSERT INTO provenance (
                 record_type,
                 record_id,
@@ -70,7 +154,15 @@ def store_provenance(
                 checksum,
                 validation_status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                {placeholder},
+                {placeholder},
+                {placeholder},
+                {placeholder},
+                {placeholder},
+                {placeholder},
+                {placeholder}
+            )
             """,
             (
                 record_type,
@@ -109,56 +201,86 @@ def store_insider_transaction(
     initialize_database(database_url)
 
     record_hash = sha256_record(raw_payload)
+    placeholder = _placeholder(database_url)
+
+    columns = """
+        source,
+        accession_number,
+        issuer_cik,
+        issuer_name,
+        insider_name,
+        insider_cik,
+        transaction_date,
+        filing_date,
+        form_type,
+        transaction_code,
+        shares,
+        price,
+        ownership_type,
+        raw_payload,
+        record_hash,
+        created_at
+    """
+
+    values = (
+        source,
+        accession_number,
+        issuer_cik,
+        issuer_name,
+        insider_name,
+        insider_cik,
+        transaction_date,
+        filing_date,
+        form_type,
+        transaction_code,
+        shares,
+        price,
+        ownership_type,
+        json.dumps(
+            raw_payload,
+            sort_keys=True,
+            default=str,
+        ),
+        record_hash,
+        utc_now(),
+    )
+
+    placeholders = ", ".join(
+        placeholder
+        for _ in values
+    )
 
     with connect(database_url) as connection:
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO insider_transactions (
-                source,
-                accession_number,
-                issuer_cik,
-                issuer_name,
-                insider_name,
-                insider_cik,
-                transaction_date,
-                filing_date,
-                form_type,
-                transaction_code,
-                shares,
-                price,
-                ownership_type,
-                raw_payload,
-                record_hash,
-                created_at
+        if is_postgresql_url(database_url):
+            connection.execute(
+                f"""
+                INSERT INTO insider_transactions (
+                    {columns}
+                )
+                VALUES (
+                    {placeholders}
+                )
+                ON CONFLICT (
+                    source,
+                    accession_number,
+                    record_hash
+                )
+                DO NOTHING
+                """,
+                values,
             )
-            VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?
+        else:
+            connection.execute(
+                f"""
+                INSERT OR IGNORE INTO insider_transactions (
+                    {columns}
+                )
+                VALUES (
+                    {placeholders}
+                )
+                """,
+                values,
             )
-            """,
-            (
-                source,
-                accession_number,
-                issuer_cik,
-                issuer_name,
-                insider_name,
-                insider_cik,
-                transaction_date,
-                filing_date,
-                form_type,
-                transaction_code,
-                shares,
-                price,
-                ownership_type,
-                json.dumps(
-                    raw_payload,
-                    sort_keys=True,
-                    default=str,
-                ),
-                record_hash,
-                utc_now(),
-            ),
-        )
 
         connection.commit()
 
@@ -184,39 +306,78 @@ def store_market_price(
     initialize_database(database_url)
 
     record_hash = sha256_record(raw_payload)
+    placeholder = _placeholder(database_url)
+
+    values = (
+        symbol,
+        price_date,
+        open_price,
+        high,
+        low,
+        close,
+        adjusted_close,
+        volume,
+        source,
+        record_hash,
+        utc_now(),
+    )
+
+    placeholders = ", ".join(
+        placeholder
+        for _ in values
+    )
 
     with connect(database_url) as connection:
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO market_prices (
-                symbol,
-                price_date,
-                open,
-                high,
-                low,
-                close,
-                adjusted_close,
-                volume,
-                source,
-                record_hash,
-                created_at
+        if is_postgresql_url(database_url):
+            connection.execute(
+                f"""
+                INSERT INTO market_prices (
+                    symbol,
+                    price_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    adjusted_close,
+                    volume,
+                    source,
+                    record_hash,
+                    created_at
+                )
+                VALUES (
+                    {placeholders}
+                )
+                ON CONFLICT (
+                    symbol,
+                    price_date,
+                    source
+                )
+                DO NOTHING
+                """,
+                values,
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                symbol,
-                price_date,
-                open_price,
-                high,
-                low,
-                close,
-                adjusted_close,
-                volume,
-                source,
-                record_hash,
-                utc_now(),
-            ),
-        )
+        else:
+            connection.execute(
+                f"""
+                INSERT OR IGNORE INTO market_prices (
+                    symbol,
+                    price_date,
+                    open,
+                    high,
+                    low,
+                    close,
+                    adjusted_close,
+                    volume,
+                    source,
+                    record_hash,
+                    created_at
+                )
+                VALUES (
+                    {placeholders}
+                )
+                """,
+                values,
+            )
 
         connection.commit()
 
@@ -239,10 +400,32 @@ def store_corporate_action(
     initialize_database(database_url)
 
     record_hash = sha256_record(raw_payload)
+    placeholder = _placeholder(database_url)
+
+    values = (
+        symbol,
+        action_type,
+        action_date,
+        ratio,
+        cash_amount,
+        source,
+        json.dumps(
+            raw_payload,
+            sort_keys=True,
+            default=str,
+        ),
+        record_hash,
+        utc_now(),
+    )
+
+    placeholders = ", ".join(
+        placeholder
+        for _ in values
+    )
 
     with connect(database_url) as connection:
         connection.execute(
-            """
+            f"""
             INSERT INTO corporate_actions (
                 symbol,
                 action_type,
@@ -254,23 +437,11 @@ def store_corporate_action(
                 record_hash,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                {placeholders}
+            )
             """,
-            (
-                symbol,
-                action_type,
-                action_date,
-                ratio,
-                cash_amount,
-                source,
-                json.dumps(
-                    raw_payload,
-                    sort_keys=True,
-                    default=str,
-                ),
-                record_hash,
-                utc_now(),
-            ),
+            values,
         )
 
         connection.commit()
@@ -284,17 +455,42 @@ def table_exists(
 ) -> bool:
     """Check whether a table exists in the configured database."""
 
+    allowed_tables = {
+        "insider_transactions",
+        "market_prices",
+        "corporate_actions",
+        "research_events",
+        "signals",
+        "trade_runs",
+        "provenance",
+    }
+
+    if table_name not in allowed_tables:
+        raise ValueError("Unsupported table.")
+
     initialize_database(database_url)
 
-    with connect(database_url) as connection:
-        row = connection.execute(
-            """
+    if is_postgresql_url(database_url):
+        query = """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+        """
+        parameters = (table_name,)
+    else:
+        query = """
             SELECT name
             FROM sqlite_master
             WHERE type = 'table'
               AND name = ?
-            """,
-            (table_name,),
+        """
+        parameters = (table_name,)
+
+    with connect(database_url) as connection:
+        row = connection.execute(
+            query,
+            parameters,
         ).fetchone()
 
     return row is not None
@@ -323,10 +519,13 @@ def count_records(
 
     with connect(database_url) as connection:
         row = connection.execute(
-            f"SELECT COUNT(*) AS count FROM {table_name}"
+            f"""
+            SELECT COUNT(*) AS count
+            FROM {_quote_identifier(table_name)}
+            """
         ).fetchone()
 
-    return int(row["count"])
+    return int(_row_value(row, "count"))
 
 
 class Repository:
@@ -354,18 +553,10 @@ class Repository:
         Store a generic compatibility record.
 
         The compatibility API accepts the lightweight normalized shape used
-        by the existing repository tests:
+        by the existing repository tests.
 
-            {
-                "symbol": "...",
-                "source": "...",
-                "record_hash": "..."
-            }
-
-        For insider_transactions, those fields are represented in the
-        existing normalized schema without silently changing the permanent
-        schema. The original compatibility payload is retained in
-        raw_payload.
+        The compatibility path is retained for existing callers and tests.
+        It does not replace the validated SEC ingestion path.
         """
 
         allowed_tables = {
@@ -398,58 +589,84 @@ class Repository:
                 supplied
             )
 
+        columns = _table_columns(
+            self.database_url,
+            table,
+        )
+
+        unknown = set(supplied) - columns
+
+        if unknown:
+            raise ValueError(
+                "Record contains unsupported columns: "
+                + ", ".join(sorted(unknown))
+            )
+
+        insert_columns = list(
+            supplied.keys()
+        )
+
+        placeholder = _placeholder(
+            self.database_url
+        )
+
+        placeholders = ", ".join(
+            placeholder
+            for _ in insert_columns
+        )
+
+        column_sql = ", ".join(
+            _quote_identifier(column)
+            for column in insert_columns
+        )
+
+        values = [
+            supplied[column]
+            for column in insert_columns
+        ]
+
         with connect(self.database_url) as connection:
-            columns = {
-                row["name"]
-                for row in connection.execute(
-                    f"PRAGMA table_info({table})"
-                ).fetchall()
-            }
+            if is_postgresql_url(self.database_url):
+                cursor = connection.execute(
+                    f"""
+                    INSERT INTO {_quote_identifier(table)} (
+                        {column_sql}
+                    )
+                    VALUES (
+                        {placeholders}
+                    )
+                    RETURNING id
+                    """,
+                    values,
+                )
+                row = cursor.fetchone()
 
-            unknown = set(supplied) - columns
+                if row is None:
+                    raise RuntimeError(
+                        "Generic repository insert did not return an id."
+                    )
 
-            if unknown:
-                raise ValueError(
-                    "Record contains unsupported columns: "
-                    + ", ".join(sorted(unknown))
+                row_id = _row_value(row, "id")
+            else:
+                connection.execute(
+                    f"""
+                    INSERT INTO {_quote_identifier(table)} (
+                        {column_sql}
+                    )
+                    VALUES (
+                        {placeholders}
+                    )
+                    """,
+                    values,
                 )
 
-            insert_columns = list(
-                supplied.keys()
-            )
+                row = connection.execute(
+                    "SELECT last_insert_rowid() AS id"
+                ).fetchone()
 
-            placeholders = ", ".join(
-                "?"
-                for _ in insert_columns
-            )
-
-            column_sql = ", ".join(
-                f'"{column}"'
-                for column in insert_columns
-            )
-
-            values = [
-                supplied[column]
-                for column in insert_columns
-            ]
-
-            connection.execute(
-                f"""
-                INSERT INTO {table} (
-                    {column_sql}
-                )
-                VALUES (
-                    {placeholders}
-                )
-                """,
-                values,
-            )
+                row_id = _row_value(row, "id")
 
             connection.commit()
-
-            row_id = connection.execute(
-                "SELECT last_insert_rowid() AS id"
-            ).fetchone()["id"]
 
         return {
             "table": table,
@@ -494,37 +711,78 @@ class Repository:
             default=str,
         )
 
+        placeholder = _placeholder(
+            self.database_url
+        )
+
+        values = (
+            source,
+            record_hash,
+            "UNKNOWN",
+            symbol,
+            raw_payload,
+            record_hash,
+            utc_now(),
+        )
+
+        placeholders = ", ".join(
+            placeholder
+            for _ in values
+        )
+
         with connect(self.database_url) as connection:
-            cursor = connection.execute(
-                """
-                INSERT INTO insider_transactions (
-                    source,
-                    accession_number,
-                    issuer_cik,
-                    issuer_name,
-                    raw_payload,
-                    record_hash,
-                    created_at
+            if is_postgresql_url(self.database_url):
+                cursor = connection.execute(
+                    f"""
+                    INSERT INTO insider_transactions (
+                        source,
+                        accession_number,
+                        issuer_cik,
+                        issuer_name,
+                        raw_payload,
+                        record_hash,
+                        created_at
+                    )
+                    VALUES (
+                        {placeholders}
+                    )
+                    RETURNING id
+                    """,
+                    values,
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    source,
-                    record_hash,
-                    "UNKNOWN",
-                    symbol,
-                    raw_payload,
-                    record_hash,
-                    utc_now(),
-                ),
-            )
+                row = cursor.fetchone()
+
+                if row is None:
+                    raise RuntimeError(
+                        "Compatibility insider insert did not return an id."
+                    )
+
+                row_id = _row_value(row, "id")
+            else:
+                cursor = connection.execute(
+                    f"""
+                    INSERT INTO insider_transactions (
+                        source,
+                        accession_number,
+                        issuer_cik,
+                        issuer_name,
+                        raw_payload,
+                        record_hash,
+                        created_at
+                    )
+                    VALUES (
+                        {placeholders}
+                    )
+                    """,
+                    values,
+                )
+
+                row_id = cursor.lastrowid
 
             connection.commit()
-
-            row_id = cursor.lastrowid
 
         return {
             "table": "insider_transactions",
             "id": row_id,
             "record": dict(record),
-                }
+    }
