@@ -15,27 +15,70 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 
-class SECFormParserError(
-    Exception
-):
+class SECFormParserError(Exception):
     """Raised when an SEC insider filing cannot be parsed safely."""
+
+
+class SECFormParser:
+    """
+    Object-oriented compatibility interface for the SEC form parser.
+
+    The underlying parsing implementation remains in the module-level
+    parse_transaction() and parse_filing() functions.
+    """
+
+    def parse_transaction(
+        self,
+        transaction: Mapping[str, Any],
+        *,
+        form_type: str,
+        source: str = "SEC",
+    ) -> dict[str, Any]:
+        """Parse one SEC transaction."""
+
+        return parse_transaction(
+            transaction,
+            form_type=form_type,
+            source=source,
+        )
+
+    def parse_filing(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        issuer_cik: str,
+        accession_number: str,
+        form_type: str,
+        issuer_name: str | None = None,
+        insider_name: str | None = None,
+        insider_cik: str | None = None,
+        filing_date: str | None = None,
+        source: str = "SEC",
+    ) -> list[dict[str, Any]]:
+        """Parse all identifiable transactions from an SEC filing."""
+
+        return parse_filing(
+            payload,
+            issuer_cik=issuer_cik,
+            accession_number=accession_number,
+            form_type=form_type,
+            issuer_name=issuer_name,
+            insider_name=insider_name,
+            insider_cik=insider_cik,
+            filing_date=filing_date,
+            source=source,
+        )
 
 
 def _text(
     value: Any,
 ) -> str | None:
-    """
-    Convert a value to stripped text.
-
-    Empty values become None.
-    """
+    """Convert a value to stripped text."""
 
     if value is None:
         return None
 
-    result = str(
-        value
-    ).strip()
+    result = str(value).strip()
 
     if not result:
         return None
@@ -47,43 +90,28 @@ def _number(
     value: Any,
     field_name: str,
 ) -> float | None:
-    """
-    Convert a numeric SEC field to float.
-    """
+    """Convert a numeric SEC field to float."""
 
     if value is None:
         return None
 
-    if isinstance(
-        value,
-        bool,
-    ):
+    if isinstance(value, bool):
         raise SECFormParserError(
             f"{field_name} cannot be boolean."
         )
 
-    if isinstance(
-        value,
-        (int, float),
-    ):
+    if isinstance(value, (int, float)):
         return float(value)
 
-    text_value = str(
-        value
-    ).strip()
+    text_value = str(value).strip()
 
     if not text_value:
         return None
 
-    text_value = text_value.replace(
-        ",",
-        "",
-    )
+    text_value = text_value.replace(",", "")
 
     try:
-        return float(
-            text_value
-        )
+        return float(text_value)
     except ValueError as exc:
         raise SECFormParserError(
             f"{field_name} must be numeric."
@@ -94,9 +122,7 @@ def _first(
     data: Mapping[str, Any],
     *keys: str,
 ) -> Any:
-    """
-    Return the first present and non-empty value from several aliases.
-    """
+    """Return the first present and non-empty value from several aliases."""
 
     for key in keys:
         if key not in data:
@@ -107,10 +133,7 @@ def _first(
         if value is None:
             continue
 
-        if isinstance(
-            value,
-            str,
-        ) and not value.strip():
+        if isinstance(value, str) and not value.strip():
             continue
 
         return value
@@ -121,13 +144,9 @@ def _first(
 def _normalize_form(
     value: Any,
 ) -> str:
-    """
-    Normalize an SEC insider form identifier.
-    """
+    """Normalize an SEC insider form identifier."""
 
-    form = _text(
-        value
-    )
+    form = _text(value)
 
     if form is None:
         raise SECFormParserError(
@@ -154,23 +173,9 @@ def _normalize_form(
 def _extract_transaction_list(
     payload: Mapping[str, Any],
 ) -> list[Mapping[str, Any]]:
-    """
-    Extract transaction dictionaries from common SEC-derived structures.
+    """Extract transaction dictionaries from common SEC structures."""
 
-    Supported keys include:
-        transactions
-        nonDerivativeTransactions
-        nonDerivativeTable
-        derivativeTransactions
-        derivativeTable
-
-    A derivative transaction is retained when it is supplied by the source;
-    downstream logic can distinguish its type.
-    """
-
-    transaction_lists: list[
-        list[Any]
-    ] = []
+    transaction_lists: list[list[Any]] = []
 
     for key in (
         "transactions",
@@ -179,52 +184,28 @@ def _extract_transaction_list(
         "derivativeTransactions",
         "derivativeTable",
     ):
-        value = payload.get(
-            key
-        )
+        value = payload.get(key)
 
-        if isinstance(
-            value,
-            list,
-        ):
-            transaction_lists.append(
-                value
-            )
+        if isinstance(value, list):
+            transaction_lists.append(value)
 
-        elif isinstance(
-            value,
-            Mapping,
-        ):
+        elif isinstance(value, Mapping):
             for nested_key in (
                 "transactions",
                 "transaction",
                 "items",
             ):
-                nested = value.get(
-                    nested_key
-                )
+                nested = value.get(nested_key)
 
-                if isinstance(
-                    nested,
-                    list,
-                ):
-                    transaction_lists.append(
-                        nested
-                    )
+                if isinstance(nested, list):
+                    transaction_lists.append(nested)
 
-    records: list[
-        Mapping[str, Any]
-    ] = []
+    records: list[Mapping[str, Any]] = []
 
     for transaction_list in transaction_lists:
         for item in transaction_list:
-            if isinstance(
-                item,
-                Mapping,
-            ):
-                records.append(
-                    item
-                )
+            if isinstance(item, Mapping):
+                records.append(item)
 
     return records
 
@@ -235,25 +216,16 @@ def parse_transaction(
     form_type: str,
     source: str = "SEC",
 ) -> dict[str, Any]:
-    """
-    Parse one SEC transaction into the normalized ingestion payload shape.
-    """
+    """Parse one SEC transaction."""
 
-    if not isinstance(
-        transaction,
-        Mapping,
-    ):
+    if not isinstance(transaction, Mapping):
         raise TypeError(
             "transaction must be a mapping."
         )
 
-    normalized_form = _normalize_form(
-        form_type
-    )
+    normalized_form = _normalize_form(form_type)
 
-    normalized_source = _text(
-        source
-    )
+    normalized_source = _text(source)
 
     if normalized_source is None:
         raise SECFormParserError(
@@ -301,23 +273,11 @@ def parse_transaction(
     return {
         "source": normalized_source,
         "form_type": normalized_form,
-        "transaction_code": _text(
-            transaction_code
-        ),
-        "transaction_date": _text(
-            transaction_date
-        ),
-        "shares": _number(
-            shares,
-            "shares",
-        ),
-        "price": _number(
-            price,
-            "price",
-        ),
-        "ownership_type": _text(
-            ownership_type
-        ),
+        "transaction_code": _text(transaction_code),
+        "transaction_date": _text(transaction_date),
+        "shares": _number(shares, "shares"),
+        "price": _number(price, "price"),
+        "ownership_type": _text(ownership_type),
         "security_title": _text(
             _first(
                 transaction,
@@ -348,26 +308,14 @@ def parse_filing(
     filing_date: str | None = None,
     source: str = "SEC",
 ) -> list[dict[str, Any]]:
-    """
-    Parse all identifiable transactions from one SEC Form 3/4/5 filing.
+    """Parse all identifiable transactions from one SEC Form 3/4/5 filing."""
 
-    Each returned record contains the common issuer/filing identity plus
-    transaction-specific fields.
-
-    A filing with no identifiable transaction records returns an empty list.
-    """
-
-    if not isinstance(
-        payload,
-        Mapping,
-    ):
+    if not isinstance(payload, Mapping):
         raise TypeError(
             "SEC filing payload must be a mapping."
         )
 
-    normalized_cik = _text(
-        issuer_cik
-    )
+    normalized_cik = _text(issuer_cik)
 
     if normalized_cik is None:
         raise SECFormParserError(
@@ -379,34 +327,22 @@ def parse_filing(
             "issuer_cik must contain digits only."
         )
 
-    normalized_cik = normalized_cik.zfill(
-        10
-    )
+    normalized_cik = normalized_cik.zfill(10)
 
-    normalized_accession = _text(
-        accession_number
-    )
+    normalized_accession = _text(accession_number)
 
     if normalized_accession is None:
         raise SECFormParserError(
             "accession_number is required."
         )
 
-    normalized_form = _normalize_form(
-        form_type
-    )
+    normalized_form = _normalize_form(form_type)
 
-    transactions = _extract_transaction_list(
-        payload
-    )
+    transactions = _extract_transaction_list(payload)
 
-    parsed: list[
-        dict[str, Any]
-    ] = []
+    parsed: list[dict[str, Any]] = []
 
-    for index, transaction in enumerate(
-        transactions
-    ):
+    for index, transaction in enumerate(transactions):
         try:
             parsed_transaction = parse_transaction(
                 transaction,
@@ -419,31 +355,20 @@ def parse_filing(
             ValueError,
         ) as exc:
             raise SECFormParserError(
-                f"Failed to parse SEC transaction "
-                f"{index}: {exc}"
+                f"Failed to parse SEC transaction {index}: {exc}"
             ) from exc
 
         parsed_transaction.update(
             {
                 "issuer_cik": normalized_cik,
                 "accession_number": normalized_accession,
-                "issuer_name": _text(
-                    issuer_name
-                ),
-                "insider_name": _text(
-                    insider_name
-                ),
-                "insider_cik": _text(
-                    insider_cik
-                ),
-                "filing_date": _text(
-                    filing_date
-                ),
+                "issuer_name": _text(issuer_name),
+                "insider_name": _text(insider_name),
+                "insider_cik": _text(insider_cik),
+                "filing_date": _text(filing_date),
             }
         )
 
-        parsed.append(
-            parsed_transaction
-        )
+        parsed.append(parsed_transaction)
 
     return parsed
