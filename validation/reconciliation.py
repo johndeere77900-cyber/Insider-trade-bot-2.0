@@ -1,25 +1,18 @@
 """
 Reconciliation layer for Insider Trade Bot.
 
-This module compares expected records with records accepted by the
-ingestion pipeline. It is designed to make missing, duplicated, and
-unexpected records visible instead of silently assuming completeness.
-
-Reconciliation does not invent missing records or substitute other data.
+Compares expected records with accepted records without inventing,
+substituting, or silently discarding records.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 
 @dataclass(frozen=True)
 class ReconciliationResult:
-    """
-    Result of reconciling an expected record set against an accepted set.
-    """
-
     expected_count: int
     accepted_count: int
 
@@ -34,6 +27,18 @@ class ReconciliationResult:
 
     complete: bool
 
+    @property
+    def is_reconciled(self) -> bool:
+        return self.complete
+
+    @property
+    def missing_record_ids(self) -> tuple[str, ...]:
+        return self.missing_ids
+
+    @property
+    def unexpected_record_ids(self) -> tuple[str, ...]:
+        return self.unexpected_ids
+
 
 class ReconciliationError(Exception):
     """Raised when reconciliation input is invalid."""
@@ -43,10 +48,6 @@ def _normalize_ids(
     values: Iterable[str],
     field_name: str,
 ) -> list[str]:
-    """
-    Normalize a collection of record identifiers.
-    """
-
     result: list[str] = []
 
     for index, value in enumerate(values):
@@ -66,27 +67,6 @@ def reconcile_record_ids(
     expected_ids: Iterable[str],
     accepted_ids: Iterable[str],
 ) -> ReconciliationResult:
-    """
-    Reconcile expected record identifiers against accepted identifiers.
-
-    A record is considered:
-
-        matched
-            Present exactly once in both sets.
-
-        missing
-            Expected but not accepted.
-
-        unexpected
-            Accepted but not expected.
-
-        duplicate
-            Appears more than once in the accepted collection.
-
-    The result is marked complete only when there are no missing,
-    unexpected, or duplicate records.
-    """
-
     expected = _normalize_ids(
         expected_ids,
         "expected_ids",
@@ -97,13 +77,8 @@ def reconcile_record_ids(
         "accepted_ids",
     )
 
-    expected_set = set(
-        expected
-    )
-
-    accepted_set = set(
-        accepted
-    )
+    expected_set = set(expected)
+    accepted_set = set(accepted)
 
     missing = sorted(
         expected_set - accepted_set
@@ -151,16 +126,74 @@ def reconcile_record_ids(
     )
 
 
+def _extract_record_id(
+    record: Mapping[str, Any],
+    *,
+    index: int,
+    collection_name: str,
+) -> str:
+    if not isinstance(record, Mapping):
+        raise ReconciliationError(
+            f"{collection_name}[{index}] must be a mapping."
+        )
+
+    record_id = record.get("record_id")
+
+    if record_id is None:
+        raise ReconciliationError(
+            f"{collection_name}[{index}] is missing record_id."
+        )
+
+    normalized = str(record_id).strip()
+
+    if not normalized:
+        raise ReconciliationError(
+            f"{collection_name}[{index}] has an empty record_id."
+        )
+
+    return normalized
+
+
+def reconcile_records(
+    expected_records: Iterable[Mapping[str, Any]],
+    actual_records: Iterable[Mapping[str, Any]],
+) -> ReconciliationResult:
+    """
+    Reconcile expected record dictionaries against actual records.
+
+    Record identity is determined by the explicit `record_id` field.
+    """
+
+    expected = list(expected_records)
+    actual = list(actual_records)
+
+    expected_ids = [
+        _extract_record_id(
+            record,
+            index=index,
+            collection_name="expected_records",
+        )
+        for index, record in enumerate(expected)
+    ]
+
+    actual_ids = [
+        _extract_record_id(
+            record,
+            index=index,
+            collection_name="actual_records",
+        )
+        for index, record in enumerate(actual)
+    ]
+
+    return reconcile_record_ids(
+        expected_ids,
+        actual_ids,
+    )
+
+
 def require_complete_reconciliation(
     result: ReconciliationResult,
 ) -> None:
-    """
-    Raise an error when reconciliation is incomplete.
-
-    This prevents downstream components from treating an incomplete
-    historical-data load as complete.
-    """
-
     if not isinstance(
         result,
         ReconciliationResult,
@@ -193,4 +226,4 @@ def require_complete_reconciliation(
         "Reconciliation is incomplete: "
         + ", ".join(problems)
         + "."
-  )
+    )
