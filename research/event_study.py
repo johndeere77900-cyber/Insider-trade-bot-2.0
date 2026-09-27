@@ -68,10 +68,13 @@ class EventStudyEngine:
                     "close must be numeric."
                 )
 
-            return_value = (
-                float(future_close)
-                / float(current_close)
-            ) - 1.0
+            return_value = round(
+                (
+                    float(future_close)
+                    / float(current_close)
+                ) - 1.0,
+                16,
+            )
 
             results.append(
                 {
