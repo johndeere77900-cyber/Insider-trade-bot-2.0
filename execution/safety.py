@@ -18,17 +18,56 @@ from risk.controls import RiskCheckResult
 
 @dataclass(frozen=True)
 class ExecutionGateResult:
-    """
-    Result of the final execution-safety evaluation.
-    """
+    """Result of the final execution-safety evaluation."""
 
     approved: bool
-
     reasons: tuple[str, ...]
 
 
 class ExecutionSafetyError(Exception):
     """Base exception for execution-safety failures."""
+
+
+class ExecutionSafety:
+    """
+    Explicit authorization boundary for live execution.
+
+    Live execution requires both:
+        - explicit confirmation
+        - strict mode enabled
+
+    This class does not execute trades.
+    """
+
+    def __init__(self) -> None:
+        self.live_execution_authorized = False
+
+    def authorize_live_execution(
+        self,
+        *,
+        confirmed: bool,
+        strict_mode: bool,
+    ) -> bool:
+        """
+        Authorize live execution only when both required safeguards
+        are explicitly satisfied.
+        """
+
+        if not confirmed:
+            self.live_execution_authorized = False
+            raise ExecutionSafetyError(
+                "Live execution requires explicit confirmation."
+            )
+
+        if not strict_mode:
+            self.live_execution_authorized = False
+            raise ExecutionSafetyError(
+                "Live execution requires strict mode."
+            )
+
+        self.live_execution_authorized = True
+
+        return True
 
 
 class ExecutionSafetyGate:
@@ -40,6 +79,8 @@ class ExecutionSafetyGate:
         - an approved risk result,
         - an explicit live-execution enablement,
         - a valid execution request.
+
+    No external execution occurs here.
     """
 
     def __init__(
@@ -47,9 +88,7 @@ class ExecutionSafetyGate:
         *,
         live_execution_enabled: bool = False,
     ) -> None:
-        self.live_execution_enabled = (
-            live_execution_enabled
-        )
+        self.live_execution_enabled = live_execution_enabled
 
     def evaluate(
         self,
@@ -58,35 +97,21 @@ class ExecutionSafetyGate:
         risk_result: RiskCheckResult,
         request: ExecutionRequest,
     ) -> ExecutionGateResult:
-        """
-        Evaluate whether an execution request may pass the local safety
-        boundary.
-
-        No external execution occurs here.
-        """
+        """Evaluate whether an execution request may pass the safety boundary."""
 
         reasons: list[str] = []
 
-        if not isinstance(
-            signal,
-            Signal,
-        ):
+        if not isinstance(signal, Signal):
             raise TypeError(
                 "signal must be a Signal instance."
             )
 
-        if not isinstance(
-            risk_result,
-            RiskCheckResult,
-        ):
+        if not isinstance(risk_result, RiskCheckResult):
             raise TypeError(
                 "risk_result must be a RiskCheckResult."
             )
 
-        if not isinstance(
-            request,
-            ExecutionRequest,
-        ):
+        if not isinstance(request, ExecutionRequest):
             raise TypeError(
                 "request must be an ExecutionRequest."
             )
@@ -129,10 +154,7 @@ class ExecutionSafetyGate:
                 "Execution symbol does not match the signal symbol."
             )
 
-        if request.side not in {
-            "buy",
-            "sell",
-        }:
+        if request.side not in {"buy", "sell"}:
             reasons.append(
                 "Execution side must be 'buy' or 'sell'."
             )
@@ -156,14 +178,9 @@ class ExecutionSafetyGate:
         self,
         result: ExecutionGateResult,
     ) -> None:
-        """
-        Stop execution when the safety gate has not approved the request.
-        """
+        """Stop execution when the safety gate has not approved the request."""
 
-        if not isinstance(
-            result,
-            ExecutionGateResult,
-        ):
+        if not isinstance(result, ExecutionGateResult):
             raise TypeError(
                 "result must be an ExecutionGateResult."
             )
@@ -173,7 +190,5 @@ class ExecutionSafetyGate:
 
         raise ExecutionSafetyError(
             "Execution safety gate rejected the request: "
-            + "; ".join(
-                result.reasons
+            + "; ".join(result.reasons)
             )
-    )
