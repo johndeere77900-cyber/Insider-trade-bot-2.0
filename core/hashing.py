@@ -47,3 +47,14 @@ def sha256_record(value: Any) -> str:
     return sha256_text(
         canonical_json(value)
     )
+
+
+def generate_record_hash(value: Any) -> str:
+    """
+    Generate the deterministic SHA-256 hash used as a record fingerprint.
+
+    This is the public compatibility API used by validation and integrity
+    components.
+    """
+
+    return sha256_record(value)
