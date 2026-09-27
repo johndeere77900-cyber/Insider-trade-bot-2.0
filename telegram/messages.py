@@ -49,7 +49,7 @@ class TelegramMessage:
     """
 
     message_id: int
-    chat_id: int
+    chat_id: str
     user: TelegramUser
     text: str
     received_at: datetime
@@ -77,14 +77,23 @@ class TelegramMessage:
                 "user must be a TelegramUser instance."
             )
 
-        normalized_chat_id = int(
-            chat_id
-        )
+        normalized_chat_id = str(chat_id)
+
+        if not normalized_chat_id.strip():
+            raise ValueError(
+                "Telegram chat_id cannot be empty."
+            )
 
         if user is None:
-            normalized_user_id = int(
-                user_id
-            )
+            try:
+                normalized_user_id = int(
+                    str(user_id)
+                )
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "user_id must be numeric."
+                ) from exc
+
             user = TelegramUser(
                 user_id=normalized_user_id
             )
