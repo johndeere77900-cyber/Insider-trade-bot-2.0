@@ -4,15 +4,20 @@ SEC Form 3/4/5 transaction parser for Insider Trade Bot.
 This module converts detailed SEC insider-filing data into normalized
 transaction records.
 
-It supports common SEC JSON/XML-derived dictionary structures while keeping
-source-specific parsing separate from validation and permanent storage.
+It supports:
+    - normalized dictionary payloads
+    - SEC ownership XML converted to dictionaries
+    - common JSON-derived SEC structures
+    - non-derivative transactions
+    - derivative transactions
 
 The parser does not decide whether a transaction is a trading signal.
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 
 class SECFormParserError(Exception):
@@ -70,12 +75,18 @@ class SECFormParser:
         )
 
 
-def _text(
-    value: Any,
-) -> str | None:
+def _text(value: Any) -> str | None:
     """Convert a value to stripped text."""
 
     if value is None:
+        return None
+
+    if isinstance(value, Mapping):
+        nested_value = value.get("value")
+
+        if nested_value is not None:
+            return _text(nested_value)
+
         return None
 
     result = str(value).strip()
@@ -94,6 +105,9 @@ def _number(
 
     if value is None:
         return None
+
+    if isinstance(value, Mapping):
+        value = value.get("value")
 
     if isinstance(value, bool):
         raise SECFormParserError(
@@ -118,11 +132,34 @@ def _number(
         ) from exc
 
 
+def _tag_name(key: Any) -> str:
+    """
+    Return an XML-local tag name.
+
+    Handles both plain tags and namespace-qualified tags such as:
+        {namespace}transactionCode
+    """
+
+    text = str(key)
+
+    if "}" in text:
+        text = text.rsplit("}", 1)[1]
+
+    if ":" in text:
+        text = text.rsplit(":", 1)[1]
+
+    return text
+
+
 def _first(
     data: Mapping[str, Any],
     *keys: str,
 ) -> Any:
-    """Return the first present and non-empty value from several aliases."""
+    """
+    Return the first present and non-empty direct value.
+
+    This preserves compatibility with the existing flat dictionary API.
+    """
 
     for key in keys:
         if key not in data:
@@ -139,6 +176,109 @@ def _first(
         return value
 
     return None
+
+
+def _deep_find(
+    data: Any,
+    keys: tuple[str, ...],
+) -> Any:
+    """
+    Recursively locate the first matching SEC/XML field.
+
+    SEC ownership XML commonly produces structures such as:
+
+        {
+            "transactionCoding": {
+                "transactionCode": "P"
+            }
+        }
+
+    or:
+
+        {
+            "transactionCoding": {
+                "transactionCode": {
+                    "value": "P"
+                }
+            }
+        }
+
+    This helper supports both representations.
+    """
+
+    wanted = {
+        _tag_name(key)
+        for key in keys
+    }
+
+    if isinstance(data, Mapping):
+        for key, value in data.items():
+            if _tag_name(key) in wanted:
+                if value is not None:
+                    return value
+
+        for value in data.values():
+            found = _deep_find(
+                value,
+                keys,
+            )
+
+            if found is not None:
+                return found
+
+        return None
+
+    if isinstance(data, list):
+        for item in data:
+            found = _deep_find(
+                item,
+                keys,
+            )
+
+            if found is not None:
+                return found
+
+    return None
+
+
+def _deep_find_section(
+    data: Any,
+    section_names: tuple[str, ...],
+) -> list[Mapping[str, Any]]:
+    """
+    Recursively find mappings belonging to named SEC XML sections.
+
+    Used primarily for nonDerivativeTransaction and
+    derivativeTransaction nodes.
+    """
+
+    wanted = {
+        _tag_name(name)
+        for name in section_names
+    }
+
+    results: list[Mapping[str, Any]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if _tag_name(key) in wanted:
+                    if isinstance(child, Mapping):
+                        results.append(child)
+                    elif isinstance(child, list):
+                        for item in child:
+                            if isinstance(item, Mapping):
+                                results.append(item)
+
+                walk(child)
+
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(data)
+
+    return results
 
 
 def _normalize_form(
@@ -173,41 +313,94 @@ def _normalize_form(
 def _extract_transaction_list(
     payload: Mapping[str, Any],
 ) -> list[Mapping[str, Any]]:
-    """Extract transaction dictionaries from common SEC structures."""
+    """
+    Extract transaction dictionaries from common SEC structures.
 
-    transaction_lists: list[list[Any]] = []
+    Supports both normalized structures and the nested structure generated
+    by data.sec_filing_pipeline._xml_to_dict().
+    """
 
+    records: list[Mapping[str, Any]] = []
+
+    # Real SEC ownership XML structures.
+    records.extend(
+        _deep_find_section(
+            payload,
+            (
+                "nonDerivativeTransaction",
+                "derivativeTransaction",
+            ),
+        )
+    )
+
+    # Existing normalized/common JSON structures.
     for key in (
         "transactions",
         "nonDerivativeTransactions",
-        "nonDerivativeTable",
         "derivativeTransactions",
-        "derivativeTable",
     ):
         value = payload.get(key)
 
-        if isinstance(value, list):
-            transaction_lists.append(value)
-
-        elif isinstance(value, Mapping):
+        if isinstance(value, Mapping):
             for nested_key in (
                 "transactions",
                 "transaction",
                 "items",
+                "nonDerivativeTransaction",
+                "derivativeTransaction",
             ):
                 nested = value.get(nested_key)
 
-                if isinstance(nested, list):
-                    transaction_lists.append(nested)
+                if isinstance(nested, Mapping):
+                    records.append(nested)
 
-    records: list[Mapping[str, Any]] = []
+                elif isinstance(nested, list):
+                    records.extend(
+                        item
+                        for item in nested
+                        if isinstance(item, Mapping)
+                    )
 
-    for transaction_list in transaction_lists:
-        for item in transaction_list:
-            if isinstance(item, Mapping):
-                records.append(item)
+        elif isinstance(value, list):
+            records.extend(
+                item
+                for item in value
+                if isinstance(item, Mapping)
+            )
 
-    return records
+    # Some callers may provide one transaction directly.
+    for key in (
+        "transaction",
+        "nonDerivativeTransaction",
+        "derivativeTransaction",
+    ):
+        value = payload.get(key)
+
+        if isinstance(value, Mapping):
+            records.append(value)
+
+        elif isinstance(value, list):
+            records.extend(
+                item
+                for item in value
+                if isinstance(item, Mapping)
+            )
+
+    # De-duplicate transaction object references/content without requiring
+    # the transaction itself to be hashable.
+    unique: list[Mapping[str, Any]] = []
+    seen: set[int] = set()
+
+    for record in records:
+        identity = id(record)
+
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        unique.append(record)
+
+    return unique
 
 
 def parse_transaction(
@@ -239,6 +432,14 @@ def parse_transaction(
         "code",
     )
 
+    if transaction_code is None:
+        transaction_code = _deep_find(
+            transaction,
+            (
+                "transactionCode",
+            ),
+        )
+
     shares = _first(
         transaction,
         "shares",
@@ -246,6 +447,15 @@ def parse_transaction(
         "transaction_shares",
         "amount",
     )
+
+    if shares is None:
+        shares = _deep_find(
+            transaction,
+            (
+                "transactionShares",
+                "shares",
+            ),
+        )
 
     price = _first(
         transaction,
@@ -255,12 +465,31 @@ def parse_transaction(
         "price",
     )
 
+    if price is None:
+        price = _deep_find(
+            transaction,
+            (
+                "transactionPricePerShare",
+                "transactionPrice",
+                "price",
+            ),
+        )
+
     transaction_date = _first(
         transaction,
         "transactionDate",
         "transaction_date",
         "date",
     )
+
+    if transaction_date is None:
+        transaction_date = _deep_find(
+            transaction,
+            (
+                "transactionDate",
+                "date",
+            ),
+        )
 
     ownership_type = _first(
         transaction,
@@ -270,6 +499,44 @@ def parse_transaction(
         "direct_indirect",
     )
 
+    if ownership_type is None:
+        ownership_type = _deep_find(
+            transaction,
+            (
+                "directOrIndirectOwnership",
+                "ownershipType",
+            ),
+        )
+
+    security_title = _first(
+        transaction,
+        "securityTitle",
+        "security_title",
+        "security",
+    )
+
+    if security_title is None:
+        security_title = _deep_find(
+            transaction,
+            (
+                "securityTitle",
+            ),
+        )
+
+    transaction_type = _first(
+        transaction,
+        "transactionType",
+        "transaction_type",
+    )
+
+    if transaction_type is None:
+        transaction_type = _deep_find(
+            transaction,
+            (
+                "transactionType",
+            ),
+        )
+
     return {
         "source": normalized_source,
         "form_type": normalized_form,
@@ -278,22 +545,78 @@ def parse_transaction(
         "shares": _number(shares, "shares"),
         "price": _number(price, "price"),
         "ownership_type": _text(ownership_type),
-        "security_title": _text(
-            _first(
-                transaction,
-                "securityTitle",
-                "security_title",
-                "security",
-            )
-        ),
-        "transaction_type": _text(
-            _first(
-                transaction,
-                "transactionType",
-                "transaction_type",
-            )
-        ),
+        "security_title": _text(security_title),
+        "transaction_type": _text(transaction_type),
     }
+
+
+def _extract_issuer_name(
+    payload: Mapping[str, Any],
+) -> str | None:
+    """Extract issuer name from a real SEC ownership filing when available."""
+
+    issuer = payload.get("issuer")
+
+    if isinstance(issuer, Mapping):
+        return _text(
+            _deep_find(
+                issuer,
+                (
+                    "issuerName",
+                    "name",
+                ),
+            )
+        )
+
+    return _text(
+        _deep_find(
+            payload,
+            (
+                "issuerName",
+            ),
+        )
+    )
+
+
+def _extract_insider_metadata(
+    payload: Mapping[str, Any],
+) -> tuple[str | None, str | None]:
+    """
+    Extract reporting-owner name and CIK from SEC ownership XML when present.
+    """
+
+    reporting_owner = payload.get("reportingOwner")
+
+    if isinstance(reporting_owner, list):
+        reporting_owner = (
+            reporting_owner[0]
+            if reporting_owner
+            else None
+        )
+
+    if not isinstance(reporting_owner, Mapping):
+        return None, None
+
+    owner_name = _deep_find(
+        reporting_owner,
+        (
+            "rptOwnerName",
+            "reportingOwnerName",
+        ),
+    )
+
+    owner_cik = _deep_find(
+        reporting_owner,
+        (
+            "rptOwnerCik",
+            "reportingOwnerCik",
+        ),
+    )
+
+    return (
+        _text(owner_name),
+        _text(owner_cik),
+    )
 
 
 def parse_filing(
@@ -338,9 +661,38 @@ def parse_filing(
 
     normalized_form = _normalize_form(form_type)
 
-    transactions = _extract_transaction_list(payload)
+    transactions = _extract_transaction_list(
+        payload
+    )
+
+    if not transactions:
+        raise SECFormParserError(
+            "SEC filing contains no identifiable insider transactions."
+        )
 
     parsed: list[dict[str, Any]] = []
+
+    payload_issuer_name = (
+        _extract_issuer_name(payload)
+        if issuer_name is None
+        else issuer_name
+    )
+
+    payload_insider_name, payload_insider_cik = (
+        _extract_insider_metadata(payload)
+    )
+
+    normalized_insider_name = (
+        _text(insider_name)
+        if insider_name is not None
+        else payload_insider_name
+    )
+
+    normalized_insider_cik = (
+        _text(insider_cik)
+        if insider_cik is not None
+        else payload_insider_cik
+    )
 
     for index, transaction in enumerate(transactions):
         try:
@@ -362,13 +714,17 @@ def parse_filing(
             {
                 "issuer_cik": normalized_cik,
                 "accession_number": normalized_accession,
-                "issuer_name": _text(issuer_name),
-                "insider_name": _text(insider_name),
-                "insider_cik": _text(insider_cik),
+                "issuer_name": _text(
+                    payload_issuer_name
+                ),
+                "insider_name": normalized_insider_name,
+                "insider_cik": normalized_insider_cik,
                 "filing_date": _text(filing_date),
             }
         )
 
-        parsed.append(parsed_transaction)
+        parsed.append(
+            parsed_transaction
+        )
 
     return parsed
