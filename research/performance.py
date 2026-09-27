@@ -52,25 +52,14 @@ def _extract_return(
     else:
         result = outcome.get("result")
 
-        if not isinstance(
-            result,
-            Mapping,
-        ):
+        if not isinstance(result, Mapping):
             raise PerformanceAnalysisError(
                 "Outcome has no valid result payload."
             )
 
-        value = result.get(
-            "return_pct"
-        )
+        value = result.get("return_pct")
 
-    if isinstance(
-        value,
-        bool,
-    ) or not isinstance(
-        value,
-        (int, float),
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise PerformanceAnalysisError(
             "return_pct must be numeric."
         )
@@ -85,9 +74,7 @@ def summarize_outcomes(
     Calculate descriptive statistics across signal outcomes.
     """
 
-    records = list(
-        outcomes
-    )
+    records = list(outcomes)
 
     if not records:
         return PerformanceSummary(
@@ -103,9 +90,7 @@ def summarize_outcomes(
         )
 
     returns = [
-        _extract_return(
-            outcome
-        )
+        _extract_return(outcome)
         for outcome in records
     ]
 
@@ -129,25 +114,16 @@ def summarize_outcomes(
 
     return PerformanceSummary(
         outcome_count=len(returns),
-        mean_return_pct=mean(
-            returns
-        ),
-        median_return_pct=median(
-            returns
-        ),
+        mean_return_pct=mean(returns),
+        median_return_pct=median(returns),
         positive_count=positive_count,
         negative_count=negative_count,
         zero_count=zero_count,
         positive_rate_pct=(
-            positive_count
-            / len(returns)
+            positive_count / len(returns)
         ) * 100.0,
-        best_return_pct=max(
-            returns
-        ),
-        worst_return_pct=min(
-            returns
-        ),
+        best_return_pct=max(returns),
+        worst_return_pct=min(returns),
     )
 
 
@@ -163,10 +139,44 @@ def compare_performance_periods(
     """
 
     return {
-        "first_period": summarize_outcomes(
-            first_period
-        ),
-        "second_period": summarize_outcomes(
-            second_period
-        ),
-  }
+        "first_period": summarize_outcomes(first_period),
+        "second_period": summarize_outcomes(second_period),
+    }
+
+
+class ResearchPerformance:
+    """
+    Compatibility interface for the application factory.
+
+    The underlying performance calculations remain function-based.
+    This class exposes them through a small object-oriented interface
+    expected by the application layer.
+    """
+
+    def summarize(
+        self,
+        outcomes: Iterable[Mapping[str, object]],
+    ) -> PerformanceSummary:
+        """Summarize historical signal outcomes."""
+
+        return summarize_outcomes(outcomes)
+
+    def analyze(
+        self,
+        outcomes: Iterable[Mapping[str, object]],
+    ) -> PerformanceSummary:
+        """Alias for summarize() for application compatibility."""
+
+        return summarize_outcomes(outcomes)
+
+    def compare(
+        self,
+        first_period: Iterable[Mapping[str, object]],
+        second_period: Iterable[Mapping[str, object]],
+    ) -> dict[str, PerformanceSummary]:
+        """Compare two periods descriptively without ranking them."""
+
+        return compare_performance_periods(
+            first_period,
+            second_period,
+)
