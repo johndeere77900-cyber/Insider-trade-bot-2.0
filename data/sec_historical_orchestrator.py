@@ -286,14 +286,64 @@ class SECHistoricalOrchestrator:
         ):
             return ()
 
+        return SECHistoricalOrchestrator._columnar_rows(
+            recent
+        )
+
+    @staticmethod
+    def _extract_historical_submission_rows(
+        submissions: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """
+        Convert an SEC historical continuation file into row-oriented
+        filing dictionaries.
+
+        SEC historical continuation files use the filing-history columns
+        directly at the top level, for example:
+
+            accessionNumber
+            filingDate
+            form
+            primaryDocument
+
+        They do not wrap those columns inside filings.recent.
+        """
+
+        required_columns = {
+            "accessionNumber",
+            "filingDate",
+            "form",
+            "primaryDocument",
+        }
+
+        if not required_columns.intersection(
+            submissions.keys()
+        ):
+            return ()
+
+        return SECHistoricalOrchestrator._columnar_rows(
+            submissions
+        )
+
+    @staticmethod
+    def _columnar_rows(
+        columns: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """
+        Convert a column-oriented SEC mapping into row-oriented
+        dictionaries.
+
+        Only list-valued columns contribute rows.
+        """
+
         column_names = tuple(
-            recent.keys()
+            columns.keys()
         )
 
         row_count = max(
             (
                 len(values)
-                for values in recent.values()
+                for values in columns.values()
                 if isinstance(values, list)
             ),
             default=0,
@@ -307,7 +357,7 @@ class SECHistoricalOrchestrator:
             row: dict[str, Any] = {}
 
             for column_name in column_names:
-                values = recent.get(
+                values = columns.get(
                     column_name
                 )
 
@@ -334,6 +384,49 @@ class SECHistoricalOrchestrator:
 
         return tuple(
             rows
+        )
+
+    @classmethod
+    def _extract_submission_rows(
+        cls,
+        submissions: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """
+        Extract filing rows from either supported SEC submissions format.
+
+        Main submissions responses use:
+
+            filings.recent
+
+        Historical continuation files use top-level filing-history
+        columns.
+        """
+
+        recent_rows = cls._extract_recent_submission_rows(
+            submissions
+        )
+
+        if recent_rows:
+            return recent_rows
+
+        return cls._extract_historical_submission_rows(
+            submissions
+        )
+
+    @classmethod
+    def _extract_submission_row_count(
+        cls,
+        submissions: Mapping[str, Any],
+    ) -> int:
+        """
+        Return the number of filing rows represented by either supported
+        SEC submissions format.
+        """
+
+        return len(
+            cls._extract_submission_rows(
+                submissions
+            )
         )
 
     @staticmethod
@@ -779,9 +872,14 @@ class SECHistoricalOrchestrator:
         """
         Process all eligible insider filings represented by one SEC
         submissions dataset.
+
+        Supports both:
+
+            1. main submissions responses using filings.recent
+            2. historical continuation files using top-level columns
         """
 
-        rows = self._extract_recent_submission_rows(
+        rows = self._extract_submission_rows(
             submissions
         )
 
@@ -924,7 +1022,7 @@ class SECHistoricalOrchestrator:
                 )
 
             historical_rows += (
-                self._extract_recent_rows(
+                self._extract_submission_row_count(
                     historical_submissions
                 )
             )
@@ -961,4 +1059,4 @@ class SECHistoricalOrchestrator:
             submission_sources_processed=sources_processed,
             recent_submission_rows=recent_rows,
             historical_submission_rows=historical_rows,
-)
+        )
