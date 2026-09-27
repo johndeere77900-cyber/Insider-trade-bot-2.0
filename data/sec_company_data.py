@@ -29,6 +29,65 @@ class SECCompanyDataError(Exception):
     """Raised when SEC company data cannot be normalized safely."""
 
 
+class SECCompanyData:
+    """
+    Compatibility interface for SEC company-data access.
+
+    The current module performs normalization locally. The user-agent is
+    retained as configuration for future SEC HTTP operations and is not
+    used to perform network access during construction.
+    """
+
+    def __init__(self, user_agent: str) -> None:
+        if not isinstance(user_agent, str):
+            raise TypeError("user_agent must be a string.")
+
+        if not user_agent.strip():
+            raise ValueError("user_agent cannot be empty.")
+
+        self.user_agent = user_agent.strip()
+
+    def normalize(
+        self,
+        payload: Mapping[str, Any],
+    ) -> SECCompany:
+        """Normalize one SEC company record."""
+
+        return normalize_company(payload)
+
+    def normalize_companies(
+        self,
+        payload: Mapping[str, Any],
+    ) -> list[SECCompany]:
+        """Normalize an SEC company-tickers dataset."""
+
+        return normalize_company_tickers(payload)
+
+    def find_by_ticker(
+        self,
+        companies: list[SECCompany],
+        ticker: str,
+    ) -> SECCompany | None:
+        """Find a company by ticker."""
+
+        return find_company_by_ticker(
+            companies,
+            ticker,
+        )
+
+    def find_by_cik(
+        self,
+        companies: list[SECCompany],
+        cik: str,
+    ) -> SECCompany | None:
+        """Find a company by CIK."""
+
+        return find_company_by_cik(
+            companies,
+            cik,
+        )
+
+
 def _text(
     value: Any,
 ) -> str | None:
@@ -41,9 +100,7 @@ def _text(
     if value is None:
         return None
 
-    result = str(
-        value
-    ).strip()
+    result = str(value).strip()
 
     if not result:
         return None
@@ -124,9 +181,6 @@ def normalize_company_tickers(
 ) -> list[SECCompany]:
     """
     Normalize the SEC company-tickers dataset.
-
-    The SEC company-tickers endpoint normally returns an object whose keys
-    are numeric identifiers and whose values contain CIK, ticker, and title.
     """
 
     if not isinstance(
@@ -183,9 +237,7 @@ def find_company_by_ticker(
             "ticker cannot be empty."
         )
 
-    normalized_ticker = (
-        normalized_ticker.upper()
-    )
+    normalized_ticker = normalized_ticker.upper()
 
     for company in companies:
         if company.ticker == normalized_ticker:
