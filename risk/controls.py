@@ -1,14 +1,3 @@
-"""
-Risk-control engine for Insider Trade Bot.
-
-This module provides deterministic pre-trade risk checks.
-
-Risk controls operate independently of signal generation. A valid research
-signal is not automatically an approved trade.
-
-No order is submitted by this module.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,23 +6,14 @@ from typing import Iterable
 
 @dataclass(frozen=True)
 class RiskLimits:
-    """
-    Explicit limits used by the risk engine.
-    """
-
     max_position_value: float
     max_total_exposure: float
     max_order_value: float
-
     max_open_positions: int = 10
 
 
 @dataclass(frozen=True)
 class Position:
-    """
-    Current portfolio position.
-    """
-
     symbol: str
     quantity: float
     reference_price: float
@@ -41,16 +21,10 @@ class Position:
 
 @dataclass(frozen=True)
 class RiskCheckResult:
-    """
-    Result of a risk-control evaluation.
-    """
-
     approved: bool
-
     order_value: float
     existing_exposure: float
     projected_exposure: float
-
     reasons: tuple[str, ...]
 
 
@@ -62,17 +36,7 @@ def _validate_positive(
     value: float,
     field_name: str,
 ) -> None:
-    """
-    Validate a strictly positive numeric value.
-    """
-
-    if isinstance(
-        value,
-        bool,
-    ) or not isinstance(
-        value,
-        (int, float),
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RiskControlError(
             f"{field_name} must be numeric."
         )
@@ -86,14 +50,7 @@ def _validate_positive(
 def validate_limits(
     limits: RiskLimits,
 ) -> None:
-    """
-    Validate configured risk limits.
-    """
-
-    if not isinstance(
-        limits,
-        RiskLimits,
-    ):
+    if not isinstance(limits, RiskLimits):
         raise TypeError(
             "limits must be a RiskLimits instance."
         )
@@ -122,14 +79,7 @@ def validate_limits(
 def position_value(
     position: Position,
 ) -> float:
-    """
-    Calculate the current value of one position.
-    """
-
-    if not isinstance(
-        position,
-        Position,
-    ):
+    if not isinstance(position, Position):
         raise TypeError(
             "position must be a Position instance."
         )
@@ -145,24 +95,18 @@ def position_value(
     )
 
     return (
-        position.quantity
-        * position.reference_price
+        float(position.quantity)
+        * float(position.reference_price)
     )
 
 
 def calculate_total_exposure(
     positions: Iterable[Position],
 ) -> float:
-    """
-    Calculate total absolute position exposure.
-    """
-
     total = 0.0
 
     for position in positions:
-        total += position_value(
-            position
-        )
+        total += position_value(position)
 
     return total
 
@@ -170,10 +114,6 @@ def calculate_total_exposure(
 def count_open_positions(
     positions: Iterable[Position],
 ) -> int:
-    """
-    Count open positions.
-    """
-
     return sum(
         1
         for _ in positions
@@ -188,19 +128,10 @@ def check_order(
     quantity: float,
     reference_price: float,
 ) -> RiskCheckResult:
-    """
-    Evaluate whether a proposed order passes configured risk limits.
 
-    This function performs checks only. It never submits an order.
-    """
+    validate_limits(limits)
 
-    validate_limits(
-        limits
-    )
-
-    normalized_symbol = str(
-        symbol
-    ).strip().upper()
+    normalized_symbol = str(symbol).strip().upper()
 
     if not normalized_symbol:
         raise RiskControlError(
@@ -217,15 +148,10 @@ def check_order(
         "reference_price",
     )
 
-    position_list = list(
-        positions
-    )
+    position_list = list(positions)
 
     for position in position_list:
-        if not isinstance(
-            position,
-            Position,
-        ):
+        if not isinstance(position, Position):
             raise TypeError(
                 "Every position must be a Position instance."
             )
@@ -263,19 +189,13 @@ def check_order(
         + order_value
     )
 
-    if (
-        projected_symbol_position
-        > limits.max_position_value
-    ):
+    if projected_symbol_position > limits.max_position_value:
         reasons.append(
             "Projected position value exceeds the maximum "
             "position-value limit."
         )
 
-    if (
-        projected_exposure
-        > limits.max_total_exposure
-    ):
+    if projected_exposure > limits.max_total_exposure:
         reasons.append(
             "Projected total exposure exceeds the maximum "
             "total-exposure limit."
@@ -287,17 +207,12 @@ def check_order(
         for position in position_list
     )
 
-    projected_open_positions = len(
-        position_list
-    )
+    projected_open_positions = len(position_list)
 
     if not symbol_already_open:
         projected_open_positions += 1
 
-    if (
-        projected_open_positions
-        > limits.max_open_positions
-    ):
+    if projected_open_positions > limits.max_open_positions:
         reasons.append(
             "Projected open-position count exceeds the configured limit."
         )
@@ -314,14 +229,7 @@ def check_order(
 def require_risk_approval(
     result: RiskCheckResult,
 ) -> None:
-    """
-    Raise an exception if a risk check did not approve the order.
-    """
-
-    if not isinstance(
-        result,
-        RiskCheckResult,
-    ):
+    if not isinstance(result, RiskCheckResult):
         raise TypeError(
             "result must be a RiskCheckResult."
         )
@@ -331,7 +239,52 @@ def require_risk_approval(
 
     raise RiskControlError(
         "Risk check rejected the proposed order: "
-        + "; ".join(
-            result.reasons
+        + "; ".join(result.reasons)
+    )
+
+
+class RiskControls:
+    """
+    Compatibility interface used by the application/test layer.
+
+    This wrapper converts the class-based API into the existing
+    deterministic risk-control functions above.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_order_value: float = 10_000.0,
+        max_position_value: float = 50_000.0,
+        max_total_exposure: float = 100_000.0,
+        max_open_positions: int = 10,
+    ) -> None:
+
+        self.limits = RiskLimits(
+            max_position_value=float(max_position_value),
+            max_total_exposure=float(max_total_exposure),
+            max_order_value=float(max_order_value),
+            max_open_positions=int(max_open_positions),
         )
-  )
+
+        validate_limits(self.limits)
+
+    def check_order(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        price: float,
+    ) -> bool:
+
+        result = check_order(
+            limits=self.limits,
+            positions=[],
+            symbol=symbol,
+            quantity=quantity,
+            reference_price=price,
+        )
+
+        require_risk_approval(result)
+
+        return True
