@@ -86,4 +86,15 @@ class TelegramCommandParser:
             name=command_name,
             arguments=tuple(tokens[1:]),
             raw_text=raw_text,
-      )
+        )
+
+
+class TelegramParser(TelegramCommandParser):
+    """
+    Backward-compatible parser interface.
+
+    Existing callers and tests use TelegramParser while the underlying
+    implementation remains TelegramCommandParser.
+    """
+
+    pass
