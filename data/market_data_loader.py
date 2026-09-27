@@ -21,9 +21,7 @@ from data.normalization import (
 )
 
 
-class MarketDataLoadError(
-    Exception
-):
+class MarketDataLoadError(Exception):
     """Raised when market-data loading fails."""
 
 
@@ -40,16 +38,10 @@ def _extract_records(
            data, results, prices, historical, or records.
     """
 
-    if isinstance(
-        payload,
-        list,
-    ):
+    if isinstance(payload, list):
         records = payload
 
-    elif isinstance(
-        payload,
-        Mapping,
-    ):
+    elif isinstance(payload, Mapping):
         records = None
 
         for key in (
@@ -59,14 +51,9 @@ def _extract_records(
             "historical",
             "records",
         ):
-            candidate = payload.get(
-                key
-            )
+            candidate = payload.get(key)
 
-            if isinstance(
-                candidate,
-                list,
-            ):
+            if isinstance(candidate, list):
                 records = candidate
                 break
 
@@ -81,25 +68,16 @@ def _extract_records(
             "Market-data response must be a list or mapping."
         )
 
-    normalized: list[
-        Mapping[str, Any]
-    ] = []
+    normalized: list[Mapping[str, Any]] = []
 
-    for index, record in enumerate(
-        records
-    ):
-        if not isinstance(
-            record,
-            Mapping,
-        ):
+    for index, record in enumerate(records):
+        if not isinstance(record, Mapping):
             raise MarketDataLoadError(
                 f"Market-price record {index} "
                 "is not an object."
             )
 
-        normalized.append(
-            record
-        )
+        normalized.append(record)
 
     return normalized
 
@@ -121,24 +99,18 @@ def load_market_prices(
     fails.
     """
 
-    normalized_source = str(
-        source
-    ).strip()
+    normalized_source = str(source).strip()
 
     if not normalized_source:
         raise MarketDataLoadError(
             "source cannot be empty."
         )
 
-    records = _extract_records(
-        payload
-    )
+    records = _extract_records(payload)
 
     hashes: list[str] = []
 
-    for index, record in enumerate(
-        records
-    ):
+    for index, record in enumerate(records):
         try:
             record_hash = ingest_market_price(
                 database_url,
@@ -158,13 +130,9 @@ def load_market_prices(
                 f"record {index}: {exc}"
             ) from exc
 
-        hashes.append(
-            record_hash
-        )
+        hashes.append(record_hash)
 
-    return tuple(
-        hashes
-    )
+    return tuple(hashes)
 
 
 def load_single_market_price(
@@ -178,17 +146,12 @@ def load_single_market_price(
     Load exactly one market-price record.
     """
 
-    if not isinstance(
-        record,
-        Mapping,
-    ):
+    if not isinstance(record, Mapping):
         raise TypeError(
             "record must be a mapping."
         )
 
-    normalized_source = str(
-        source
-    ).strip()
+    normalized_source = str(source).strip()
 
     if not normalized_source:
         raise MarketDataLoadError(
@@ -212,3 +175,45 @@ def load_single_market_price(
         raise MarketDataLoadError(
             f"Market-price ingestion failed: {exc}"
         ) from exc
+
+
+class MarketDataLoader:
+    """
+    Compatibility wrapper around the market-data loading functions.
+
+    The client is retained for future/provider-backed loading and does
+    not alter the existing ingestion functions.
+    """
+
+    def __init__(self, client: Any | None = None) -> None:
+        self.client = client
+
+    def load(
+        self,
+        database_url: str,
+        payload: Any,
+        *,
+        source: str,
+        source_reference: str | None = None,
+    ) -> tuple[str, ...]:
+        return load_market_prices(
+            database_url,
+            payload,
+            source=source,
+            source_reference=source_reference,
+        )
+
+    def load_one(
+        self,
+        database_url: str,
+        record: Mapping[str, Any],
+        *,
+        source: str,
+        source_reference: str | None = None,
+    ) -> str:
+        return load_single_market_price(
+            database_url,
+            record,
+            source=source,
+            source_reference=source_reference,
+        )
