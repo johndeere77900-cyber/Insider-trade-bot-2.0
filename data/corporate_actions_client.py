@@ -16,9 +16,7 @@ from urllib.request import Request, urlopen
 from typing import Any
 
 
-class CorporateActionsClientError(
-    Exception
-):
+class CorporateActionsClientError(Exception):
     """Base exception for corporate-actions client failures."""
 
 
@@ -44,17 +42,24 @@ class CorporateActionsClient:
 
     def __init__(
         self,
-        base_url: str,
+        base_url: str = "",
         api_key: str = "",
         timeout: int = 30,
         api_key_parameter: str = "apikey",
     ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key.strip()
+        self.base_url = str(
+            base_url
+        ).strip().rstrip("/")
+
+        self.api_key = str(
+            api_key
+        ).strip()
+
         self.timeout = timeout
-        self.api_key_parameter = (
-            api_key_parameter.strip()
-        )
+
+        self.api_key_parameter = str(
+            api_key_parameter
+        ).strip()
 
     def _build_url(
         self,
@@ -70,6 +75,11 @@ class CorporateActionsClient:
                 "Corporate-actions request path cannot be empty."
             )
 
+        if not self.base_url:
+            raise CorporateActionsRequestError(
+                "Corporate-actions base_url is not configured."
+            )
+
         url = (
             f"{self.base_url}/"
             f"{str(path).lstrip('/')}"
@@ -82,9 +92,7 @@ class CorporateActionsClient:
                 if value is None:
                     continue
 
-                query[
-                    str(key)
-                ] = str(value)
+                query[str(key)] = str(value)
 
         if self.api_key:
             if not self.api_key_parameter:
@@ -103,9 +111,7 @@ class CorporateActionsClient:
                 for key, value in query.items()
             )
 
-            url = (
-                f"{url}?{encoded}"
-            )
+            url = f"{url}?{encoded}"
 
         return url
 
@@ -267,4 +273,4 @@ class CorporateActionsClient:
         return self._request_json(
             path,
             parameters,
-)
+            )
