@@ -444,21 +444,25 @@ class BacktestEngine:
                 "exit_price",
             )
 
-            trade_return = (
-                float(exit_price)
-                / float(entry_price)
-            ) - 1.0
+            trade_return = round(
+                (
+                    float(exit_price)
+                    / float(entry_price)
+                ) - 1.0,
+                10,
+            )
 
             trade_returns.append(
                 trade_return
             )
 
         return {
-            "total_return": sum(
-                trade_returns
+            "total_return": round(
+                sum(trade_returns),
+                10,
             ),
             "trade_count": len(
                 trade_returns
             ),
             "trade_returns": trade_returns,
-        }
+           }
