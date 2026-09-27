@@ -77,12 +77,101 @@ jobs:
         run: |
           pytest -q
 
+      - name: Verify Neon PostgreSQL integration
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import uuid
+
+          from database.connection import (
+              connect,
+              initialize_database,
+              is_postgresql_url,
+          )
+          from storage.repository import Repository
+
+          database_url = os.environ.get("DATABASE_URL", "").strip()
+
+          if not database_url:
+              raise SystemExit("DATABASE_URL secret is missing.")
+
+          if not is_postgresql_url(database_url):
+              raise SystemExit(
+                  "DATABASE_URL is not a PostgreSQL URL."
+              )
+
+          initialize_database(database_url)
+
+          run_id = (
+              "ITB2_GITHUB_NEON_TEST_"
+              + uuid.uuid4().hex
+          )
+
+          repository = Repository(database_url)
+
+          repository.store(
+              table="trade_runs",
+              record={
+                  "run_id": run_id,
+                  "mode": "paper",
+                  "status": "integration_test",
+                  "started_at": "2026-01-01T00:00:00+00:00",
+              },
+          )
+
+          with connect(database_url) as connection:
+              row = connection.execute(
+                  """
+                  SELECT run_id, mode, status
+                  FROM trade_runs
+                  WHERE run_id = %s
+                  """,
+                  (run_id,),
+              ).fetchone()
+
+          if row is None:
+              raise SystemExit(
+                  "Neon write/read verification failed."
+              )
+
+          if tuple(row) != (
+              run_id,
+              "paper",
+              "integration_test",
+          ):
+              raise SystemExit(
+                  "Neon returned unexpected test data."
+              )
+
+          with connect(database_url) as connection:
+              connection.execute(
+                  """
+                  DELETE FROM trade_runs
+                  WHERE run_id = %s
+                  """,
+                  (run_id,),
+              )
+              connection.commit()
+
+          print(
+              "PASS: GitHub runner connected to Neon PostgreSQL."
+          )
+          print(
+              "PASS: Application repository wrote and read a record."
+          )
+          print(
+              "PASS: Temporary integration record was deleted."
+          )
+          PY
+
       - name: Diagnostic summary
         if: always()
         run: |
           echo "========================================"
           echo "Insider Trade Bot 2.0 Diagnostic"
           echo "========================================"
-          echo "Python compilation, imports, and tests"
-          echo "were executed above."
+          echo "Compilation, imports, tests, and Neon"
+          echo "PostgreSQL integration were executed above."
           echo "========================================"
