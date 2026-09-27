@@ -65,10 +65,15 @@ def _number(
         if not text_value:
             return None
 
-        text_value = text_value.replace(",", "")
+        text_value = text_value.replace(
+            ",",
+            "",
+        )
 
         try:
-            result = float(text_value)
+            result = float(
+                text_value
+            )
         except ValueError as exc:
             raise NormalizationError(
                 f"{field_name} must be numeric."
@@ -86,7 +91,10 @@ def _mapping(
     value: Any,
     field_name: str,
 ) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
+    if not isinstance(
+        value,
+        Mapping,
+    ):
         raise NormalizationError(
             f"{field_name} must be an object or mapping."
         )
@@ -103,8 +111,12 @@ def _first_present(
 
     Unlike `a or b`, this preserves legitimate zero values.
     """
+
     for key in keys:
-        if key in data and data[key] is not None:
+        if (
+            key in data
+            and data[key] is not None
+        ):
             return data[key]
 
     return None
@@ -234,12 +246,30 @@ def normalize_insider_transaction(
 def normalize_market_price(
     payload: Mapping[str, Any],
     *,
-    source: str,
-) -> MarketPrice:
+    source: str | None = None,
+) -> MarketPrice | dict[str, Any]:
+    """
+    Normalize a market-price record.
+
+    When source is explicitly supplied, the normal domain-model
+    MarketPrice representation is returned.
+
+    When source is omitted, the source is read from the input record and
+    a compatibility dictionary is returned for lightweight callers.
+    """
+
     data = _mapping(
         payload,
         "payload",
     )
+
+    source_was_explicit = source is not None
+
+    if source is None:
+        source = _first_present(
+            data,
+            "source",
+        )
 
     normalized_source = _required_text(
         source,
@@ -265,38 +295,82 @@ def normalize_market_price(
         "price_date",
     )
 
+    open_price = _number(
+        _first_present(
+            data,
+            "open",
+            "open_price",
+        ),
+        "open",
+    )
+
+    high_price = _number(
+        _first_present(
+            data,
+            "high",
+            "high_price",
+        ),
+        "high",
+    )
+
+    low_price = _number(
+        _first_present(
+            data,
+            "low",
+            "low_price",
+        ),
+        "low",
+    )
+
+    close_price = _number(
+        _first_present(
+            data,
+            "close",
+            "close_price",
+        ),
+        "close",
+    )
+
+    adjusted_close = _number(
+        _first_present(
+            data,
+            "adjusted_close",
+            "adjustedClose",
+            "adj_close",
+        ),
+        "adjusted_close",
+    )
+
+    volume = _number(
+        _first_present(
+            data,
+            "volume",
+        ),
+        "volume",
+    )
+
+    if not source_was_explicit:
+        return {
+            "symbol": symbol.upper(),
+            "price_date": price_date,
+            "open_price": open_price,
+            "high_price": high_price,
+            "low_price": low_price,
+            "close_price": close_price,
+            "adjusted_close": adjusted_close,
+            "volume": volume,
+            "source": normalized_source,
+        }
+
     return MarketPrice(
         symbol=symbol.upper(),
         price_date=price_date,
-        open=_number(
-            _first_present(data, "open"),
-            "open",
-        ),
-        high=_number(
-            _first_present(data, "high"),
-            "high",
-        ),
-        low=_number(
-            _first_present(data, "low"),
-            "low",
-        ),
-        close=_number(
-            _first_present(data, "close"),
-            "close",
-        ),
-        adjusted_close=_number(
-            _first_present(
-                data,
-                "adjusted_close",
-                "adjustedClose",
-                "adj_close",
-            ),
-            "adjusted_close",
-        ),
-        volume=_number(
-            _first_present(data, "volume"),
-            "volume",
-        ),
+        open=open_price,
+        high=high_price,
+        low=low_price,
+        close=close_price,
+        adjusted_close=adjusted_close,
+        volume=volume,
         source=normalized_source,
     )
 
@@ -500,27 +574,49 @@ def normalize_market_price_record(
         "symbol": symbol.upper(),
         "price_date": price_date,
         "open_price": _number(
-            _first_present(data, "open", "open_price"),
+            _first_present(
+                data,
+                "open",
+                "open_price",
+            ),
             "open",
         ),
         "high_price": _number(
-            _first_present(data, "high", "high_price"),
+            _first_present(
+                data,
+                "high",
+                "high_price",
+            ),
             "high",
         ),
         "low_price": _number(
-            _first_present(data, "low", "low_price"),
+            _first_present(
+                data,
+                "low",
+                "low_price",
+            ),
             "low",
         ),
         "close_price": _number(
-            _first_present(data, "close", "close_price"),
+            _first_present(
+                data,
+                "close",
+                "close_price",
+            ),
             "close",
         ),
         "volume": _number(
-            _first_present(data, "volume"),
+            _first_present(
+                data,
+                "volume",
+            ),
             "volume",
         ),
         "source": _required_text(
-            _first_present(data, "source"),
+            _first_present(
+                data,
+                "source",
+            ),
             "source",
         ),
     }
@@ -555,18 +651,22 @@ def normalize_batch(
         | CorporateAction
     ] = []
 
-    for index, record in enumerate(records):
+    for index, record in enumerate(
+        records
+    ):
         try:
             if normalized_type == "insider_transaction":
                 result = normalize_insider_transaction(
                     record,
                     source=source,
                 )
+
             elif normalized_type == "market_price":
                 result = normalize_market_price(
                     record,
                     source=source,
                 )
+
             else:
                 result = normalize_corporate_action(
                     record,
@@ -582,6 +682,8 @@ def normalize_batch(
                 f"Failed to normalize record {index}: {exc}"
             ) from exc
 
-        results.append(result)
+        results.append(
+            result
+        )
 
     return results
