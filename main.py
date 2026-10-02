@@ -205,6 +205,10 @@ def run_historical_acquisition(
     print(f"Latest transaction date: {latest_date}")
     print("================================================================")
 
+    if total_failures > 0:
+        print(f"Historical acquisition finished with {total_failures} period failure(s). Returning non-zero exit code.", file=sys.stderr)
+        return 1
+
     return 0
 
 

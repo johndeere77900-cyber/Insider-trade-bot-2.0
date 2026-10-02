@@ -331,7 +331,8 @@ def store_bulk_insider_transactions(
     provenance_rows = []
 
     for r in records:
-        r_hash = sha256_record(r.raw_payload)
+        # Use persisted semantic transaction identity (record_hash) if available
+        r_hash = getattr(r, "record_hash", None) or sha256_record(r.raw_payload)
         raw_json = json.dumps(r.raw_payload, sort_keys=True, default=str)
 
         form_t = getattr(r, "form_type", None) or getattr(r, "form", None) or "4"

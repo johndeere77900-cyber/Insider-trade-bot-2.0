@@ -2,7 +2,7 @@
 Comprehensive unit tests for official SEC bulk datasets pipeline, normalization, validation,
 Owner ↔ Transaction relationships (Cases A, B, C, D), footnotes/holdings source preservation,
 amendment relationships, deterministic transaction deduplication, bounded batching,
-period provenance, and resumable state.
+period provenance, ZipFile cleanup, and resumable state.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from data.acquisition_state import AcquisitionStateManager
 from data.sec_dataset_pipeline import (
     NormalizedBulkTransaction,
     build_dataset_url,
+    compute_transaction_identity,
     normalize_bulk_record,
     parse_dataset_zip,
     parse_sec_date,
@@ -157,7 +158,10 @@ def test_parse_sec_date():
 
 
 def test_case_a_one_filing_two_owners_one_transaction():
-    """Case A: 1 filing, 2 reporting owners, 1 transaction row -> Expected: 1 transaction record, 2 reporting owners in raw payload."""
+    """
+    Case A: 2 reporting owners + 1 transaction row = exactly 1 transaction record + 2 owner records in raw source.
+    Owner fields are left unset (None) to avoid false single-owner attribution.
+    """
     zip_bytes = create_mock_zip_bytes(case="case_a")
     records = list(parse_dataset_zip(zip_bytes))
 
@@ -165,7 +169,8 @@ def test_case_a_one_filing_two_owners_one_transaction():
 
     rec = records[0]
     assert rec["accession_number"] == "0000016732-23-000043"
-    assert rec["reporting_owner_name"] == "Watanabe Todd Franklin"
+    assert rec["reporting_owner_name"] is None
+    assert rec["reporting_owner_cik"] is None
 
     raw = rec["raw"]
     all_owners = raw["all_owners"]
@@ -175,7 +180,7 @@ def test_case_a_one_filing_two_owners_one_transaction():
 
 
 def test_case_b_one_filing_two_owners_two_transactions():
-    """Case B: 1 filing, 2 reporting owners, 2 transaction rows -> Expected: 2 transaction records, NOT 4."""
+    """Case B: 2 reporting owners + 2 transaction rows = exactly 2 transaction records + 2 owner records in raw source."""
     zip_bytes = create_mock_zip_bytes(case="case_b")
     records = list(parse_dataset_zip(zip_bytes))
 
@@ -186,18 +191,17 @@ def test_case_b_one_filing_two_owners_two_transactions():
 
 
 def test_case_c_multiple_nonderiv_and_deriv_transactions():
-    """Case C: 1 filing, 2 non-derivative, 1 derivative -> Expected: 3 separate transaction records."""
+    """Case C: 2 non-derivative, 1 derivative = 3 distinct transaction records with distinct transaction SK identities."""
     zip_bytes = create_mock_zip_bytes(case="case_c")
     records = list(parse_dataset_zip(zip_bytes))
 
     assert len(records) == 3, f"Expected 3 transaction records, got {len(records)}"
-    types = [r["transaction_type"] for r in records]
-    assert types.count("non_derivative") == 2
-    assert types.count("derivative") == 1
+    hashes = [r["record_hash"] for r in records]
+    assert len(set(hashes)) == 3, "Expected 3 distinct semantic transaction identities"
 
 
 def test_case_d_same_dataset_processed_twice(tmp_path):
-    """Case D: Same dataset processed twice -> Expected: 0 new transaction records inserted, 0 duplicate provenance records."""
+    """Case D: Same dataset re-ingested = 0 new transaction records inserted, 0 duplicate provenance records."""
     db_file = tmp_path / "test_case_d.db"
     db_url = f"sqlite:///{db_file}"
 
@@ -218,6 +222,23 @@ def test_case_d_same_dataset_processed_twice(tmp_path):
     assert dup2 == 2
     assert count_records(db_url, "insider_transactions") == 2
     assert count_records(db_url, "provenance") == 2
+
+
+def test_persisted_semantic_transaction_identity():
+    """Verify persisted semantic transaction identity uses compute_transaction_identity and isn't replaced by raw-payload hash."""
+    zip_bytes = create_mock_zip_bytes(case="case_a")
+    raw_records = list(parse_dataset_zip(zip_bytes))
+    norm_rec = normalize_bulk_record(raw_records[0])
+
+    expected_hash = compute_transaction_identity(
+        accession_number="0000016732-23-000043",
+        transaction_type="non_derivative",
+        transaction_sk="5001",
+        is_amendment=False,
+        form_type="4",
+    )
+
+    assert norm_rec.record_hash == expected_hash, "Record hash must match deterministic semantic SEC transaction identity"
 
 
 def test_amendments_preservation():
@@ -290,7 +311,6 @@ def test_acquisition_state_and_resume_behavior(tmp_path):
         failures_count=1,
         status="FAILED",
     )
-    # FAILED period should NOT be skipped on rerun
     assert state_mgr.get_period_status("2006-Q1") == "FAILED"
     assert state_mgr.should_skip_period("2006-Q1") is False
 
