@@ -29,17 +29,26 @@ from database.connection import connect, is_postgresql_url
 from storage.repository import _row_value
 
 
-def get_field(row: Any, key: str) -> Any:
-    """Safely retrieve a column by name from sqlite3.Row, dict, or psycopg tuple/row."""
+from typing import Sequence
+
+def get_field(row: Any, key: str, columns: Optional[Sequence[str]] = None) -> Any:
+    """Safely retrieve a column by name from dict, sqlite3.Row, or tuple/row."""
     if row is None:
         return None
+    if isinstance(row, dict):
+        return row.get(key)
     if hasattr(row, "keys"):
         try:
             return row[key]
-        except (IndexError, KeyError):
+        except (IndexError, KeyError, TypeError):
             pass
-    if isinstance(row, dict):
-        return row.get(key)
+    if isinstance(row, (tuple, list)):
+        if columns is not None and key in columns:
+            idx = columns.index(key)
+            if idx < len(row):
+                return row[idx]
+        if len(row) == 1:
+            return row[0]
     return None
 
 
@@ -59,15 +68,42 @@ def get_db_url() -> str:
 
 
 def query_one(conn: Any, db_url: str, sql: str, params: tuple = ()) -> Any:
-    """Execute query and fetch single row."""
+    """Execute query, fetch single row, and normalize to dict using cursor.description if available."""
     cursor = conn.execute(sql, params)
-    return cursor.fetchone()
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return row
+    if getattr(cursor, "description", None):
+        cols = [desc[0] for desc in cursor.description]
+        if hasattr(row, "keys"):
+            return {c: row[c] for c in cols}
+        if isinstance(row, (tuple, list)):
+            return dict(zip(cols, row))
+    return row
 
 
 def query_all(conn: Any, db_url: str, sql: str, params: tuple = ()) -> list:
-    """Execute query and fetch all rows."""
+    """Execute query, fetch all rows, and normalize each to dict using cursor.description if available."""
     cursor = conn.execute(sql, params)
-    return cursor.fetchall()
+    rows = cursor.fetchall()
+    if not rows:
+        return []
+    if getattr(cursor, "description", None):
+        cols = [desc[0] for desc in cursor.description]
+        normalized = []
+        for r in rows:
+            if isinstance(r, dict):
+                normalized.append(r)
+            elif hasattr(r, "keys"):
+                normalized.append({c: r[c] for c in cols})
+            elif isinstance(r, (tuple, list)):
+                normalized.append(dict(zip(cols, r)))
+            else:
+                normalized.append(r)
+        return normalized
+    return rows
 
 
 def get_period_date_bounds(period: str) -> Tuple[str, str]:
@@ -110,7 +146,7 @@ def verify_run1(period: str, state_file: str) -> int:
     with connect(db_url) as conn:
         # 1. Total database records
         row = query_one(conn, db_url, "SELECT COUNT(*) AS c FROM insider_transactions")
-        total_tx_count = int(get_field(row, "c") if get_field(row, "c") is not None else row[0])
+        total_tx_count = int(get_field(row, "c", ["c"]))
 
         # 2. Strict Period records count (WHERE filing_date BETWEEN start_date AND end_date)
         period_count_sql = (
@@ -119,13 +155,14 @@ def verify_run1(period: str, state_file: str) -> int:
             "SELECT COUNT(*) AS c FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ?"
         )
         row = query_one(conn, db_url, period_count_sql, (start_date, end_date))
-        period_tx_count = int(get_field(row, "c") if get_field(row, "c") is not None else row[0])
+        period_tx_count = int(get_field(row, "c", ["c"]))
 
         if period_tx_count == 0:
             print(f"ERROR: 0 records found for period {period} (filing_date between {start_date} and {end_date}).", file=sys.stderr)
             sys.exit(1)
 
         # Period transaction date range
+        date_range_cols = ["min_d", "max_d"]
         date_range_sql = (
             "SELECT MIN(transaction_date) AS min_d, MAX(transaction_date) AS max_d "
             "FROM insider_transactions WHERE filing_date >= %s AND filing_date <= %s "
@@ -136,8 +173,8 @@ def verify_run1(period: str, state_file: str) -> int:
             "AND transaction_date IS NOT NULL AND transaction_date != ''"
         )
         row = query_one(conn, db_url, date_range_sql, (start_date, end_date))
-        earliest_date = get_field(row, "min_d") if get_field(row, "min_d") is not None else row[0]
-        latest_date = get_field(row, "max_d") if get_field(row, "max_d") is not None else row[1]
+        earliest_date = get_field(row, "min_d", date_range_cols)
+        latest_date = get_field(row, "max_d", date_range_cols)
 
         # Period distinct accession numbers
         period_acc_sql = (
@@ -146,7 +183,7 @@ def verify_run1(period: str, state_file: str) -> int:
             "SELECT COUNT(DISTINCT accession_number) AS c FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ?"
         )
         row = query_one(conn, db_url, period_acc_sql, (start_date, end_date))
-        distinct_accessions = int(get_field(row, "c") if get_field(row, "c") is not None else row[0])
+        distinct_accessions = int(get_field(row, "c", ["c"]))
 
         # Period distinct record hashes
         period_hash_sql = (
@@ -155,7 +192,7 @@ def verify_run1(period: str, state_file: str) -> int:
             "SELECT COUNT(DISTINCT record_hash) AS c FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ?"
         )
         row = query_one(conn, db_url, period_hash_sql, (start_date, end_date))
-        distinct_hashes = int(get_field(row, "c") if get_field(row, "c") is not None else row[0])
+        distinct_hashes = int(get_field(row, "c", ["c"]))
 
         print(f"Total database count: {total_tx_count}")
         print(f"Period {period} record count: {period_tx_count}")
@@ -165,23 +202,22 @@ def verify_run1(period: str, state_file: str) -> int:
         print(f"Period distinct record hashes: {distinct_hashes}")
 
         # Provenance checks
-        row = query_one(
-            conn,
-            db_url,
-            "SELECT * FROM provenance WHERE record_type = %s AND record_id = %s AND source = %s"
+        prov_cols = ["record_type", "record_id", "source", "source_reference", "retrieved_at", "checksum", "validation_status"]
+        prov_sql = (
+            f"SELECT {', '.join(prov_cols)} FROM provenance WHERE record_type = %s AND record_id = %s AND source = %s"
             if is_postgresql_url(db_url) else
-            "SELECT * FROM provenance WHERE record_type = ? AND record_id = ? AND source = ?",
-            ("dataset_period", period, "SEC")
+            f"SELECT {', '.join(prov_cols)} FROM provenance WHERE record_type = ? AND record_id = ? AND source = ?"
         )
+        row = query_one(conn, db_url, prov_sql, ("dataset_period", period, "SEC"))
 
         if not row:
             print(f"ERROR: Missing provenance record for dataset_period {period}.", file=sys.stderr)
             sys.exit(1)
 
-        prov_source = get_field(row, "source")
-        prov_ref = get_field(row, "source_reference")
-        prov_checksum = get_field(row, "checksum")
-        prov_status = get_field(row, "validation_status")
+        prov_source = get_field(row, "source", prov_cols)
+        prov_ref = get_field(row, "source_reference", prov_cols)
+        prov_checksum = get_field(row, "checksum", prov_cols)
+        prov_status = get_field(row, "validation_status", prov_cols)
 
         if prov_source != "SEC":
             print(f"ERROR: Provenance source is '{prov_source}', expected 'SEC'.", file=sys.stderr)
@@ -200,28 +236,27 @@ def verify_run1(period: str, state_file: str) -> int:
             sys.exit(1)
 
         row = query_one(conn, db_url, "SELECT COUNT(*) AS c FROM provenance")
-        total_prov_count = int(get_field(row, "c") if get_field(row, "c") is not None else row[0])
+        total_prov_count = int(get_field(row, "c", ["c"]))
 
         # Ingestion_state checks
-        row = query_one(
-            conn,
-            db_url,
-            "SELECT * FROM ingestion_state WHERE period = %s"
+        ingest_cols = ["period", "status", "records_parsed", "records_inserted", "duplicates_count", "invalid_count", "failures_count", "completed_at"]
+        ingest_sql = (
+            f"SELECT {', '.join(ingest_cols)} FROM ingestion_state WHERE period = %s"
             if is_postgresql_url(db_url) else
-            "SELECT * FROM ingestion_state WHERE period = ?",
-            (period,)
+            f"SELECT {', '.join(ingest_cols)} FROM ingestion_state WHERE period = ?"
         )
+        row = query_one(conn, db_url, ingest_sql, (period,))
 
         if not row:
             print(f"ERROR: Missing ingestion_state record for period {period}.", file=sys.stderr)
             sys.exit(1)
 
-        status = get_field(row, "status")
-        records_parsed = int(get_field(row, "records_parsed") or 0)
-        records_inserted = int(get_field(row, "records_inserted") or 0)
-        duplicates_count = int(get_field(row, "duplicates_count") or 0)
-        invalid_count = int(get_field(row, "invalid_count") or 0)
-        failures_count = int(get_field(row, "failures_count") or 0)
+        status = get_field(row, "status", ingest_cols)
+        records_parsed = int(get_field(row, "records_parsed", ingest_cols) or 0)
+        records_inserted = int(get_field(row, "records_inserted", ingest_cols) or 0)
+        duplicates_count = int(get_field(row, "duplicates_count", ingest_cols) or 0)
+        invalid_count = int(get_field(row, "invalid_count", ingest_cols) or 0)
+        failures_count = int(get_field(row, "failures_count", ingest_cols) or 0)
 
         if status != "COMPLETED":
             print(f"ERROR: Ingestion status is '{status}', expected 'COMPLETED'.", file=sys.stderr)
@@ -236,11 +271,12 @@ def verify_run1(period: str, state_file: str) -> int:
             sys.exit(1)
 
         # Strict Period-Scoped Data Quality: Multi-Owner and Amendment checks
+        period_tx_cols = ["accession_number", "issuer_cik", "record_hash", "source", "insider_name", "insider_cik", "form_type", "filing_date", "raw_payload"]
         period_sql = (
-            "SELECT accession_number, issuer_cik, record_hash, source, insider_name, insider_cik, form_type, filing_date, raw_payload "
+            f"SELECT {', '.join(period_tx_cols)} "
             "FROM insider_transactions WHERE filing_date >= %s AND filing_date <= %s"
             if is_postgresql_url(db_url) else
-            "SELECT accession_number, issuer_cik, record_hash, source, insider_name, insider_cik, form_type, filing_date, raw_payload "
+            f"SELECT {', '.join(period_tx_cols)} "
             "FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ?"
         )
         period_rows = query_all(conn, db_url, period_sql, (start_date, end_date))
@@ -250,16 +286,16 @@ def verify_run1(period: str, state_file: str) -> int:
         multi_owner_found = False
         multi_owner_valid = True
 
-        amendment_records = []
-        non_amendment_hashes = set()
+        amendment_rows = []
+        original_rows_by_acc: Dict[str, list] = {}
         all_period_hashes = set()
 
         for r in period_rows:
-            acc = get_field(r, "accession_number")
-            cik = get_field(r, "issuer_cik")
-            rec_hash = get_field(r, "record_hash")
-            source = get_field(r, "source")
-            raw_str = get_field(r, "raw_payload")
+            acc = get_field(r, "accession_number", period_tx_cols)
+            cik = get_field(r, "issuer_cik", period_tx_cols)
+            rec_hash = get_field(r, "record_hash", period_tx_cols)
+            source = get_field(r, "source", period_tx_cols)
+            raw_str = get_field(r, "raw_payload", period_tx_cols)
 
             if not acc or not cik or not rec_hash or source != "SEC" or not raw_str:
                 print(f"ERROR: Record failed required field check: acc={acc}, cik={cik}, hash={rec_hash}, source={source}", file=sys.stderr)
@@ -276,9 +312,9 @@ def verify_run1(period: str, state_file: str) -> int:
                 break
 
             # Multi-owner evaluation
-            all_owners = raw_obj.get("all_owners", [])
-            insider_name = get_field(r, "insider_name")
-            insider_cik = get_field(r, "insider_cik")
+            all_owners = raw_obj.get("all_owners", []) if isinstance(raw_obj, dict) else []
+            insider_name = get_field(r, "insider_name", period_tx_cols)
+            insider_cik = get_field(r, "insider_cik", period_tx_cols)
 
             if len(all_owners) > 1:
                 multi_owner_found = True
@@ -287,45 +323,41 @@ def verify_run1(period: str, state_file: str) -> int:
                     multi_owner_valid = False
 
             # Amendment evaluation
-            doc_type = str(raw_obj.get("submission", {}).get("DOCUMENT_TYPE", ""))
-            date_orig = str(raw_obj.get("submission", {}).get("DATE_OF_ORIG_SUB", ""))
-            form_t = str(get_field(r, "form_type") or "")
+            sub_info = raw_obj.get("submission", {}) if isinstance(raw_obj, dict) else {}
+            doc_type = str(sub_info.get("DOCUMENT_TYPE", ""))
+            date_orig = str(sub_info.get("DATE_OF_ORIG_SUB", ""))
+            form_t = str(get_field(r, "form_type", period_tx_cols) or "")
 
-            is_amend = doc_type.endswith("/A") or form_t.endswith("/A") or (date_orig and date_orig.strip())
+            is_amend = doc_type.endswith("/A") or form_t.endswith("/A") or bool(date_orig and date_orig.strip())
 
             if is_amend:
-                amendment_records.append((acc, rec_hash, date_orig, doc_type, raw_obj))
+                amendment_rows.append((acc, rec_hash, date_orig, doc_type, raw_obj))
             else:
-                non_amendment_hashes.add(rec_hash)
+                if acc not in original_rows_by_acc:
+                    original_rows_by_acc[acc] = []
+                original_rows_by_acc[acc].append((rec_hash, r))
 
-        # Strict Amendment Preservation Verification: NO SELF-COMPARISON
+        # Strict Amendment Preservation Verification
         amendment_result = "NOT TESTABLE"
-        if amendment_records:
+        if amendment_rows:
             distinct_amendment_proven = False
             amendment_failed = False
 
-            for acc, rec_hash, date_orig, doc_type, raw_obj in amendment_records:
-                # 1. Basic integrity
+            for acc, rec_hash, date_orig, doc_type, raw_obj in amendment_rows:
                 if not acc or not rec_hash or rec_hash not in all_period_hashes:
                     amendment_failed = True
                     break
 
-                # 2. Check if a DISTINCT non-amendment record exists for the same accession/issuer
-                # An amendment record MUST NOT compare itself against itself!
-                orig_acc = raw_obj.get("submission", {}).get("ACCESSION_NUMBER") or acc
+                sub_info = raw_obj.get("submission", {}) if isinstance(raw_obj, dict) else {}
+                orig_acc = sub_info.get("ACCESSION_NUMBER") or acc
 
-                # Check for separate distinct records with same accession
-                matching_hashes = {
-                    get_field(other, "record_hash")
-                    for other in period_rows
-                    if get_field(other, "accession_number") == orig_acc
-                }
-
-                if len(matching_hashes) > 1 and rec_hash in matching_hashes:
-                    # Found distinct original filing and amendment rows preserved separately!
-                    distinct_hashes = matching_hashes - {rec_hash}
-                    if distinct_hashes:
-                        distinct_amendment_proven = True
+                # Check if a separate original filing record exists in original_rows_by_acc
+                matching_origs = original_rows_by_acc.get(orig_acc) or original_rows_by_acc.get(acc)
+                if matching_origs:
+                    for orig_hash, orig_r in matching_origs:
+                        if orig_hash != rec_hash:
+                            distinct_amendment_proven = True
+                            break
 
             if amendment_failed:
                 amendment_result = "FAIL"
@@ -389,7 +421,7 @@ def verify_run2(period: str, state_file: str) -> int:
     with connect(db_url) as conn:
         # Total insider_transactions count check
         row = query_one(conn, db_url, "SELECT COUNT(*) AS c FROM insider_transactions")
-        total_tx_count_run2 = int(get_field(row, "c") if get_field(row, "c") is not None else row[0])
+        total_tx_count_run2 = int(get_field(row, "c", ["c"]))
 
         # Period-specific insider_transactions count check
         period_count_sql = (
@@ -398,32 +430,31 @@ def verify_run2(period: str, state_file: str) -> int:
             "SELECT COUNT(*) AS c FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ?"
         )
         row = query_one(conn, db_url, period_count_sql, (start_date, end_date))
-        period_tx_count_run2 = int(get_field(row, "c") if get_field(row, "c") is not None else row[0])
+        period_tx_count_run2 = int(get_field(row, "c", ["c"]))
 
         # Provenance count check
         row = query_one(conn, db_url, "SELECT COUNT(*) AS c FROM provenance")
-        prov_count_run2 = int(get_field(row, "c") if get_field(row, "c") is not None else row[0])
+        prov_count_run2 = int(get_field(row, "c", ["c"]))
 
         # Ingestion_state check
-        row = query_one(
-            conn,
-            db_url,
-            "SELECT * FROM ingestion_state WHERE period = %s"
+        ingest_cols = ["period", "status", "records_parsed", "records_inserted", "duplicates_count", "invalid_count", "failures_count", "completed_at"]
+        ingest_sql = (
+            f"SELECT {', '.join(ingest_cols)} FROM ingestion_state WHERE period = %s"
             if is_postgresql_url(db_url) else
-            "SELECT * FROM ingestion_state WHERE period = ?",
-            (period,)
+            f"SELECT {', '.join(ingest_cols)} FROM ingestion_state WHERE period = ?"
         )
+        row = query_one(conn, db_url, ingest_sql, (period,))
 
         if not row:
             print(f"ERROR: Missing ingestion_state record for period {period} on run 2.", file=sys.stderr)
             sys.exit(1)
 
-        status_run2 = get_field(row, "status")
-        run2_parsed = int(get_field(row, "records_parsed") or 0)
-        run2_inserted = int(get_field(row, "records_inserted") or 0)
-        run2_duplicates = int(get_field(row, "duplicates_count") or 0)
-        run2_invalid = int(get_field(row, "invalid_count") or 0)
-        run2_failures = int(get_field(row, "failures_count") or 0)
+        status_run2 = get_field(row, "status", ingest_cols)
+        run2_parsed = int(get_field(row, "records_parsed", ingest_cols) or 0)
+        run2_inserted = int(get_field(row, "records_inserted", ingest_cols) or 0)
+        run2_duplicates = int(get_field(row, "duplicates_count", ingest_cols) or 0)
+        run2_invalid = int(get_field(row, "invalid_count", ingest_cols) or 0)
+        run2_failures = int(get_field(row, "failures_count", ingest_cols) or 0)
 
         idempotency_pass = True
         idempotency_errors = []
