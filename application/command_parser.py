@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from application.commands import (
     ApplicationCommand,
     BacktestCommand,
+    HistoricalAcquisitionCommand,
     PortfolioCommand,
     ResearchCommand,
     SignalCommand,
@@ -31,6 +32,8 @@ class ApplicationCommandParser:
         "portfolio": PortfolioCommand,
         "status": StatusCommand,
         "trade": TradeCommand,
+        "historical acquisition": HistoricalAcquisitionCommand,
+        "historical_acquisition": HistoricalAcquisitionCommand,
     }
 
     def parse(

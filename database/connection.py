@@ -114,15 +114,20 @@ def _postgres_schema() -> str:
         accession_number TEXT NOT NULL,
         issuer_cik TEXT NOT NULL,
         issuer_name TEXT,
+        ticker TEXT,
         insider_name TEXT,
         insider_cik TEXT,
         transaction_date TEXT,
         filing_date TEXT,
         form_type TEXT,
         transaction_code TEXT,
+        security_title TEXT,
         shares DOUBLE PRECISION,
         price DOUBLE PRECISION,
+        transaction_type TEXT,
         ownership_type TEXT,
+        ownership_nature TEXT,
+        source_url TEXT,
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -131,6 +136,18 @@ def _postgres_schema() -> str:
             accession_number,
             record_hash
         )
+    );
+
+    CREATE TABLE IF NOT EXISTS ingestion_state (
+        id BIGSERIAL PRIMARY KEY,
+        period TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        records_parsed BIGINT DEFAULT 0,
+        records_inserted BIGINT DEFAULT 0,
+        duplicates_count BIGINT DEFAULT 0,
+        invalid_count BIGINT DEFAULT 0,
+        failures_count BIGINT DEFAULT 0,
+        completed_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS market_prices (
@@ -210,7 +227,8 @@ def _postgres_schema() -> str:
         source_reference TEXT,
         retrieved_at TEXT NOT NULL,
         checksum TEXT,
-        validation_status TEXT NOT NULL
+        validation_status TEXT NOT NULL,
+        UNIQUE (record_type, record_id, source)
     );
     """
 
@@ -227,15 +245,20 @@ def _sqlite_schema() -> str:
         accession_number TEXT NOT NULL,
         issuer_cik TEXT NOT NULL,
         issuer_name TEXT,
+        ticker TEXT,
         insider_name TEXT,
         insider_cik TEXT,
         transaction_date TEXT,
         filing_date TEXT,
         form_type TEXT,
         transaction_code TEXT,
+        security_title TEXT,
         shares REAL,
         price REAL,
+        transaction_type TEXT,
         ownership_type TEXT,
+        ownership_nature TEXT,
+        source_url TEXT,
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -244,6 +267,18 @@ def _sqlite_schema() -> str:
             accession_number,
             record_hash
         )
+    );
+
+    CREATE TABLE IF NOT EXISTS ingestion_state (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        period TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        records_parsed INTEGER DEFAULT 0,
+        records_inserted INTEGER DEFAULT 0,
+        duplicates_count INTEGER DEFAULT 0,
+        invalid_count INTEGER DEFAULT 0,
+        failures_count INTEGER DEFAULT 0,
+        completed_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS market_prices (
@@ -323,14 +358,16 @@ def _sqlite_schema() -> str:
         source_reference TEXT,
         retrieved_at TEXT NOT NULL,
         checksum TEXT,
-        validation_status TEXT NOT NULL
+        validation_status TEXT NOT NULL,
+        UNIQUE (record_type, record_id, source)
     );
     """
 
 
 def initialize_database(database_url: str) -> Any:
     """
-    Create and initialize the configured database.
+    Create and initialize the configured database, including migration
+    of new columns on existing tables.
 
     The existing SQLite backend remains supported for local testing.
     PostgreSQL is supported for persistent deployment.
@@ -340,9 +377,35 @@ def initialize_database(database_url: str) -> Any:
         database_path = get_database_path(database_url)
 
         with sqlite3.connect(database_path) as connection:
-            connection.executescript(
-                _sqlite_schema()
+            connection.executescript(_sqlite_schema())
+
+            # Migration for SQLite: Add missing columns to pre-existing tables if needed
+            cursor = connection.cursor()
+            cursor.execute("PRAGMA table_info(insider_transactions)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+
+            new_columns = [
+                ("ticker", "TEXT"),
+                ("security_title", "TEXT"),
+                ("transaction_type", "TEXT"),
+                ("ownership_nature", "TEXT"),
+                ("source_url", "TEXT"),
+            ]
+
+            for col_name, col_type in new_columns:
+                if col_name not in existing_cols:
+                    connection.execute(
+                        f"ALTER TABLE insider_transactions ADD COLUMN {col_name} {col_type}"
+                    )
+
+            # Ensure indexes exist for insider_transactions deduplication
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_insider_tx_uniq ON insider_transactions (source, accession_number, record_hash);"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
+            )
+
             connection.commit()
 
         return database_path
@@ -352,8 +415,26 @@ def initialize_database(database_url: str) -> Any:
 
         try:
             with connection.cursor() as cursor:
+                cursor.execute(_postgres_schema())
+
+                # Migration for PostgreSQL: Add missing columns to pre-existing tables if needed
+                alter_queries = [
+                    "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS ticker TEXT;",
+                    "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS security_title TEXT;",
+                    "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS transaction_type TEXT;",
+                    "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS ownership_nature TEXT;",
+                    "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS source_url TEXT;",
+                ]
+
+                for query in alter_queries:
+                    cursor.execute(query)
+
+                # Ensure PostgreSQL indexes exist
                 cursor.execute(
-                    _postgres_schema()
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_insider_tx_uniq ON insider_transactions (source, accession_number, record_hash);"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
                 )
 
             connection.commit()

@@ -185,15 +185,20 @@ def store_insider_transaction(
     accession_number: str,
     issuer_cik: str,
     issuer_name: str | None,
-    insider_name: str | None,
-    insider_cik: str | None,
-    transaction_date: str | None,
-    filing_date: str | None,
-    form_type: str | None,
-    transaction_code: str | None,
-    shares: float | None,
-    price: float | None,
-    ownership_type: str | None,
+    ticker: str | None = None,
+    insider_name: str | None = None,
+    insider_cik: str | None = None,
+    transaction_date: str | None = None,
+    filing_date: str | None = None,
+    form_type: str | None = None,
+    transaction_code: str | None = None,
+    security_title: str | None = None,
+    shares: float | None = None,
+    price: float | None = None,
+    transaction_type: str | None = None,
+    ownership_type: str | None = None,
+    ownership_nature: str | None = None,
+    source_url: str | None = None,
     raw_payload: dict[str, Any],
 ) -> str:
     """Store an insider transaction and return its record hash."""
@@ -208,15 +213,20 @@ def store_insider_transaction(
         accession_number,
         issuer_cik,
         issuer_name,
+        ticker,
         insider_name,
         insider_cik,
         transaction_date,
         filing_date,
         form_type,
         transaction_code,
+        security_title,
         shares,
         price,
+        transaction_type,
         ownership_type,
+        ownership_nature,
+        source_url,
         raw_payload,
         record_hash,
         created_at
@@ -227,15 +237,20 @@ def store_insider_transaction(
         accession_number,
         issuer_cik,
         issuer_name,
+        ticker,
         insider_name,
         insider_cik,
         transaction_date,
         filing_date,
         form_type,
         transaction_code,
+        security_title,
         shares,
         price,
+        transaction_type,
         ownership_type,
+        ownership_nature,
+        source_url,
         json.dumps(
             raw_payload,
             sort_keys=True,
@@ -285,6 +300,120 @@ def store_insider_transaction(
         connection.commit()
 
     return record_hash
+
+
+def store_bulk_insider_transactions(
+    database_url: str,
+    records: list[Any],
+) -> tuple[int, int]:
+    """
+    Batch store normalized insider transactions with deduplication.
+    Also stores provenance records for each inserted record.
+
+    Returns:
+        (inserted_count, duplicates_count)
+    """
+    if not records:
+        return 0, 0
+
+    initialize_database(database_url)
+
+    columns = """
+        source, accession_number, issuer_cik, issuer_name, ticker,
+        insider_name, insider_cik, transaction_date, filing_date,
+        form_type, transaction_code, security_title, shares, price,
+        transaction_type, ownership_type, ownership_nature, source_url,
+        raw_payload, record_hash, created_at
+    """
+
+    now = utc_now()
+    rows_to_insert = []
+    provenance_rows = []
+
+    for r in records:
+        # Use persisted semantic transaction identity (record_hash) if available
+        r_hash = getattr(r, "record_hash", None) or sha256_record(r.raw_payload)
+        raw_json = json.dumps(r.raw_payload, sort_keys=True, default=str)
+
+        form_t = getattr(r, "form_type", None) or getattr(r, "form", None) or "4"
+        val_tuple = (
+            r.source,
+            r.accession_number,
+            r.issuer_cik,
+            r.issuer_name,
+            r.ticker,
+            r.reporting_owner_name,
+            r.reporting_owner_cik,
+            r.transaction_date,
+            r.filing_date,
+            form_t,
+            r.transaction_code,
+            r.security_title,
+            r.shares,
+            r.price_per_share,
+            r.transaction_type,
+            r.ownership_type,
+            r.ownership_nature,
+            r.source_url,
+            raw_json,
+            r_hash,
+            now,
+        )
+        rows_to_insert.append(val_tuple)
+
+        prov_tuple = (
+            "insider_transaction",
+            r_hash,
+            r.source,
+            r.source_url,
+            now,
+            r_hash,
+            "validated",
+        )
+        provenance_rows.append(prov_tuple)
+
+    placeholder_str = ", ".join(_placeholder(database_url) for _ in rows_to_insert[0])
+    prov_placeholder_str = ", ".join(_placeholder(database_url) for _ in provenance_rows[0])
+
+    initial_count = count_records(database_url, "insider_transactions")
+
+    with connect(database_url) as connection:
+        if is_postgresql_url(database_url):
+            insert_sql = f"""
+                INSERT INTO insider_transactions ({columns})
+                VALUES ({placeholder_str})
+                ON CONFLICT (source, accession_number, record_hash) DO NOTHING
+            """
+            prov_sql = f"""
+                INSERT INTO provenance (
+                    record_type, record_id, source, source_reference,
+                    retrieved_at, checksum, validation_status
+                )
+                VALUES ({prov_placeholder_str})
+                ON CONFLICT (record_type, record_id, source) DO NOTHING
+            """
+        else:
+            insert_sql = f"""
+                INSERT OR IGNORE INTO insider_transactions ({columns})
+                VALUES ({placeholder_str})
+            """
+            prov_sql = f"""
+                INSERT OR IGNORE INTO provenance (
+                    record_type, record_id, source, source_reference,
+                    retrieved_at, checksum, validation_status
+                )
+                VALUES ({prov_placeholder_str})
+            """
+
+        connection.executemany(insert_sql, rows_to_insert)
+        connection.executemany(prov_sql, provenance_rows)
+        connection.commit()
+
+    final_count = count_records(database_url, "insider_transactions")
+    inserted_count = final_count - initial_count
+    duplicates_count = len(records) - inserted_count
+
+    return inserted_count, max(0, duplicates_count)
 
 
 def store_market_price(
