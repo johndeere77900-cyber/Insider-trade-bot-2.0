@@ -69,3 +69,10 @@ class TradeCommand(ApplicationCommand):
     name: str = "trade"
     parameters: Mapping[str, Any] = field(default_factory=dict)
     execution_mode: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class HistoricalAcquisitionCommand(ApplicationCommand):
+    """Request for historical SEC dataset acquisition."""
+
+    name: str = "historical acquisition"
