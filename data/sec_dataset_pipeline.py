@@ -12,11 +12,12 @@ https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/{ye
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import urllib.request
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Generator, List, Mapping, Optional, Tuple
 
@@ -61,6 +62,8 @@ class NormalizedBulkTransaction:
     date_of_orig_submission: Optional[str]
     raw_payload: Dict[str, Any]
     source: str = "SEC"
+    record_hash: Optional[str] = None
+    form_type: Optional[str] = "4"
 
 
 @dataclass
@@ -96,7 +99,6 @@ def parse_sec_date(date_str: Optional[str]) -> Optional[str]:
         except ValueError:
             continue
 
-    # Return raw cleaned string if no pattern matches, avoiding data loss
     return cleaned
 
 
@@ -168,6 +170,42 @@ def read_tsv_from_zip(
             }
 
 
+def compute_transaction_identity(
+    accession_number: str,
+    reporting_owner_cik: str,
+    reporting_owner_name: str,
+    transaction_type: str,
+    transaction_sk: str,
+    security_title: str,
+    transaction_date: str,
+    transaction_code: str,
+    shares: Any,
+    price_per_share: Any,
+    acquired_disposed: str,
+    is_amendment: bool,
+) -> str:
+    """
+    Create a deterministic, highly collision-resistant transaction identity hash.
+    Distinguishes separate owners, transaction rows, derivative vs non-derivative,
+    securities, dates, codes, quantities, prices, and amendments.
+    """
+    raw_key = (
+        f"{accession_number}|"
+        f"{reporting_owner_cik}|"
+        f"{reporting_owner_name}|"
+        f"{transaction_type}|"
+        f"{transaction_sk}|"
+        f"{security_title}|"
+        f"{transaction_date}|"
+        f"{transaction_code}|"
+        f"{shares}|"
+        f"{price_per_share}|"
+        f"{acquired_disposed}|"
+        f"{'1' if is_amendment else '0'}"
+    )
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
 def parse_dataset_zip(
     zip_bytes: bytes,
     source_url: str = "",
@@ -176,37 +214,85 @@ def parse_dataset_zip(
     Parse a SEC Form 3/4/5 bulk dataset zip archive and yield raw merged record dicts.
 
     Combines:
-    - SUBMISSION.tsv (submission metadata, issuer info, filing date)
-    - REPORTINGOWNER.tsv (insider / reporting owner CIK and name)
-    - NONDERIV_TRANS.tsv (non-derivative transactions)
-    - DERIV_TRANS.tsv (derivative transactions)
+    - SUBMISSION.tsv
+    - REPORTINGOWNER.tsv (supports multiple owners per accession)
+    - NONDERIV_TRANS.tsv
+    - DERIV_TRANS.tsv
+    - NONDERIV_HOLDING.tsv / DERIV_HOLDING.tsv
+    - FOOTNOTES.tsv
+    - OWNER_SIGNATURE.tsv
     """
     try:
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     except Exception as exc:
         raise SECDatasetError(f"Invalid zip file: {exc}") from exc
 
-    # 1. Parse SUBMISSION.tsv
+    # 1. SUBMISSION.tsv
     submissions: Dict[str, Dict[str, str]] = {}
     for row in read_tsv_from_zip(zf, "SUBMISSION.tsv"):
         acc = row.get("ACCESSION_NUMBER", "")
         if acc:
             submissions[acc] = row
 
-    # 2. Parse REPORTINGOWNER.tsv
-    reporting_owners: Dict[str, Dict[str, str]] = {}
+    # 2. REPORTINGOWNER.tsv (multimap: accession -> list of owner dicts)
+    reporting_owners: Dict[str, List[Dict[str, str]]] = {}
     for row in read_tsv_from_zip(zf, "REPORTINGOWNER.tsv"):
         acc = row.get("ACCESSION_NUMBER", "")
-        if acc and acc not in reporting_owners:
-            reporting_owners[acc] = row
+        if acc:
+            if acc not in reporting_owners:
+                reporting_owners[acc] = []
+            reporting_owners[acc].append(row)
 
-    def build_record(
+    # 3. FOOTNOTES.tsv (accession -> list of footnote dicts)
+    footnotes: Dict[str, List[Dict[str, str]]] = {}
+    for row in read_tsv_from_zip(zf, "FOOTNOTES.tsv"):
+        acc = row.get("ACCESSION_NUMBER", "")
+        if acc:
+            if acc not in footnotes:
+                footnotes[acc] = []
+            footnotes[acc].append(row)
+
+    # 4. OWNER_SIGNATURE.tsv (accession -> list of signature dicts)
+    signatures: Dict[str, List[Dict[str, str]]] = {}
+    for row in read_tsv_from_zip(zf, "OWNER_SIGNATURE.tsv"):
+        acc = row.get("ACCESSION_NUMBER", "")
+        if acc:
+            if acc not in signatures:
+                signatures[acc] = []
+            signatures[acc].append(row)
+
+    # 5. NONDERIV_HOLDING.tsv (accession -> list of holding dicts)
+    nonderiv_holdings: Dict[str, List[Dict[str, str]]] = {}
+    for row in read_tsv_from_zip(zf, "NONDERIV_HOLDING.tsv"):
+        acc = row.get("ACCESSION_NUMBER", "")
+        if acc:
+            if acc not in nonderiv_holdings:
+                nonderiv_holdings[acc] = []
+            nonderiv_holdings[acc].append(row)
+
+    # 6. DERIV_HOLDING.tsv (accession -> list of holding dicts)
+    deriv_holdings: Dict[str, List[Dict[str, str]]] = {}
+    for row in read_tsv_from_zip(zf, "DERIV_HOLDING.tsv"):
+        acc = row.get("ACCESSION_NUMBER", "")
+        if acc:
+            if acc not in deriv_holdings:
+                deriv_holdings[acc] = []
+            deriv_holdings[acc].append(row)
+
+    def build_records_for_transaction(
         acc: str,
         trans_row: Dict[str, str],
         transaction_type: str,  # 'non_derivative' or 'derivative'
-    ) -> Dict[str, Any]:
+    ) -> List[Dict[str, Any]]:
         sub_info = submissions.get(acc, {})
-        owner_info = reporting_owners.get(acc, {})
+        owners_list = reporting_owners.get(acc, [{}])
+        fn_list = footnotes.get(acc, [])
+        sig_list = signatures.get(acc, [])
+        hld_list = (
+            nonderiv_holdings.get(acc, [])
+            if transaction_type == "non_derivative"
+            else deriv_holdings.get(acc, [])
+        )
 
         filing_date_raw = sub_info.get("FILING_DATE", "")
         trans_date_raw = trans_row.get("TRANS_DATE", "")
@@ -216,57 +302,99 @@ def parse_dataset_zip(
 
         issuer_cik = sub_info.get("ISSUERCIK", "")
         if issuer_cik and issuer_cik.isdigit():
+            clean_issuer_cik_dir = str(int(issuer_cik))
             issuer_cik = issuer_cik.zfill(10)
-
-        owner_cik = owner_info.get("RPTOWNERCIK", "")
-        if owner_cik and owner_cik.isdigit():
-            owner_cik = owner_cik.zfill(10)
+        else:
+            clean_issuer_cik_dir = issuer_cik or "0"
 
         date_orig_sub = sub_info.get("DATE_OF_ORIG_SUB", "")
         doc_type = sub_info.get("DOCUMENT_TYPE", "")
         is_amendment = bool(date_orig_sub) or doc_type.endswith("/A")
 
-        record = {
-            "accession_number": acc,
-            "source": "SEC",
-            "source_url": source_url or f"https://www.sec.gov/Archives/edgar/data/{issuer_cik}/{acc.replace('-', '')}/{acc}.txt",
-            "form_type": trans_row.get("TRANS_FORM_TYPE") or doc_type or "4",
-            "filing_date": filing_date,
-            "transaction_date": trans_date,
-            "issuer_cik": issuer_cik,
-            "issuer_name": sub_info.get("ISSUERNAME", ""),
-            "ticker": sub_info.get("ISSUERTRADINGSYMBOL", ""),
-            "reporting_owner_cik": owner_cik,
-            "reporting_owner_name": owner_info.get("RPTOWNERNAME", ""),
-            "reporting_owner_title": owner_info.get("RPTOWNER_TITLE", ""),
-            "reporting_owner_relationship": owner_info.get("RPTOWNER_RELATIONSHIP", ""),
-            "security_title": trans_row.get("SECURITY_TITLE", ""),
-            "transaction_code": trans_row.get("TRANS_CODE", ""),
-            "shares": trans_row.get("TRANS_SHARES", ""),
-            "price_per_share": trans_row.get("TRANS_PRICEPERSHARE", ""),
-            "acquired_disposed": trans_row.get("TRANS_ACQUIRED_DISP_CD", ""),
-            "direct_indirect": trans_row.get("DIRECT_INDIRECT_OWNERSHIP", ""),
-            "ownership_nature": trans_row.get("NATURE_OF_OWNERSHIP", ""),
-            "transaction_type": transaction_type,
-            "is_amendment": is_amendment,
-            "date_of_orig_submission": parse_sec_date(date_orig_sub) if date_orig_sub else None,
-            "raw": {
-                "submission": sub_info,
-                "owner": owner_info,
-                "transaction": trans_row,
-            },
-        }
-        return record
+        records = []
+        trans_sk = (
+            trans_row.get("NONDERIV_TRANS_SK")
+            if transaction_type == "non_derivative"
+            else trans_row.get("DERIV_TRANS_SK")
+        ) or ""
 
+        for owner_info in owners_list:
+            owner_cik = owner_info.get("RPTOWNERCIK", "")
+            if owner_cik and owner_cik.isdigit():
+                owner_cik = owner_cik.zfill(10)
+
+            owner_name = owner_info.get("RPTOWNERNAME", "")
+
+            # Deterministic transaction identity
+            rec_hash = compute_transaction_identity(
+                accession_number=acc,
+                reporting_owner_cik=owner_cik,
+                reporting_owner_name=owner_name,
+                transaction_type=transaction_type,
+                transaction_sk=str(trans_sk),
+                security_title=trans_row.get("SECURITY_TITLE", ""),
+                transaction_date=trans_date or "",
+                transaction_code=trans_row.get("TRANS_CODE", ""),
+                shares=trans_row.get("TRANS_SHARES", ""),
+                price_per_share=trans_row.get("TRANS_PRICEPERSHARE", ""),
+                acquired_disposed=trans_row.get("TRANS_ACQUIRED_DISP_CD", ""),
+                is_amendment=is_amendment,
+            )
+
+            rec_source_url = source_url or f"https://www.sec.gov/Archives/edgar/data/{clean_issuer_cik_dir}/{acc.replace('-', '')}/{acc}.txt"
+
+            record = {
+                "accession_number": acc,
+                "source": "SEC",
+                "source_url": rec_source_url,
+                "form_type": trans_row.get("TRANS_FORM_TYPE") or doc_type or "4",
+                "filing_date": filing_date,
+                "transaction_date": trans_date,
+                "issuer_cik": issuer_cik,
+                "issuer_name": sub_info.get("ISSUERNAME", ""),
+                "ticker": sub_info.get("ISSUERTRADINGSYMBOL", ""),
+                "reporting_owner_cik": owner_cik,
+                "reporting_owner_name": owner_name,
+                "reporting_owner_title": owner_info.get("RPTOWNER_TITLE", ""),
+                "reporting_owner_relationship": owner_info.get("RPTOWNER_RELATIONSHIP", ""),
+                "security_title": trans_row.get("SECURITY_TITLE", ""),
+                "transaction_code": trans_row.get("TRANS_CODE", ""),
+                "shares": trans_row.get("TRANS_SHARES", ""),
+                "price_per_share": trans_row.get("TRANS_PRICEPERSHARE", ""),
+                "acquired_disposed": trans_row.get("TRANS_ACQUIRED_DISP_CD", ""),
+                "direct_indirect": trans_row.get("DIRECT_INDIRECT_OWNERSHIP", ""),
+                "ownership_nature": trans_row.get("NATURE_OF_OWNERSHIP", ""),
+                "transaction_type": transaction_type,
+                "is_amendment": is_amendment,
+                "date_of_orig_submission": parse_sec_date(date_orig_sub) if date_orig_sub else None,
+                "record_hash": rec_hash,
+                "raw": {
+                    "submission": sub_info,
+                    "owner": owner_info,
+                    "all_owners": owners_list,
+                    "transaction": trans_row,
+                    "footnotes": fn_list,
+                    "signatures": sig_list,
+                    "holdings": hld_list,
+                },
+            }
+            records.append(record)
+
+        return records
+
+    # Parse non-derivative transactions
     for row in read_tsv_from_zip(zf, "NONDERIV_TRANS.tsv"):
         acc = row.get("ACCESSION_NUMBER", "")
         if acc:
-            yield build_record(acc, row, "non_derivative")
+            for rec in build_records_for_transaction(acc, row, "non_derivative"):
+                yield rec
 
+    # Parse derivative transactions
     for row in read_tsv_from_zip(zf, "DERIV_TRANS.tsv"):
         acc = row.get("ACCESSION_NUMBER", "")
         if acc:
-            yield build_record(acc, row, "derivative")
+            for rec in build_records_for_transaction(acc, row, "derivative"):
+                yield rec
 
 
 def normalize_bulk_record(raw_record: Dict[str, Any]) -> NormalizedBulkTransaction:
@@ -310,25 +438,34 @@ def normalize_bulk_record(raw_record: Dict[str, Any]) -> NormalizedBulkTransacti
         date_of_orig_submission=_str(raw_record.get("date_of_orig_submission")),
         raw_payload=raw_record.get("raw") or {},
         source="SEC",
+        record_hash=_str(raw_record.get("record_hash")),
+        form_type=_str(raw_record.get("form_type")) or "4",
     )
 
 
 def validate_bulk_record(record: NormalizedBulkTransaction) -> BulkValidationResult:
     """
-    Validate normalized transaction according to Section 9 rules.
+    Validate normalized transaction according to Section 5/9 rules.
     Does not silently discard invalid records; reports specific validation errors.
     """
     errors: List[str] = []
 
+    # Filing identity
     if not record.accession_number:
         errors.append("Missing filing identity (accession_number)")
 
+    if not record.form_type:
+        errors.append("Missing form type")
+
+    # Issuer identity
     if not record.issuer_cik:
         errors.append("Missing issuer identity (issuer_cik)")
 
+    # Reporting owner identity
     if not record.reporting_owner_cik and not record.reporting_owner_name:
         errors.append("Missing reporting owner identity (reporting_owner_cik and reporting_owner_name both empty)")
 
+    # Dates and temporal consistency
     if record.transaction_date:
         try:
             datetime.strptime(record.transaction_date, "%Y-%m-%d")
@@ -340,6 +477,49 @@ def validate_bulk_record(record: NormalizedBulkTransaction) -> BulkValidationRes
             datetime.strptime(record.filing_date, "%Y-%m-%d")
         except ValueError:
             errors.append(f"Invalid filing_date format: {record.filing_date}")
+
+    if record.date_of_orig_submission:
+        try:
+            datetime.strptime(record.date_of_orig_submission, "%Y-%m-%d")
+        except ValueError:
+            errors.append(f"Invalid date_of_orig_submission format: {record.date_of_orig_submission}")
+
+    if record.transaction_date and record.filing_date:
+        # A transaction date far in the future compared to filing date is suspicious
+        try:
+            t_dt = datetime.strptime(record.transaction_date, "%Y-%m-%d")
+            f_dt = datetime.strptime(record.filing_date, "%Y-%m-%d")
+            if t_dt > f_dt and (t_dt - f_dt).days > 365:
+                errors.append(f"Transaction date ({record.transaction_date}) is >1 year ahead of filing date ({record.filing_date})")
+        except ValueError:
+            pass
+
+    # Transaction codes and indicators
+    valid_codes = {
+        "P", "S", "A", "D", "F", "I", "M", "C", "E", "H", "O", "X", "G", "L", "W", "Z", "J", "K", "U"
+    }
+    if record.transaction_code and record.transaction_code.upper() not in valid_codes:
+        errors.append(f"Invalid transaction code: {record.transaction_code}")
+
+    if record.acquired_disposed and record.acquired_disposed.upper() not in {"A", "D"}:
+        errors.append(f"Invalid acquired_disposed indicator: {record.acquired_disposed}")
+
+    if record.ownership_type and record.ownership_type.upper() not in {"D", "I"}:
+        errors.append(f"Invalid ownership_type indicator: {record.ownership_type}")
+
+    # Numeric checks
+    if record.shares is not None and record.shares < 0:
+        errors.append(f"Negative shares value: {record.shares}")
+
+    if record.price_per_share is not None and record.price_per_share < 0:
+        errors.append(f"Negative price_per_share value: {record.price_per_share}")
+
+    # Source and raw payload
+    if not record.source_url:
+        errors.append("Missing source URL/reference")
+
+    if not record.raw_payload:
+        errors.append("Missing raw source payload")
 
     return BulkValidationResult(
         is_valid=len(errors) == 0,

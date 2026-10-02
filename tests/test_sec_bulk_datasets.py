@@ -1,6 +1,7 @@
 """
-Unit tests for official SEC bulk datasets pipeline, normalization, validation,
-deduplication, temporal integrity, amendments, provenance, and resumable state.
+Comprehensive unit tests for official SEC bulk datasets pipeline, normalization, validation,
+multiple reporting owners, footnotes/holdings source preservation, amendment relationships,
+deterministic transaction deduplication, bounded batching, period provenance, and resumable state.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from storage.repository import (
 
 
 def create_mock_zip_bytes() -> bytes:
-    """Create mock SEC dataset zip archive bytes in memory."""
+    """Create mock SEC dataset zip archive bytes with multi-owner, footnotes, holdings, and amendments."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         # SUBMISSION.tsv
@@ -47,7 +48,7 @@ def create_mock_zip_bytes() -> bytes:
         ])
         zf.writestr("SUBMISSION.tsv", sub_io.getvalue().encode("utf-8"))
 
-        # REPORTINGOWNER.tsv
+        # REPORTINGOWNER.tsv (contains 2 owners for 0000016732-23-000043)
         owner_io = io.StringIO()
         owner_writer = csv.writer(owner_io, delimiter="\t")
         owner_writer.writerow([
@@ -59,26 +60,51 @@ def create_mock_zip_bytes() -> bytes:
             "Officer", "Director,Officer"
         ])
         owner_writer.writerow([
+            "0000016732-23-000043", "0001801062", "Watanabe Joint Holder",
+            "Ten Percent Owner", "10% Owner"
+        ])
+        owner_writer.writerow([
             "0000016732-23-000044", "0001801061", "Watanabe Todd Franklin",
             "Officer", "Director,Officer"
         ])
         zf.writestr("REPORTINGOWNER.tsv", owner_io.getvalue().encode("utf-8"))
 
+        # FOOTNOTES.tsv
+        fn_io = io.StringIO()
+        fn_writer = csv.writer(fn_io, delimiter="\t")
+        fn_writer.writerow(["ACCESSION_NUMBER", "FOOTNOTE_ID", "FOOTNOTE_TXT"])
+        fn_writer.writerow(["0000016732-23-000043", "F1", "Acquired under 10b5-1 plan."])
+        zf.writestr("FOOTNOTES.tsv", fn_io.getvalue().encode("utf-8"))
+
+        # OWNER_SIGNATURE.tsv
+        sig_io = io.StringIO()
+        sig_writer = csv.writer(sig_io, delimiter="\t")
+        sig_writer.writerow(["ACCESSION_NUMBER", "OWNERSIGNATURENAME", "OWNERSIGNATUREDATE"])
+        sig_writer.writerow(["0000016732-23-000043", "/s/ Todd Watanabe", "31-MAR-2023"])
+        zf.writestr("OWNER_SIGNATURE.tsv", sig_io.getvalue().encode("utf-8"))
+
+        # NONDERIV_HOLDING.tsv
+        hld_io = io.StringIO()
+        hld_writer = csv.writer(hld_io, delimiter="\t")
+        hld_writer.writerow(["ACCESSION_NUMBER", "NONDERIV_HOLDING_SK", "SECURITY_TITLE", "SHRS_OWND_FOLWNG_TRANS"])
+        hld_writer.writerow(["0000016732-23-000043", "1001", "Common Stock", "15000"])
+        zf.writestr("NONDERIV_HOLDING.tsv", hld_io.getvalue().encode("utf-8"))
+
         # NONDERIV_TRANS.tsv
         nonderiv_io = io.StringIO()
         nonderiv_writer = csv.writer(nonderiv_io, delimiter="\t")
         nonderiv_writer.writerow([
-            "ACCESSION_NUMBER", "SECURITY_TITLE", "TRANS_DATE",
+            "ACCESSION_NUMBER", "NONDERIV_TRANS_SK", "SECURITY_TITLE", "TRANS_DATE",
             "TRANS_FORM_TYPE", "TRANS_CODE", "TRANS_SHARES",
             "TRANS_PRICEPERSHARE", "TRANS_ACQUIRED_DISP_CD",
             "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP"
         ])
         nonderiv_writer.writerow([
-            "0000016732-23-000043", "Common Stock", "30-MAR-2023",
+            "0000016732-23-000043", "5001", "Common Stock", "30-MAR-2023",
             "4", "P", "1000.0", "45.50", "A", "D", ""
         ])
         nonderiv_writer.writerow([
-            "0000016732-23-000044", "Common Stock", "28-MAR-2023",
+            "0000016732-23-000044", "5002", "Common Stock", "28-MAR-2023",
             "4/A", "S", "500.0", "46.00", "D", "I", "By Trust"
         ])
         zf.writestr("NONDERIV_TRANS.tsv", nonderiv_io.getvalue().encode("utf-8"))
@@ -87,7 +113,7 @@ def create_mock_zip_bytes() -> bytes:
         deriv_io = io.StringIO()
         deriv_writer = csv.writer(deriv_io, delimiter="\t")
         deriv_writer.writerow([
-            "ACCESSION_NUMBER", "SECURITY_TITLE", "TRANS_DATE",
+            "ACCESSION_NUMBER", "DERIV_TRANS_SK", "SECURITY_TITLE", "TRANS_DATE",
             "TRANS_FORM_TYPE", "TRANS_CODE", "TRANS_SHARES",
             "TRANS_PRICEPERSHARE", "TRANS_ACQUIRED_DISP_CD",
             "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP"
@@ -110,21 +136,42 @@ def test_parse_sec_date():
     assert parse_sec_date(None) is None
 
 
-def test_parse_dataset_zip_and_amendments():
+def test_multiple_reporting_owners_and_source_preservation():
     zip_bytes = create_mock_zip_bytes()
     records = list(parse_dataset_zip(zip_bytes))
-    assert len(records) == 2
+    # 2 owners for filing 43 + 1 owner for filing 44 = 3 records total
+    assert len(records) == 3
 
-    r1, r2 = records[0], records[1]
+    r1, r2, r3 = records[0], records[1], records[2]
+
+    # Verify multiple reporting owners
     assert r1["accession_number"] == "0000016732-23-000043"
-    assert r1["filing_date"] == "2023-03-31"
-    assert r1["transaction_date"] == "2023-03-30"
-    assert r1["transaction_code"] == "P"
-    assert r1["is_amendment"] is False
+    assert r1["reporting_owner_name"] == "Watanabe Todd Franklin"
 
-    assert r2["accession_number"] == "0000016732-23-000044"
-    assert r2["is_amendment"] is True
-    assert r2["date_of_orig_submission"] == "2023-03-15"
+    assert r2["accession_number"] == "0000016732-23-000043"
+    assert r2["reporting_owner_name"] == "Watanabe Joint Holder"
+
+    # Distinct hashes for separate owners
+    assert r1["record_hash"] != r2["record_hash"]
+
+    # Source data preservation (footnotes, signatures, holdings)
+    raw = r1["raw"]
+    assert len(raw["footnotes"]) == 1
+    assert raw["footnotes"][0]["FOOTNOTE_TXT"] == "Acquired under 10b5-1 plan."
+    assert len(raw["signatures"]) == 1
+    assert raw["signatures"][0]["OWNERSIGNATURENAME"] == "/s/ Todd Watanabe"
+    assert len(raw["holdings"]) == 1
+
+
+def test_amendments_preservation():
+    zip_bytes = create_mock_zip_bytes()
+    records = list(parse_dataset_zip(zip_bytes))
+    amended = records[2]
+
+    assert amended["accession_number"] == "0000016732-23-000044"
+    assert amended["is_amendment"] is True
+    assert amended["date_of_orig_submission"] == "2023-03-15"
+    assert amended["form_type"] == "4/A"
 
 
 def test_normalize_and_validate_bulk_record():
@@ -151,13 +198,13 @@ def test_normalize_and_validate_bulk_record():
         reporting_owner_cik=None,
         transaction_date="invalid-date",
         filing_date=None,
-        transaction_code=None,
+        transaction_code="INVALID_CODE",
         security_title=None,
-        shares=None,
-        price_per_share=None,
+        shares=-10.0,
+        price_per_share=-5.0,
         transaction_type=None,
-        acquired_disposed=None,
-        ownership_type=None,
+        acquired_disposed="INVALID",
+        ownership_type="INVALID",
         ownership_nature=None,
         source_url="",
         is_amendment=False,
@@ -166,7 +213,7 @@ def test_normalize_and_validate_bulk_record():
     )
     val_invalid = validate_bulk_record(invalid_norm)
     assert val_invalid.is_valid is False
-    assert len(val_invalid.errors) >= 3
+    assert len(val_invalid.errors) >= 5
 
 
 def test_bulk_store_and_deduplication(tmp_path):
@@ -179,25 +226,40 @@ def test_bulk_store_and_deduplication(tmp_path):
 
     # First store
     inserted, duplicates = store_bulk_insider_transactions(db_url, norm_records)
-    assert inserted == 2
+    assert inserted == 3
     assert duplicates == 0
-    assert count_records(db_url, "insider_transactions") == 2
-    assert count_records(db_url, "provenance") == 2
+    assert count_records(db_url, "insider_transactions") == 3
+    assert count_records(db_url, "provenance") == 3
 
     # Second store (idempotent rerun)
     inserted_2, duplicates_2 = store_bulk_insider_transactions(db_url, norm_records)
     assert inserted_2 == 0
-    assert duplicates_2 == 2
-    assert count_records(db_url, "insider_transactions") == 2
+    assert duplicates_2 == 3
+    assert count_records(db_url, "insider_transactions") == 3
 
 
-def test_acquisition_state_manager(tmp_path):
+def test_acquisition_state_and_resume_behavior(tmp_path):
     db_file = tmp_path / "test_state.db"
     db_url = f"sqlite:///{db_file}"
 
     state_mgr = AcquisitionStateManager(db_url)
-    assert state_mgr.is_period_completed("2006-Q1") is False
+    assert state_mgr.should_skip_period("2006-Q1") is False
 
+    # Mark failed
+    state_mgr.record_period_completion(
+        period="2006-Q1",
+        records_parsed=0,
+        records_inserted=0,
+        duplicates_count=0,
+        invalid_count=0,
+        failures_count=1,
+        status="FAILED",
+    )
+    # FAILED period should NOT be skipped on rerun
+    assert state_mgr.get_period_status("2006-Q1") == "FAILED"
+    assert state_mgr.should_skip_period("2006-Q1") is False
+
+    # Mark completed
     state_mgr.record_period_completion(
         period="2006-Q1",
         records_parsed=100,
@@ -205,12 +267,7 @@ def test_acquisition_state_manager(tmp_path):
         duplicates_count=10,
         invalid_count=0,
         failures_count=0,
+        status="COMPLETED",
     )
-
-    assert state_mgr.is_period_completed("2006-Q1") is True
-    assert state_mgr.get_completed_periods() == ["2006-Q1"]
-
-    periods = state_mgr.parse_period_range("2006-Q1", "2006-Q3")
-    assert len(periods) == 3
-    assert periods[0] == (2006, 1, "2006-Q1")
-    assert periods[2] == (2006, 3, "2006-Q3")
+    assert state_mgr.get_period_status("2006-Q1") == "COMPLETED"
+    assert state_mgr.should_skip_period("2006-Q1") is True

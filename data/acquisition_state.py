@@ -33,8 +33,8 @@ class AcquisitionStateManager:
         self.database_url = database_url
         initialize_database(self.database_url)
 
-    def is_period_completed(self, period: str) -> bool:
-        """Check if a quarter (e.g., '2023-Q1' or '2023Q1') is marked as completed."""
+    def get_period_status(self, period: str) -> Optional[str]:
+        """Return the status of a given period (e.g. COMPLETED, FAILED, PARTIAL, None)."""
         norm_period = self.normalize_period(period)
         placeholder = _placeholder(self.database_url)
 
@@ -48,9 +48,21 @@ class AcquisitionStateManager:
             row = cursor.fetchone()
 
         if row is None:
-            return False
+            return None
 
         status = _row_value(row, "status")
+        return str(status) if status else None
+
+    def is_period_completed(self, period: str) -> bool:
+        """Check if a quarter is marked as COMPLETED."""
+        return self.get_period_status(period) == "COMPLETED"
+
+    def should_skip_period(self, period: str) -> bool:
+        """
+        Skip if COMPLETED.
+        Retry if FAILED, PARTIAL, or UNKNOWN (None).
+        """
+        status = self.get_period_status(period)
         return status == "COMPLETED"
 
     def record_period_completion(

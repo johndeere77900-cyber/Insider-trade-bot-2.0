@@ -15,14 +15,21 @@ from config.environment_validator import (
 from core.logging_config import configure_logging
 
 
-def run_historical_acquisition(start_period: str, end_period: str) -> int:
+def run_historical_acquisition(
+    start_period: str,
+    end_period: str,
+    batch_size: int = 5000,
+) -> int:
     """
-    Execute historical SEC dataset acquisition from start_period to end_period.
+    Execute historical SEC dataset acquisition from start_period to end_period
+    using bounded streaming batches to prevent high memory usage.
     """
+    import hashlib
     import os
     from config.environment import load_environment
     from data.acquisition_state import AcquisitionStateManager
     from data.sec_dataset_pipeline import (
+        build_dataset_url,
         download_dataset_zip,
         normalize_bulk_record,
         parse_dataset_zip,
@@ -34,6 +41,7 @@ def run_historical_acquisition(start_period: str, end_period: str) -> int:
         count_records,
         is_postgresql_url,
         store_bulk_insider_transactions,
+        store_provenance,
     )
 
     settings = load_environment()
@@ -51,11 +59,13 @@ def run_historical_acquisition(start_period: str, end_period: str) -> int:
     total_invalid = 0
     total_failures = 0
 
-    print(f"Starting historical acquisition from {start_period} to {end_period}...")
+    print(f"Starting historical acquisition from {start_period} to {end_period} (batch_size={batch_size})...")
 
     for year, qtr, period_str in period_range:
         periods_processed += 1
-        if state_mgr.is_period_completed(period_str):
+
+        # Check resume state: skip completed periods; retry failed/partial/unknown
+        if state_mgr.should_skip_period(period_str):
             print(f"Period {period_str}: Already completed. Skipping.")
             continue
 
@@ -79,33 +89,72 @@ def run_historical_acquisition(start_period: str, end_period: str) -> int:
             )
             continue
 
-        valid_records = []
+        # Period-level provenance tracking with ZIP checksum
+        zip_checksum = hashlib.sha256(zip_bytes).hexdigest()
+        dataset_url = build_dataset_url(year, qtr)
+        store_provenance(
+            db_url,
+            record_type="dataset_period",
+            record_id=period_str,
+            source="SEC",
+            source_reference=dataset_url,
+            checksum=zip_checksum,
+            validation_status="validated",
+        )
+
         p_parsed = 0
         p_invalid = 0
+        p_inserted = 0
+        p_duplicates = 0
+        batch = []
 
-        for raw_record in parse_dataset_zip(zip_bytes):
-            p_parsed += 1
-            norm_rec = normalize_bulk_record(raw_record)
-            val_res = validate_bulk_record(norm_rec)
+        try:
+            for raw_record in parse_dataset_zip(zip_bytes, source_url=dataset_url):
+                p_parsed += 1
+                norm_rec = normalize_bulk_record(raw_record)
+                val_res = validate_bulk_record(norm_rec)
 
-            if val_res.is_valid:
-                valid_records.append(norm_rec)
-            else:
-                p_invalid += 1
+                if val_res.is_valid:
+                    batch.append(norm_rec)
+                else:
+                    p_invalid += 1
 
-        p_inserted, p_duplicates = store_bulk_insider_transactions(
-            db_url, valid_records
-        )
+                if len(batch) >= batch_size:
+                    b_ins, b_dup = store_bulk_insider_transactions(db_url, batch)
+                    p_inserted += b_ins
+                    p_duplicates += b_dup
+                    batch.clear()
 
-        state_mgr.record_period_completion(
-            period=period_str,
-            records_parsed=p_parsed,
-            records_inserted=p_inserted,
-            duplicates_count=p_duplicates,
-            invalid_count=p_invalid,
-            failures_count=0,
-            status="COMPLETED",
-        )
+            # Process final remaining batch for period
+            if batch:
+                b_ins, b_dup = store_bulk_insider_transactions(db_url, batch)
+                p_inserted += b_ins
+                p_duplicates += b_dup
+                batch.clear()
+
+            state_mgr.record_period_completion(
+                period=period_str,
+                records_parsed=p_parsed,
+                records_inserted=p_inserted,
+                duplicates_count=p_duplicates,
+                invalid_count=p_invalid,
+                failures_count=0,
+                status="COMPLETED",
+            )
+
+        except Exception as exc:
+            print(f"Period {period_str}: Error during ingestion processing ({exc}). Marking FAILED.")
+            total_failures += 1
+            state_mgr.record_period_completion(
+                period=period_str,
+                records_parsed=p_parsed,
+                records_inserted=p_inserted,
+                duplicates_count=p_duplicates,
+                invalid_count=p_invalid,
+                failures_count=1,
+                status="FAILED",
+            )
+            continue
 
         total_parsed += p_parsed
         total_inserted += p_inserted
