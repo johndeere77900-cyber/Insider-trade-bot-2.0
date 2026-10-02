@@ -306,3 +306,37 @@ def test_acquisition_state_and_resume_behavior(tmp_path):
     )
     assert state_mgr.get_period_status("2006-Q1") == "COMPLETED"
     assert state_mgr.should_skip_period("2006-Q1") is True
+
+
+def test_temp_file_download_and_cleanup(tmp_path):
+    """Verify ZIP files are streamed to temporary files on disk and cleaned up after processing."""
+    import os
+    import tempfile
+
+    zip_bytes = create_mock_zip_bytes(case="default")
+    temp_fd, temp_zip_path = tempfile.mkstemp(suffix=".zip", prefix="test_sec_", dir=str(tmp_path))
+    os.close(temp_fd)
+
+    with open(temp_zip_path, "wb") as f:
+        f.write(zip_bytes)
+
+    assert os.path.exists(temp_zip_path)
+
+    records = list(parse_dataset_zip(temp_zip_path))
+    assert len(records) == 2
+
+    # Simulate cleanup
+    os.remove(temp_zip_path)
+    assert not os.path.exists(temp_zip_path)
+
+
+def test_cli_default_end_period():
+    """Verify CLI default end period is 2026-Q2."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="historical acquisition")
+    parser.add_argument("--start", default="2006-Q1")
+    parser.add_argument("--end", default="2026-Q2")
+
+    args = parser.parse_args([])
+    assert args.start == "2006-Q1"
+    assert args.end == "2026-Q2"

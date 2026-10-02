@@ -107,6 +107,55 @@ def build_dataset_url(year: int, quarter: int) -> str:
     return f"{SEC_DATASET_BASE_URL}/{year}q{quarter}_form345.zip"
 
 
+def download_dataset_zip_to_file(
+    year: int,
+    quarter: int,
+    user_agent: str,
+    target_path: str,
+    timeout: int = 60,
+) -> str:
+    """
+    Download the zip archive for a given year and quarter directly to disk at target_path.
+    Avoids holding large ZIP files in memory.
+    """
+    url = build_dataset_url(year, quarter)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": user_agent,
+            "Accept": "application/zip, application/octet-stream, */*",
+            "Accept-Encoding": "gzip, deflate",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            status = getattr(response, "status", 200)
+            if status != 200:
+                raise SECDatasetDownloadError(
+                    f"HTTP status {status} downloading dataset {year}q{quarter} from {url}"
+                )
+            with open(target_path, "wb") as out_file:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+        return target_path
+    except urllib.error.HTTPError as exc:
+        raise SECDatasetDownloadError(
+            f"HTTP {exc.code} downloading dataset {year}q{quarter}: {exc.reason}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SECDatasetDownloadError(
+            f"URL error downloading dataset {year}q{quarter}: {exc.reason}"
+        ) from exc
+    except Exception as exc:
+        raise SECDatasetDownloadError(
+            f"Failed to download dataset {year}q{quarter}: {exc}"
+        ) from exc
+
+
 def download_dataset_zip(
     year: int,
     quarter: int,
@@ -114,7 +163,7 @@ def download_dataset_zip(
     timeout: int = 60,
 ) -> bytes:
     """
-    Download the zip archive for a given year and quarter from SEC.
+    Legacy helper: download zip archive into memory bytes.
     """
     url = build_dataset_url(year, quarter)
     req = urllib.request.Request(
@@ -205,23 +254,26 @@ def compute_transaction_identity(
 
 
 def parse_dataset_zip(
-    zip_bytes: bytes,
+    zip_bytes_or_path: Any,
     source_url: str = "",
 ) -> Generator[Dict[str, Any], None, None]:
     """
-    Parse a SEC Form 3/4/5 bulk dataset zip archive and yield raw merged record dicts.
-
-    Combines:
-    - SUBMISSION.tsv
-    - REPORTINGOWNER.tsv (preserves all reporting owners without multiplying transactions)
-    - NONDERIV_TRANS.tsv
-    - DERIV_TRANS.tsv
-    - NONDERIV_HOLDING.tsv / DERIV_HOLDING.tsv
-    - FOOTNOTES.tsv
-    - OWNER_SIGNATURE.tsv
+    Parse a SEC Form 3/4/5 bulk dataset zip archive (from file path or in-memory bytes)
+    and yield raw merged record dicts.
     """
     try:
-        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        if isinstance(zip_bytes_or_path, zipfile.ZipFile):
+            zf = zip_bytes_or_path
+            close_zf = False
+        elif isinstance(zip_bytes_or_path, str):
+            zf = zipfile.ZipFile(zip_bytes_or_path, "r")
+            close_zf = True
+        elif isinstance(zip_bytes_or_path, (bytes, bytearray)):
+            zf = zipfile.ZipFile(io.BytesIO(zip_bytes_or_path))
+            close_zf = True
+        else:
+            zf = zipfile.ZipFile(zip_bytes_or_path)
+            close_zf = True
     except Exception as exc:
         raise SECDatasetError(f"Invalid zip file: {exc}") from exc
 

@@ -22,15 +22,16 @@ def run_historical_acquisition(
 ) -> int:
     """
     Execute historical SEC dataset acquisition from start_period to end_period
-    using bounded streaming batches to prevent high memory usage.
+    using temporary disk files and bounded streaming batches to prevent high memory usage.
     """
     import hashlib
     import os
+    import tempfile
     from config.environment import load_environment
     from data.acquisition_state import AcquisitionStateManager
     from data.sec_dataset_pipeline import (
         build_dataset_url,
-        download_dataset_zip,
+        download_dataset_zip_to_file,
         normalize_bulk_record,
         parse_dataset_zip,
         validate_bulk_record,
@@ -71,45 +72,39 @@ def run_historical_acquisition(
 
         print(f"Processing period {period_str}...")
 
+        # Create temporary file for downloading ZIP archive to disk
+        temp_fd, temp_zip_path = tempfile.mkstemp(suffix=".zip", prefix=f"sec_{period_str}_")
+        os.close(temp_fd)
+
         try:
-            zip_bytes = download_dataset_zip(year, qtr, user_agent=user_agent)
+            download_dataset_zip_to_file(year, qtr, user_agent=user_agent, target_path=temp_zip_path)
             periods_downloaded += 1
-        except SECDatasetDownloadError as exc:
-            print(f"Period {period_str}: Download failed ({exc}). Marking failed.")
-            total_failures += 1
-            state_mgr.record_period_completion(
-                period_str, 0, 0, 0, 0, 1, status="FAILED"
+
+            # Calculate SHA256 checksum of downloaded ZIP file from disk
+            hasher = hashlib.sha256()
+            with open(temp_zip_path, "rb") as f:
+                while chunk := f.read(1024 * 1024):
+                    hasher.update(chunk)
+            zip_checksum = hasher.hexdigest()
+
+            dataset_url = build_dataset_url(year, qtr)
+            store_provenance(
+                db_url,
+                record_type="dataset_period",
+                record_id=period_str,
+                source="SEC",
+                source_reference=dataset_url,
+                checksum=zip_checksum,
+                validation_status="validated",
             )
-            continue
-        except Exception as exc:
-            print(f"Period {period_str}: Download failed with unexpected error ({exc}).")
-            total_failures += 1
-            state_mgr.record_period_completion(
-                period_str, 0, 0, 0, 0, 1, status="FAILED"
-            )
-            continue
 
-        # Period-level provenance tracking with ZIP checksum
-        zip_checksum = hashlib.sha256(zip_bytes).hexdigest()
-        dataset_url = build_dataset_url(year, qtr)
-        store_provenance(
-            db_url,
-            record_type="dataset_period",
-            record_id=period_str,
-            source="SEC",
-            source_reference=dataset_url,
-            checksum=zip_checksum,
-            validation_status="validated",
-        )
+            p_parsed = 0
+            p_invalid = 0
+            p_inserted = 0
+            p_duplicates = 0
+            batch = []
 
-        p_parsed = 0
-        p_invalid = 0
-        p_inserted = 0
-        p_duplicates = 0
-        batch = []
-
-        try:
-            for raw_record in parse_dataset_zip(zip_bytes, source_url=dataset_url):
+            for raw_record in parse_dataset_zip(temp_zip_path, source_url=dataset_url):
                 p_parsed += 1
                 norm_rec = normalize_bulk_record(raw_record)
                 val_res = validate_bulk_record(norm_rec)
@@ -142,29 +137,43 @@ def run_historical_acquisition(
                 status="COMPLETED",
             )
 
+            total_parsed += p_parsed
+            total_inserted += p_inserted
+            total_duplicates += p_duplicates
+            total_invalid += p_invalid
+
+            print(
+                f"Period {period_str}: Parsed {p_parsed}, Inserted {p_inserted}, "
+                f"Duplicates {p_duplicates}, Invalid {p_invalid}"
+            )
+
+        except SECDatasetDownloadError as exc:
+            print(f"Period {period_str}: Download failed ({exc}). Marking failed.")
+            total_failures += 1
+            state_mgr.record_period_completion(
+                period_str, 0, 0, 0, 0, 1, status="FAILED"
+            )
+
         except Exception as exc:
-            print(f"Period {period_str}: Error during ingestion processing ({exc}). Marking FAILED.")
+            print(f"Period {period_str}: Error during processing ({exc}). Marking FAILED.")
             total_failures += 1
             state_mgr.record_period_completion(
                 period=period_str,
-                records_parsed=p_parsed,
-                records_inserted=p_inserted,
-                duplicates_count=p_duplicates,
-                invalid_count=p_invalid,
+                records_parsed=0,
+                records_inserted=0,
+                duplicates_count=0,
+                invalid_count=0,
                 failures_count=1,
                 status="FAILED",
             )
-            continue
 
-        total_parsed += p_parsed
-        total_inserted += p_inserted
-        total_duplicates += p_duplicates
-        total_invalid += p_invalid
-
-        print(
-            f"Period {period_str}: Parsed {p_parsed}, Inserted {p_inserted}, "
-            f"Duplicates {p_duplicates}, Invalid {p_invalid}"
-        )
+        finally:
+            # Always clean up temporary ZIP file from disk
+            if os.path.exists(temp_zip_path):
+                try:
+                    os.remove(temp_zip_path)
+                except OSError:
+                    pass
 
     # Calculate final database stats
     final_count = count_records(db_url, "insider_transactions")
@@ -219,7 +228,7 @@ def main() -> int:
         parser = argparse.ArgumentParser(prog="historical acquisition")
         parser.add_argument("cmd", nargs="*")
         parser.add_argument("--start", default="2006-Q1", help="Start period (e.g. 2006-Q1)")
-        parser.add_argument("--end", default="2026-Q1", help="End period (e.g. 2026-Q1)")
+        parser.add_argument("--end", default="2026-Q2", help="End period (e.g. 2026-Q2)")
         args = parser.parse_args()
         return run_historical_acquisition(args.start, args.end)
 
