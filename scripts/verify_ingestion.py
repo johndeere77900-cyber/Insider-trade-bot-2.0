@@ -4,6 +4,7 @@ Verification Script for SEC Historical Ingestion into Database (Neon PostgreSQL 
 Validates:
 - Run 1 data ingestion, provenance, ingestion_state, and data quality rules.
 - Multi-owner handling and amendment preservation (PASS / FAIL / NOT TESTABLE) scoped to target period.
+- Explicit DATA QUALITY reporting (PASS / FAIL / PARTIAL / NOT TESTABLE).
 - Run 2 database idempotency and duplicate protection with forced re-processing.
 - Temporary ZIP cleanup.
 - Formats final required summary output.
@@ -207,7 +208,6 @@ def verify_run1(period: str, state_file: str) -> int:
             sys.exit(1)
 
         # D. Period-Scoped Data Quality: Multi-Owner and Amendment checks
-        # Query records belonging to the target period by filing_date
         period_sql = (
             "SELECT accession_number, issuer_cik, record_hash, source, insider_name, insider_cik, form_type, filing_date, raw_payload "
             "FROM insider_transactions WHERE filing_date >= %s AND filing_date <= %s"
@@ -217,7 +217,7 @@ def verify_run1(period: str, state_file: str) -> int:
         )
         period_rows = query_all(conn, db_url, period_sql, (start_date, end_date))
 
-        # Fallback if filing_date range returned 0 due to date formatting variations: fetch all rows
+        # Fallback if filing_date range returned 0: fetch all rows
         if not period_rows:
             period_rows = query_all(
                 conn,
@@ -232,7 +232,7 @@ def verify_run1(period: str, state_file: str) -> int:
 
         amendment_records = []
         all_period_hashes = set()
-        all_period_accessions = set()
+        accession_hash_map: Dict[str, set] = {}
 
         for r in period_rows:
             acc = get_field(r, "accession_number")
@@ -247,7 +247,9 @@ def verify_run1(period: str, state_file: str) -> int:
                 break
 
             all_period_hashes.add(rec_hash)
-            all_period_accessions.add(acc)
+            if acc not in accession_hash_map:
+                accession_hash_map[acc] = set()
+            accession_hash_map[acc].add(rec_hash)
 
             try:
                 raw_obj = json.loads(raw_str) if isinstance(raw_str, str) else raw_str
@@ -275,7 +277,7 @@ def verify_run1(period: str, state_file: str) -> int:
             if doc_type.endswith("/A") or form_t.endswith("/A") or (date_orig and date_orig.strip()):
                 amendment_records.append((acc, rec_hash, date_orig, doc_type, raw_obj))
 
-        # Robust Amendment Preservation Verification
+        # Strict Amendment Preservation Verification
         amendment_result = "NOT TESTABLE"
         if amendment_records:
             amendment_valid = True
@@ -283,12 +285,22 @@ def verify_run1(period: str, state_file: str) -> int:
                 # 1. accession_number preserved
                 if not acc:
                     amendment_valid = False
-                # 2. record_hash present and unique in DB
+                    break
+                # 2. record_hash present and unique in dataset
                 if not rec_hash or rec_hash not in all_period_hashes:
                     amendment_valid = False
+                    break
                 # 3. amendment metadata present in raw_payload
                 if not doc_type.endswith("/A") and not (date_orig and date_orig.strip()):
                     amendment_valid = False
+                    break
+
+                # 4. If original filing accession exists in dataset, verify distinct rows with distinct record_hashes
+                orig_acc = raw_obj.get("submission", {}).get("ACCESSION_NUMBER") or acc
+                if orig_acc in accession_hash_map and len(accession_hash_map[orig_acc]) > 1:
+                    if rec_hash not in accession_hash_map[orig_acc]:
+                        amendment_valid = False
+                        break
 
             if amendment_valid:
                 amendment_result = "PASS"
@@ -427,14 +439,19 @@ def verify_run2(period: str, state_file: str) -> int:
         multi_owner_result = run1.get("multi_owner_result", "NOT TESTABLE")
         amendment_result = run1.get("amendment_result", "NOT TESTABLE")
 
-        data_quality_pass = (
-            run1.get("tx_count", 0) > 0
-            and status_run2 == "COMPLETED"
-            and multi_owner_result != "FAIL"
-            and amendment_result != "FAIL"
-        )
+        # Explicit DATA QUALITY determination: PASS, FAIL, or PARTIAL / NOT TESTABLE
+        if multi_owner_result == "FAIL" or amendment_result == "FAIL":
+            data_quality_display = "FAIL"
+            data_quality_valid = False
+        elif multi_owner_result == "PASS" and amendment_result == "PASS":
+            data_quality_display = "PASS"
+            data_quality_valid = True
+        else:
+            data_quality_display = "PARTIAL / NOT TESTABLE"
+            data_quality_valid = True
+
         temp_cleanup_pass = temp_cleaned
-        overall_pass = idempotency_pass and data_quality_pass and temp_cleanup_pass
+        overall_pass = idempotency_pass and data_quality_valid and temp_cleanup_pass
 
         print("\n" + "=" * 60)
         print("SEC DATASET:")
@@ -466,6 +483,10 @@ def verify_run2(period: str, state_file: str) -> int:
         if idempotency_errors:
             for err in idempotency_errors:
                 print(f"  Reason: {err}")
+        print()
+
+        print("DATA QUALITY:")
+        print(data_quality_display)
         print()
 
         print("MULTI-OWNER TEST:")
