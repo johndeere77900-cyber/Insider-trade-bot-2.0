@@ -51,11 +51,18 @@ jobs:
 
       - name: Run Historical Ingestion Engine
         run: |
-          CMD="python main.py historical --start \"${START_PERIOD}\" --end \"${END_PERIOD}\" --batch-size \"${BATCH_SIZE}\""
           if [ "${FORCE}" = "true" ]; then
-            CMD="${CMD} --force"
+            python main.py historical \
+              --start "${START_PERIOD}" \
+              --end "${END_PERIOD}" \
+              --batch-size "${BATCH_SIZE}" \
+              --force
+          else
+            python main.py historical \
+              --start "${START_PERIOD}" \
+              --end "${END_PERIOD}" \
+              --batch-size "${BATCH_SIZE}"
           fi
-          eval ${CMD}
         env:
           START_PERIOD: ${{ github.event.inputs.start_period }}
           END_PERIOD: ${{ github.event.inputs.end_period }}

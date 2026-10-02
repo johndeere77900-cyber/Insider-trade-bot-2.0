@@ -259,7 +259,7 @@ def test_verify_run1_zero_period_records_failure(tmp_path: Path, monkeypatch: py
         verify_run1("2006-Q1", state_file)
 
 
-def test_verify_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verify_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
     from scripts.verify_ingestion import verify_range
 
     db_path = tmp_path / "test_verify_range.db"
@@ -268,6 +268,64 @@ def test_verify_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     initialize_database(db_url)
 
+    # Insert data for 2006-Q1 and 2006-Q2, PLUS unrelated data for 2007-Q1
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES
+            ('2006-Q1', 'COMPLETED', 100, 90, 10, 0, 0, '2026-01-01'),
+            ('2006-Q2', 'COMPLETED', 150, 140, 10, 0, 0, '2026-01-01'),
+            ('2007-Q1', 'COMPLETED', 999, 999, 0, 0, 0, '2026-01-01')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES
+            ('dataset_period', '2006-Q1', 'SEC', 'ref1', '2026-01-01', 'chk1', 'validated'),
+            ('dataset_period', '2006-Q2', 'SEC', 'ref2', '2026-01-01', 'chk2', 'validated'),
+            ('dataset_period', '2007-Q1', 'SEC', 'ref3', '2026-01-01', 'chk3', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, transaction_date, form_type, raw_payload, record_hash, created_at
+            ) VALUES
+            ('SEC', 'acc1', 'cik1', '2006-01-15', '2006-01-10', '4', '{}', 'hash1', '2026-01-01'),
+            ('SEC', 'acc2', 'cik2', '2006-05-15', '2006-05-10', '4', '{}', 'hash2', '2026-01-01'),
+            ('SEC', 'acc3', 'cik3', '2007-02-15', '2007-02-10', '4', '{}', 'hash3', '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    ret = verify_range("2006-Q1", "2006-Q2")
+    assert ret == 0
+
+    captured = capsys.readouterr().out
+    assert "Periods requested:     2" in captured
+    assert "Periods completed:     2" in captured
+    assert "Periods failed:        0" in captured
+    assert "Records parsed:        250" in captured
+    assert "Records inserted:      230" in captured
+    assert "Duplicates:            20" in captured
+    assert "Provenance records:    2" in captured
+    assert "Ingestion states:      2" in captured
+
+
+def test_verify_range_missing_period_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.verify_ingestion import verify_range
+
+    db_path = tmp_path / "test_verify_range_missing.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+
+    initialize_database(db_url)
+
+    # Requested range: 2006-Q1 to 2006-Q3. DB has Q1 and Q2, Q3 missing.
     with connect(db_url) as conn:
         conn.execute(
             """
@@ -278,34 +336,16 @@ def test_verify_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
             ('2006-Q2', 'COMPLETED', 150, 140, 10, 0, 0, '2026-01-01')
             """
         )
-        conn.execute(
-            """
-            INSERT INTO provenance (
-                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
-            ) VALUES
-            ('dataset_period', '2006-Q1', 'SEC', 'ref1', '2026-01-01', 'chk1', 'validated'),
-            ('dataset_period', '2006-Q2', 'SEC', 'ref2', '2026-01-01', 'chk2', 'validated')
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO insider_transactions (
-                source, accession_number, issuer_cik, filing_date, transaction_date, form_type, raw_payload, record_hash, created_at
-            ) VALUES
-            ('SEC', 'acc1', 'cik1', '2006-01-15', '2006-01-10', '4', '{}', 'hash1', '2026-01-01'),
-            ('SEC', 'acc2', 'cik2', '2006-05-15', '2006-05-10', '4', '{}', 'hash2', '2026-01-01')
-            """
-        )
         conn.commit()
 
-    ret = verify_range("2006-Q1", "2006-Q2")
-    assert ret == 0
+    ret = verify_range("2006-Q1", "2006-Q3")
+    assert ret == 1
 
 
-def test_verify_range_incomplete_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_verify_range_failed_period_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from scripts.verify_ingestion import verify_range
 
-    db_path = tmp_path / "test_verify_range_fail.db"
+    db_path = tmp_path / "test_verify_range_failed.db"
     db_url = f"sqlite:///{db_path}"
     monkeypatch.setenv("DATABASE_URL", db_url)
 

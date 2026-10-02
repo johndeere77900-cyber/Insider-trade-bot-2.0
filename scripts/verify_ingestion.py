@@ -645,12 +645,18 @@ def verify_range(start_period: str, end_period: str) -> int:
             else:
                 periods_failed += 1
 
-        # Count provenance records
-        row = query_one(conn, db_url, "SELECT COUNT(*) AS c FROM provenance")
+        # Count provenance records strictly scoped to requested periods
+        prov_placeholders = ", ".join("%s" if is_postgresql_url(db_url) else "?" for _ in requested_periods)
+        prov_sql = (
+            f"SELECT COUNT(*) AS c FROM provenance WHERE record_type = 'dataset_period' AND source = 'SEC' AND record_id IN ({prov_placeholders})"
+        )
+        row = query_one(conn, db_url, prov_sql, tuple(requested_periods))
         provenance_records = int(get_field(row, "c", ["c"])) if row else 0
 
-        # Count ingestion_state records
-        row = query_one(conn, db_url, "SELECT COUNT(*) AS c FROM ingestion_state")
+        # Count ingestion_state records strictly scoped to requested periods
+        ingest_count_placeholders = ", ".join("%s" if is_postgresql_url(db_url) else "?" for _ in requested_periods)
+        ingest_count_sql = f"SELECT COUNT(*) AS c FROM ingestion_state WHERE period IN ({ingest_count_placeholders})"
+        row = query_one(conn, db_url, ingest_count_sql, tuple(requested_periods))
         ingestion_states = int(get_field(row, "c", ["c"])) if row else 0
 
         # Calculate transaction date range scoped to requested periods

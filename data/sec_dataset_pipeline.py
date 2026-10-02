@@ -108,6 +108,9 @@ def build_dataset_url(year: int, quarter: int) -> str:
     return f"{SEC_DATASET_BASE_URL}/{year}q{quarter}_form345.zip"
 
 
+TRANSIENT_HTTP_STATUSES = {429, 500, 502, 503, 504}
+
+
 def download_dataset_zip_to_file(
     year: int,
     quarter: int,
@@ -120,7 +123,7 @@ def download_dataset_zip_to_file(
     """
     Download the zip archive for a given year and quarter directly to disk at target_path.
     Avoids holding large ZIP files in memory.
-    Includes bounded retries with exponential backoff for transient HTTP or network failures.
+    Includes bounded retries with exponential backoff for transient HTTP or network failures only.
     """
     url = build_dataset_url(year, quarter)
     req = urllib.request.Request(
@@ -154,13 +157,13 @@ def download_dataset_zip_to_file(
             return target_path
         except urllib.error.HTTPError as exc:
             last_exc = exc
-            if exc.code == 404:
+            if exc.code not in TRANSIENT_HTTP_STATUSES:
                 raise SECDatasetDownloadError(
                     f"HTTP {exc.code} downloading dataset {year}q{quarter}: {exc.reason}"
                 ) from exc
         except urllib.error.URLError as exc:
             last_exc = exc
-        except Exception as exc:
+        except TimeoutError as exc:
             last_exc = exc
 
     if isinstance(last_exc, urllib.error.HTTPError):
@@ -187,7 +190,7 @@ def download_dataset_zip(
 ) -> bytes:
     """
     Legacy helper: download zip archive into memory bytes.
-    Includes bounded retries with exponential backoff for transient HTTP or network failures.
+    Includes bounded retries with exponential backoff for transient HTTP or network failures only.
     """
     url = build_dataset_url(year, quarter)
     req = urllib.request.Request(
@@ -215,13 +218,13 @@ def download_dataset_zip(
                 return response.read()
         except urllib.error.HTTPError as exc:
             last_exc = exc
-            if exc.code == 404:
+            if exc.code not in TRANSIENT_HTTP_STATUSES:
                 raise SECDatasetDownloadError(
                     f"HTTP {exc.code} downloading dataset {year}q{quarter}: {exc.reason}"
                 ) from exc
         except urllib.error.URLError as exc:
             last_exc = exc
-        except Exception as exc:
+        except TimeoutError as exc:
             last_exc = exc
 
     if isinstance(last_exc, urllib.error.HTTPError):
