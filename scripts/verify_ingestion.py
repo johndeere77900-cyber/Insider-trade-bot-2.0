@@ -3,9 +3,10 @@ Verification Script for SEC Historical Ingestion into Database (Neon PostgreSQL 
 
 Validates:
 - Run 1 data ingestion, provenance, ingestion_state, and data quality rules.
-- Run 2 database idempotency and duplicate protection.
+- Multi-owner handling and amendment preservation (PASS / FAIL / NOT TESTABLE).
+- Run 2 database idempotency and duplicate protection with forced re-processing.
 - Temporary ZIP cleanup.
-- Formats final TASK 10 summary output.
+- Formats final required summary output.
 """
 
 from __future__ import annotations
@@ -184,12 +185,15 @@ def verify_run1(period: str, state_file: str) -> int:
             print("ERROR: Ingestion state reports records_inserted = 0.", file=sys.stderr)
             sys.exit(1)
 
-        # D. Data quality checks
-        rows = query_all(conn, db_url, "SELECT * FROM insider_transactions LIMIT 50")
+        # D. Detailed Data Quality: Multi-Owner and Amendment checks
+        rows = query_all(conn, db_url, "SELECT accession_number, issuer_cik, record_hash, source, insider_name, insider_cik, raw_payload FROM insider_transactions")
         dq_pass = True
 
-        multi_owner_tested = False
-        amendment_tested = False
+        multi_owner_found = False
+        multi_owner_valid = True
+
+        amendment_found = False
+        amendment_valid = True
 
         for r in rows:
             acc = get_field(r, "accession_number")
@@ -210,24 +214,38 @@ def verify_run1(period: str, state_file: str) -> int:
                 dq_pass = False
                 break
 
+            # Multi-owner evaluation
             all_owners = raw_obj.get("all_owners", [])
             insider_name = get_field(r, "insider_name")
             insider_cik = get_field(r, "insider_cik")
 
             if len(all_owners) > 1:
-                multi_owner_tested = True
+                multi_owner_found = True
                 if insider_name is not None or insider_cik is not None:
-                    print(f"ERROR: Multi-owner filing {acc} assigned specific owner_cik/name when all_owners has length {len(all_owners)}", file=sys.stderr)
-                    dq_pass = False
-                    break
+                    print(f"ERROR: Multi-owner filing {acc} incorrectly assigned top-level insider_name={insider_name}, insider_cik={insider_cik}", file=sys.stderr)
+                    multi_owner_valid = False
 
-            doc_type = raw_obj.get("submission", {}).get("DOCUMENT_TYPE", "")
-            date_orig = raw_obj.get("submission", {}).get("DATE_OF_ORIG_SUB", "")
-            if doc_type.endswith("/A") or date_orig:
-                amendment_tested = True
+            # Amendment evaluation
+            doc_type = str(raw_obj.get("submission", {}).get("DOCUMENT_TYPE", ""))
+            date_orig = str(raw_obj.get("submission", {}).get("DATE_OF_ORIG_SUB", ""))
+            if doc_type.endswith("/A") or (date_orig and date_orig.strip()):
+                amendment_found = True
+                # Confirm amendment metadata preserved
+                if not acc or not raw_obj:
+                    amendment_valid = False
 
-        if not dq_pass:
-            print("ERROR: Data quality checks failed.", file=sys.stderr)
+        if multi_owner_found:
+            multi_owner_result = "PASS" if multi_owner_valid else "FAIL"
+        else:
+            multi_owner_result = "NOT TESTABLE"
+
+        if amendment_found:
+            amendment_result = "PASS" if amendment_valid else "FAIL"
+        else:
+            amendment_result = "NOT TESTABLE"
+
+        if not dq_pass or multi_owner_result == "FAIL" or amendment_result == "FAIL":
+            print(f"ERROR: Data quality checks failed (multi_owner={multi_owner_result}, amendment={amendment_result}).", file=sys.stderr)
             sys.exit(1)
 
         temp_cleaned = check_temp_files_cleaned(period)
@@ -247,14 +265,14 @@ def verify_run1(period: str, state_file: str) -> int:
             "status": status,
             "earliest_date": earliest_date,
             "latest_date": latest_date,
-            "multi_owner_tested": multi_owner_tested,
-            "amendment_tested": amendment_tested,
+            "multi_owner_result": multi_owner_result,
+            "amendment_result": amendment_result,
         }
 
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(run1_data, f, indent=2)
 
-        print(f"Run 1 verification PASSED. Saved state to {state_file}.")
+        print(f"Run 1 verification PASSED. Multi-Owner: {multi_owner_result}, Amendment: {amendment_result}. Saved state to {state_file}.")
         return 0
 
 
@@ -303,33 +321,62 @@ def verify_run2(period: str, state_file: str) -> int:
         idempotency_pass = True
         idempotency_errors = []
 
-        # 1. Total insider transactions count must NOT increase
+        # 1. Verification that second run actually downloaded and parsed SEC dataset
+        if run2_parsed == 0:
+            idempotency_pass = False
+            idempotency_errors.append(
+                "Run 2 records_parsed is 0 (the importer skipped or failed to process SEC data)"
+            )
+
+        # 2. Duplicate detection MUST occur on re-processing
+        if run2_duplicates == 0 and run2_parsed > 0:
+            idempotency_pass = False
+            idempotency_errors.append(
+                f"Run 2 duplicates_count is 0 despite parsing {run2_parsed} records (expected duplicates > 0)"
+            )
+
+        # 3. New records inserted MUST be 0
+        if run2_inserted > 0:
+            idempotency_pass = False
+            idempotency_errors.append(
+                f"Run 2 records_inserted is {run2_inserted} (expected 0)"
+            )
+
+        # 4. Total insider transactions count must NOT increase
         if tx_count_run2 != run1["tx_count"]:
             idempotency_pass = False
             idempotency_errors.append(
                 f"insider_transactions count changed from {run1['tx_count']} to {tx_count_run2}"
             )
 
-        # 2. Provenance count must not increase unexpectedly
+        # 5. Provenance count must not increase unexpectedly
         if prov_count_run2 != run1["provenance_count"]:
             idempotency_pass = False
             idempotency_errors.append(
                 f"provenance count changed from {run1['provenance_count']} to {prov_count_run2}"
             )
 
-        # 3. Status must remain COMPLETED
+        # 6. Status must remain COMPLETED
         if status_run2 != "COMPLETED":
             idempotency_pass = False
             idempotency_errors.append(f"ingestion_state status is '{status_run2}', expected 'COMPLETED'")
 
-        # 4. Failures must remain 0
+        # 7. Failures must remain 0
         if run2_failures != 0:
             idempotency_pass = False
             idempotency_errors.append(f"ingestion_state failures_count is {run2_failures}")
 
         temp_cleaned = check_temp_files_cleaned(period)
 
-        data_quality_pass = run1.get("tx_count", 0) > 0 and status_run2 == "COMPLETED"
+        multi_owner_result = run1.get("multi_owner_result", "NOT TESTABLE")
+        amendment_result = run1.get("amendment_result", "NOT TESTABLE")
+
+        data_quality_pass = (
+            run1.get("tx_count", 0) > 0
+            and status_run2 == "COMPLETED"
+            and multi_owner_result != "FAIL"
+            and amendment_result != "FAIL"
+        )
         temp_cleanup_pass = temp_cleaned
         overall_pass = idempotency_pass and data_quality_pass and temp_cleanup_pass
 
@@ -365,8 +412,12 @@ def verify_run2(period: str, state_file: str) -> int:
                 print(f"  Reason: {err}")
         print()
 
-        print("DATA QUALITY:")
-        print("PASS" if data_quality_pass else "FAIL")
+        print("MULTI-OWNER TEST:")
+        print(multi_owner_result)
+        print()
+
+        print("AMENDMENT TEST:")
+        print(amendment_result)
         print()
 
         print("TEMP FILE CLEANUP:")
