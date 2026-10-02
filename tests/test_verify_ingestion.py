@@ -7,12 +7,98 @@ import pytest
 
 import main
 from database.connection import connect, initialize_database
+import datetime
 from scripts.verify_ingestion import (
     check_temp_files_cleaned,
     get_field,
+    json_safe_value,
     verify_run1,
     verify_run2,
 )
+
+
+def test_json_safe_value_with_dates() -> None:
+    """Test that json_safe_value converts date/datetime objects to ISO format strings."""
+    d = datetime.date(2006, 1, 15)
+    dt = datetime.datetime(2006, 1, 15, 12, 30, 0)
+    assert json_safe_value(d) == "2006-01-15"
+    assert json_safe_value(dt) == "2006-01-15T12:30:00"
+    assert json_safe_value("2006-01-15") == "2006-01-15"
+    assert json_safe_value(123) == 123
+    assert json_safe_value(None) is None
+
+
+def test_verify_run1_date_json_serialization(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test: verify that date objects returned from query_one do not cause TypeError during json.dump in verify_run1."""
+    import scripts.verify_ingestion as vi
+
+    db_path = tmp_path / "test_date_serialize.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+
+    initialize_database(db_url)
+
+    raw_data = {
+        "accession_number": "0000000000-06-000001",
+        "issuer_cik": "0000001234",
+        "submission": {"DOCUMENT_TYPE": "4"}
+    }
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, transaction_date,
+                form_type, raw_payload, record_hash, created_at
+            ) VALUES (
+                'SEC', '0000000000-06-000001', '0000001234', '2006-01-15', '2006-01-14',
+                '4', ?, 'hash1', '2026-01-01T00:00:00Z'
+            )
+            """,
+            (json.dumps(raw_data),)
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES ('dataset_period', '2006-Q1', 'SEC', '2006q1_form345.zip', '2026-01-01', 'chk', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES ('2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    # Wrap query_one so that when date_range_sql is executed, min_d and max_d are returned as datetime.date objects (as PostgreSQL driver does)
+    original_query_one = vi.query_one
+
+    def mock_query_one(conn, db_url_arg, sql, params=()):
+        res = original_query_one(conn, db_url_arg, sql, params)
+        if isinstance(res, dict) and "min_d" in res and "max_d" in res:
+            return {
+                "min_d": datetime.date(2006, 1, 14),
+                "max_d": datetime.date(2006, 3, 30),
+            }
+        return res
+
+    monkeypatch.setattr(vi, "query_one", mock_query_one)
+
+    state_file = str(tmp_path / "sec_run1_stats.json")
+
+    # verify_run1 MUST succeed without TypeError: Object of type date is not JSON serializable
+    res = verify_run1("2006-Q1", state_file)
+    assert res == 0
+
+    with open(state_file, "r") as f:
+        data = json.load(f)
+
+    assert data["earliest_date"] == "2006-01-14"
+    assert data["latest_date"] == "2006-03-30"
 
 
 def test_get_field_postgres_tuples_and_mappings() -> None:
