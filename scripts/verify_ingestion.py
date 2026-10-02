@@ -31,6 +31,13 @@ from storage.repository import _row_value
 
 from typing import Sequence
 
+def json_safe_value(value: Any) -> Any:
+    """Return ISO formatted string if value is date/datetime or has isoformat attribute."""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
 def get_field(row: Any, key: str, columns: Optional[Sequence[str]] = None) -> Any:
     """Safely retrieve a column by name from dict, sqlite3.Row, or tuple/row."""
     if row is None:
@@ -391,8 +398,8 @@ def verify_run1(period: str, state_file: str) -> int:
             "period_tx_count": period_tx_count,
             "provenance_count": total_prov_count,
             "status": status,
-            "earliest_date": earliest_date,
-            "latest_date": latest_date,
+            "earliest_date": json_safe_value(earliest_date),
+            "latest_date": json_safe_value(latest_date),
             "multi_owner_result": multi_owner_result,
             "amendment_result": amendment_result,
         }
