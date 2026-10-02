@@ -1,0 +1,173 @@
+"""
+Regression tests for Storage Architecture Repair & Optimization.
+
+Verifies:
+- Duplicate index `idx_insider_tx_uniq` is no longer created by initialization.
+- Intended unique constraint `UNIQUE(source, accession_number, record_hash)` still prevents duplicate transaction insertions.
+- Dataset-level provenance remains idempotent.
+- Transaction identity remains deterministic.
+- Historical ingestion remains resumable.
+- Existing raw_payload behavior is preserved for bulk records.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import pytest
+
+from data.acquisition_state import AcquisitionStateManager
+from data.sec_dataset_pipeline import compute_transaction_identity, normalize_bulk_record
+from database.connection import connect, initialize_database
+from storage.repository import (
+    count_records,
+    store_bulk_insider_transactions,
+    store_provenance,
+)
+
+
+def test_initialization_does_not_create_duplicate_index(tmp_path) -> None:
+    """Verify initialize_database creates required schema but DOES NOT create idx_insider_tx_uniq."""
+    db_file = tmp_path / "test_no_dup_idx.db"
+    db_url = f"sqlite:///{db_file}"
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_insider_tx_uniq'"
+        )
+        row = cursor.fetchone()
+        assert row is None, "idx_insider_tx_uniq should no longer be created on database initialization"
+
+
+def test_unique_constraint_prevents_duplicate_transactions(tmp_path) -> None:
+    """Verify table-level UNIQUE(source, accession_number, record_hash) still prevents duplicates."""
+    db_file = tmp_path / "test_unique.db"
+    db_url = f"sqlite:///{db_file}"
+
+    raw_rec = {
+        "accession_number": "0000016732-23-000043",
+        "issuer_cik": "0000016732",
+        "issuer_name": "TEST INC",
+        "source": "SEC",
+        "source_url": "https://www.sec.gov/test.txt",
+        "form_type": "4",
+        "record_hash": "abc123hash",
+        "raw": {"test": 1},
+    }
+
+    norm = normalize_bulk_record(raw_rec)
+
+    # First insert
+    ins1, dup1 = store_bulk_insider_transactions(db_url, [norm])
+    assert ins1 == 1
+    assert dup1 == 0
+    assert count_records(db_url, "insider_transactions") == 1
+
+    # Second insert with identical (source, accession_number, record_hash)
+    ins2, dup2 = store_bulk_insider_transactions(db_url, [norm])
+    assert ins2 == 0
+    assert dup2 == 1
+    assert count_records(db_url, "insider_transactions") == 1
+
+
+def test_dataset_level_provenance_idempotency(tmp_path) -> None:
+    """Verify dataset_period provenance remains idempotent when written repeatedly."""
+    db_file = tmp_path / "test_prov.db"
+    db_url = f"sqlite:///{db_file}"
+
+    store_provenance(
+        db_url,
+        record_type="dataset_period",
+        record_id="2006-Q1",
+        source="SEC",
+        source_reference="https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/2006q1_form345.zip",
+        checksum="hash1",
+        validation_status="validated",
+    )
+    assert count_records(db_url, "provenance") == 1
+
+    # Second write updates record instead of creating duplicate
+    store_provenance(
+        db_url,
+        record_type="dataset_period",
+        record_id="2006-Q1",
+        source="SEC",
+        source_reference="https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/2006q1_form345.zip",
+        checksum="hash2_updated",
+        validation_status="validated",
+    )
+    assert count_records(db_url, "provenance") == 1
+
+    with connect(db_url) as conn:
+        cursor = conn.execute("SELECT checksum FROM provenance WHERE record_id='2006-Q1'")
+        row = cursor.fetchone()
+        assert row[0] == "hash2_updated"
+
+
+def test_transaction_identity_deterministic() -> None:
+    """Verify transaction identity calculation remains deterministic."""
+    h1 = compute_transaction_identity(
+        accession_number="0001140361-23-000001",
+        transaction_type="non_derivative",
+        transaction_sk="100",
+        is_amendment=False,
+        form_type="4",
+    )
+    h2 = compute_transaction_identity(
+        accession_number="0001140361-23-000001",
+        transaction_type="non_derivative",
+        transaction_sk="100",
+        is_amendment=False,
+        form_type="4",
+    )
+    assert h1 == h2
+    assert len(h1) == 64  # SHA256 length
+
+
+def test_historical_ingestion_resumable(tmp_path) -> None:
+    """Verify acquisition state manager correctly tracks period completion for resumption."""
+    db_file = tmp_path / "test_resume.db"
+    db_url = f"sqlite:///{db_file}"
+
+    state_mgr = AcquisitionStateManager(db_url)
+    assert state_mgr.should_skip_period("2006-Q1") is False
+
+    state_mgr.record_period_completion(
+        period="2006-Q1",
+        records_parsed=1000,
+        records_inserted=950,
+        duplicates_count=50,
+        invalid_count=0,
+        failures_count=0,
+        status="COMPLETED",
+    )
+
+    assert state_mgr.should_skip_period("2006-Q1") is True
+
+
+def test_raw_payload_behavior_preserved(tmp_path) -> None:
+    """Verify raw_payload is stored and retrievable on insider_transactions."""
+    db_file = tmp_path / "test_raw.db"
+    db_url = f"sqlite:///{db_file}"
+
+    raw_data = {"submission": {"ACCESSION_NUMBER": "000123"}, "owner": {"NAME": "John Doe"}}
+    raw_rec = {
+        "accession_number": "000123",
+        "issuer_cik": "000001",
+        "issuer_name": "TEST",
+        "source": "SEC",
+        "source_url": "https://sec.gov",
+        "form_type": "4",
+        "record_hash": "hash123",
+        "raw": raw_data,
+    }
+
+    norm = normalize_bulk_record(raw_rec)
+    store_bulk_insider_transactions(db_url, [norm])
+
+    with connect(db_url) as conn:
+        cursor = conn.execute("SELECT raw_payload FROM insider_transactions WHERE accession_number='000123'")
+        row = cursor.fetchone()
+        assert row is not None
+        assert "John Doe" in row[0]

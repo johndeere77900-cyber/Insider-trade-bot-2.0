@@ -398,10 +398,7 @@ def initialize_database(database_url: str) -> Any:
                         f"ALTER TABLE insider_transactions ADD COLUMN {col_name} {col_type}"
                     )
 
-            # Ensure indexes exist for insider_transactions deduplication
-            connection.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_insider_tx_uniq ON insider_transactions (source, accession_number, record_hash);"
-            )
+            # Ensure indexes exist for insider_transactions query optimization
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
             )
@@ -430,9 +427,6 @@ def initialize_database(database_url: str) -> Any:
                     cursor.execute(query)
 
                 # Ensure PostgreSQL indexes exist
-                cursor.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_insider_tx_uniq ON insider_transactions (source, accession_number, record_hash);"
-                )
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
                 )

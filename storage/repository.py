@@ -314,7 +314,8 @@ def store_bulk_insider_transactions(
 ) -> tuple[int, int]:
     """
     Batch store normalized insider transactions with deduplication.
-    Also stores provenance records for each inserted record.
+    Note: Provenance is tracked at the dataset level (dataset_period) rather
+    than per-transaction to prevent massive database index/storage bloat.
 
     Returns:
         (inserted_count, duplicates_count)
@@ -334,7 +335,6 @@ def store_bulk_insider_transactions(
 
     now = utc_now()
     rows_to_insert = []
-    provenance_rows = []
 
     for r in records:
         # Use persisted semantic transaction identity (record_hash) if available
@@ -367,19 +367,7 @@ def store_bulk_insider_transactions(
         )
         rows_to_insert.append(val_tuple)
 
-        prov_tuple = (
-            "insider_transaction",
-            r_hash,
-            r.source,
-            r.source_url,
-            now,
-            r_hash,
-            "validated",
-        )
-        provenance_rows.append(prov_tuple)
-
     placeholder_str = ", ".join(_placeholder(database_url) for _ in rows_to_insert[0])
-    prov_placeholder_str = ", ".join(_placeholder(database_url) for _ in provenance_rows[0])
 
     initial_count = count_records(database_url, "insider_transactions")
 
@@ -390,34 +378,17 @@ def store_bulk_insider_transactions(
                 VALUES ({placeholder_str})
                 ON CONFLICT (source, accession_number, record_hash) DO NOTHING
             """
-            prov_sql = f"""
-                INSERT INTO provenance (
-                    record_type, record_id, source, source_reference,
-                    retrieved_at, checksum, validation_status
-                )
-                VALUES ({prov_placeholder_str})
-                ON CONFLICT (record_type, record_id, source) DO NOTHING
-            """
         else:
             insert_sql = f"""
                 INSERT OR IGNORE INTO insider_transactions ({columns})
                 VALUES ({placeholder_str})
             """
-            prov_sql = f"""
-                INSERT OR IGNORE INTO provenance (
-                    record_type, record_id, source, source_reference,
-                    retrieved_at, checksum, validation_status
-                )
-                VALUES ({prov_placeholder_str})
-            """
 
         if is_postgresql_url(database_url):
             with connection.cursor() as cursor:
                 cursor.executemany(insert_sql, rows_to_insert)
-                cursor.executemany(prov_sql, provenance_rows)
         else:
             connection.executemany(insert_sql, rows_to_insert)
-            connection.executemany(prov_sql, provenance_rows)
 
         connection.commit()
 
