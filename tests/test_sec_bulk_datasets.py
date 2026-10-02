@@ -360,3 +360,28 @@ def test_cli_default_end_period():
     args = parser.parse_args([])
     assert args.start == "2006-Q1"
     assert args.end == "2026-Q2"
+
+
+def test_download_dataset_zip_to_file_retries(monkeypatch, tmp_path):
+    from data.sec_dataset_pipeline import SECDatasetDownloadError, download_dataset_zip_to_file
+    import urllib.error
+
+    attempts = 0
+
+    def mock_urlopen(req, timeout=60):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise urllib.error.URLError("Transient network failure")
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", mock_urlopen)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    target_file = tmp_path / "test.zip"
+    with pytest.raises(SECDatasetDownloadError) as exc_info:
+        download_dataset_zip_to_file(2006, 1, "UserAgent", str(target_file), max_retries=3)
+
+    # Note: 404 immediately raises without retrying further, so 2 transient URLErrors + 1 HTTP 404 = 3 attempts total.
+    assert attempts == 3
+    assert "HTTP 404" in str(exc_info.value)

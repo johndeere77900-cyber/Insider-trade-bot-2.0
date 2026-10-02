@@ -237,9 +237,10 @@ def main() -> int:
         parser.add_argument("cmd", nargs="*")
         parser.add_argument("--start", default="2006-Q1", help="Start period (e.g. 2006-Q1)")
         parser.add_argument("--end", default="2026-Q2", help="End period (e.g. 2026-Q2)")
+        parser.add_argument("--batch-size", type=int, default=5000, help="Batch size for database insertion")
         parser.add_argument("--force", action="store_true", help="Force re-processing of completed periods")
         args = parser.parse_args()
-        return run_historical_acquisition(args.start, args.end, force=args.force)
+        return run_historical_acquisition(args.start, args.end, batch_size=args.batch_size, force=args.force)
 
     try:
         settings = load_environment()

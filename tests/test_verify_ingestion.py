@@ -259,6 +259,74 @@ def test_verify_run1_zero_period_records_failure(tmp_path: Path, monkeypatch: py
         verify_run1("2006-Q1", state_file)
 
 
+def test_verify_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.verify_ingestion import verify_range
+
+    db_path = tmp_path / "test_verify_range.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES
+            ('2006-Q1', 'COMPLETED', 100, 90, 10, 0, 0, '2026-01-01'),
+            ('2006-Q2', 'COMPLETED', 150, 140, 10, 0, 0, '2026-01-01')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES
+            ('dataset_period', '2006-Q1', 'SEC', 'ref1', '2026-01-01', 'chk1', 'validated'),
+            ('dataset_period', '2006-Q2', 'SEC', 'ref2', '2026-01-01', 'chk2', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, transaction_date, form_type, raw_payload, record_hash, created_at
+            ) VALUES
+            ('SEC', 'acc1', 'cik1', '2006-01-15', '2006-01-10', '4', '{}', 'hash1', '2026-01-01'),
+            ('SEC', 'acc2', 'cik2', '2006-05-15', '2006-05-10', '4', '{}', 'hash2', '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    ret = verify_range("2006-Q1", "2006-Q2")
+    assert ret == 0
+
+
+def test_verify_range_incomplete_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts.verify_ingestion import verify_range
+
+    db_path = tmp_path / "test_verify_range_fail.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES
+            ('2006-Q1', 'COMPLETED', 100, 90, 10, 0, 0, '2026-01-01'),
+            ('2006-Q2', 'FAILED', 0, 0, 0, 0, 1, '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    ret = verify_range("2006-Q1", "2006-Q2")
+    assert ret == 1
+
+
 def test_verify_run1_amendment_no_self_comparison(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that an isolated amendment record without a distinct original filing yields NOT TESTABLE rather than PASS."""
     db_path = tmp_path / "test_amend_self.db"

@@ -25,6 +25,7 @@ from typing import Any, Dict, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config.environment import load_environment
+from data.acquisition_state import AcquisitionStateManager
 from database.connection import connect, is_postgresql_url
 from storage.repository import _row_value
 
@@ -597,18 +598,124 @@ def verify_run2(period: str, state_file: str) -> int:
         return 0
 
 
+def verify_range(start_period: str, end_period: str) -> int:
+    """Verify a historical period range and output summary report."""
+    db_url = get_db_url()
+    state_mgr = AcquisitionStateManager(db_url)
+    period_range = state_mgr.parse_period_range(start_period, end_period)
+
+    requested_periods = [p_str for _, _, p_str in period_range]
+    periods_requested_count = len(requested_periods)
+
+    with connect(db_url) as conn:
+        # Get ingestion states for all requested periods
+        ingest_cols = ["period", "status", "records_parsed", "records_inserted", "duplicates_count", "invalid_count", "failures_count"]
+        placeholders = ", ".join("%s" if is_postgresql_url(db_url) else "?" for _ in requested_periods)
+        ingest_sql = f"SELECT {', '.join(ingest_cols)} FROM ingestion_state WHERE period IN ({placeholders})"
+        ingest_rows = query_all(conn, db_url, ingest_sql, tuple(requested_periods))
+
+        state_by_period = {get_field(r, "period", ingest_cols): r for r in ingest_rows}
+
+        periods_completed = 0
+        periods_failed = 0
+        total_parsed = 0
+        total_inserted = 0
+        total_duplicates = 0
+        total_invalid = 0
+
+        for p_str in requested_periods:
+            st_row = state_by_period.get(p_str)
+            if not st_row:
+                periods_failed += 1
+                continue
+
+            status = get_field(st_row, "status", ingest_cols)
+            parsed = int(get_field(st_row, "records_parsed", ingest_cols) or 0)
+            inserted = int(get_field(st_row, "records_inserted", ingest_cols) or 0)
+            dups = int(get_field(st_row, "duplicates_count", ingest_cols) or 0)
+            invalids = int(get_field(st_row, "invalid_count", ingest_cols) or 0)
+
+            total_parsed += parsed
+            total_inserted += inserted
+            total_duplicates += dups
+            total_invalid += invalids
+
+            if status == "COMPLETED":
+                periods_completed += 1
+            else:
+                periods_failed += 1
+
+        # Count provenance records
+        row = query_one(conn, db_url, "SELECT COUNT(*) AS c FROM provenance")
+        provenance_records = int(get_field(row, "c", ["c"])) if row else 0
+
+        # Count ingestion_state records
+        row = query_one(conn, db_url, "SELECT COUNT(*) AS c FROM ingestion_state")
+        ingestion_states = int(get_field(row, "c", ["c"])) if row else 0
+
+        # Calculate transaction date range scoped to requested periods
+        min_start_date, _ = get_period_date_bounds(requested_periods[0])
+        _, max_end_date = get_period_date_bounds(requested_periods[-1])
+
+        tx_date_cols = ["min_d", "max_d"]
+        tx_date_sql = (
+            "SELECT MIN(transaction_date) AS min_d, MAX(transaction_date) AS max_d "
+            "FROM insider_transactions WHERE filing_date >= %s AND filing_date <= %s "
+            "AND transaction_date IS NOT NULL"
+            if is_postgresql_url(db_url) else
+            "SELECT MIN(transaction_date) AS min_d, MAX(transaction_date) AS max_d "
+            "FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ? "
+            "AND transaction_date IS NOT NULL AND transaction_date != ''"
+        )
+        row = query_one(conn, db_url, tx_date_sql, (min_start_date, max_end_date))
+        earliest_tx = get_field(row, "min_d", tx_date_cols) if row else None
+        latest_tx = get_field(row, "max_d", tx_date_cols) if row else None
+
+    overall_pass = (periods_failed == 0) and (periods_completed == periods_requested_count)
+
+    print("\nHISTORICAL SEC BACKFILL\n")
+    print("Requested range:")
+    print(f"{start_period} → {end_period}\n")
+    print(f"Periods requested:     {periods_requested_count}")
+    print(f"Periods completed:     {periods_completed}")
+    print(f"Periods failed:        {periods_failed}\n")
+    print(f"Records parsed:        {total_parsed}")
+    print(f"Records inserted:      {total_inserted}")
+    print(f"Duplicates:            {total_duplicates}")
+    print(f"Invalid:               {total_invalid}\n")
+    print(f"Provenance records:    {provenance_records}")
+    print(f"Ingestion states:      {ingestion_states}\n")
+    print(f"Earliest transaction:  {earliest_tx}")
+    print(f"Latest transaction:    {latest_tx}\n")
+    print(f"OVERALL: {'PASS' if overall_pass else 'FAIL'}\n")
+
+    if not overall_pass:
+        print("ERROR: Historical backfill range verification failed.", file=sys.stderr)
+        return 1
+
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify SEC historical ingestion.")
-    parser.add_argument("--run", type=int, choices=[1, 2], required=True, help="Run number to verify (1 or 2)")
+    parser.add_argument("--run", type=int, choices=[1, 2], help="Run number to verify (1 or 2)")
     parser.add_argument("--period", default="2006-Q1", help="Target SEC dataset period")
     parser.add_argument("--state-file", default="/tmp/sec_run1_stats.json", help="Path to JSON state file between runs")
+    parser.add_argument("--verify-range", action="store_true", help="Verify range of historical periods")
+    parser.add_argument("--start", default="2006-Q1", help="Start period for range verification")
+    parser.add_argument("--end", default="2010-Q4", help="End period for range verification")
 
     args = parser.parse_args()
 
+    if args.verify_range:
+        return verify_range(args.start, args.end)
+
     if args.run == 1:
         return verify_run1(args.period, args.state_file)
-    else:
+    elif args.run == 2:
         return verify_run2(args.period, args.state_file)
+    else:
+        parser.error("Either --run {1,2} or --verify-range must be provided.")
 
 
 if __name__ == "__main__":

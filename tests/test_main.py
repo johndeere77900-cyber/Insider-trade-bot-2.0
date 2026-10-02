@@ -48,3 +48,27 @@ def test_main_rejects_invalid_environment(
     result = main.main()
 
     assert result == 1
+
+
+def test_main_historical_cli_args(monkeypatch) -> None:
+    called_args = {}
+
+    def mock_run_historical(start, end, batch_size=5000, force=False):
+        called_args["start"] = start
+        called_args["end"] = end
+        called_args["batch_size"] = batch_size
+        called_args["force"] = force
+        return 0
+
+    monkeypatch.setattr(main, "run_historical_acquisition", mock_run_historical)
+    monkeypatch.setattr("sys.argv", ["main.py", "historical", "--start", "2006-Q1", "--end", "2006-Q2", "--batch-size", "1000", "--force"])
+
+    result = main.main()
+
+    assert result == 0
+    assert called_args == {
+        "start": "2006-Q1",
+        "end": "2006-Q2",
+        "batch_size": 1000,
+        "force": True,
+    }

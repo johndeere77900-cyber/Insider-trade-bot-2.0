@@ -15,6 +15,7 @@ import csv
 import hashlib
 import io
 import json
+import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
@@ -113,10 +114,13 @@ def download_dataset_zip_to_file(
     user_agent: str,
     target_path: str,
     timeout: int = 60,
+    max_retries: int = 3,
+    backoff_factor: float = 1.0,
 ) -> str:
     """
     Download the zip archive for a given year and quarter directly to disk at target_path.
     Avoids holding large ZIP files in memory.
+    Includes bounded retries with exponential backoff for transient HTTP or network failures.
     """
     url = build_dataset_url(year, quarter)
     req = urllib.request.Request(
@@ -128,32 +132,49 @@ def download_dataset_zip_to_file(
         },
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            status = getattr(response, "status", 200)
-            if status != 200:
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            sleep_time = backoff_factor * (2 ** (attempt - 1))
+            time.sleep(sleep_time)
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                status = getattr(response, "status", 200)
+                if status != 200:
+                    raise SECDatasetDownloadError(
+                        f"HTTP status {status} downloading dataset {year}q{quarter} from {url}"
+                    )
+                with open(target_path, "wb") as out_file:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+            return target_path
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code == 404:
                 raise SECDatasetDownloadError(
-                    f"HTTP status {status} downloading dataset {year}q{quarter} from {url}"
-                )
-            with open(target_path, "wb") as out_file:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    out_file.write(chunk)
-        return target_path
-    except urllib.error.HTTPError as exc:
+                    f"HTTP {exc.code} downloading dataset {year}q{quarter}: {exc.reason}"
+                ) from exc
+        except urllib.error.URLError as exc:
+            last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+
+    if isinstance(last_exc, urllib.error.HTTPError):
         raise SECDatasetDownloadError(
-            f"HTTP {exc.code} downloading dataset {year}q{quarter}: {exc.reason}"
-        ) from exc
-    except urllib.error.URLError as exc:
+            f"HTTP {last_exc.code} downloading dataset {year}q{quarter}: {last_exc.reason}"
+        ) from last_exc
+    elif isinstance(last_exc, urllib.error.URLError):
         raise SECDatasetDownloadError(
-            f"URL error downloading dataset {year}q{quarter}: {exc.reason}"
-        ) from exc
-    except Exception as exc:
+            f"URL error downloading dataset {year}q{quarter}: {last_exc.reason}"
+        ) from last_exc
+    else:
         raise SECDatasetDownloadError(
-            f"Failed to download dataset {year}q{quarter}: {exc}"
-        ) from exc
+            f"Failed to download dataset {year}q{quarter}: {last_exc}"
+        ) from last_exc
 
 
 def download_dataset_zip(
@@ -161,9 +182,12 @@ def download_dataset_zip(
     quarter: int,
     user_agent: str,
     timeout: int = 60,
+    max_retries: int = 3,
+    backoff_factor: float = 1.0,
 ) -> bytes:
     """
     Legacy helper: download zip archive into memory bytes.
+    Includes bounded retries with exponential backoff for transient HTTP or network failures.
     """
     url = build_dataset_url(year, quarter)
     req = urllib.request.Request(
@@ -175,26 +199,43 @@ def download_dataset_zip(
         },
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            status = getattr(response, "status", 200)
-            if status != 200:
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            sleep_time = backoff_factor * (2 ** (attempt - 1))
+            time.sleep(sleep_time)
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                status = getattr(response, "status", 200)
+                if status != 200:
+                    raise SECDatasetDownloadError(
+                        f"HTTP status {status} downloading dataset {year}q{quarter} from {url}"
+                    )
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code == 404:
                 raise SECDatasetDownloadError(
-                    f"HTTP status {status} downloading dataset {year}q{quarter} from {url}"
-                )
-            return response.read()
-    except urllib.error.HTTPError as exc:
+                    f"HTTP {exc.code} downloading dataset {year}q{quarter}: {exc.reason}"
+                ) from exc
+        except urllib.error.URLError as exc:
+            last_exc = exc
+        except Exception as exc:
+            last_exc = exc
+
+    if isinstance(last_exc, urllib.error.HTTPError):
         raise SECDatasetDownloadError(
-            f"HTTP {exc.code} downloading dataset {year}q{quarter}: {exc.reason}"
-        ) from exc
-    except urllib.error.URLError as exc:
+            f"HTTP {last_exc.code} downloading dataset {year}q{quarter}: {last_exc.reason}"
+        ) from last_exc
+    elif isinstance(last_exc, urllib.error.URLError):
         raise SECDatasetDownloadError(
-            f"URL error downloading dataset {year}q{quarter}: {exc.reason}"
-        ) from exc
-    except Exception as exc:
+            f"URL error downloading dataset {year}q{quarter}: {last_exc.reason}"
+        ) from last_exc
+    else:
         raise SECDatasetDownloadError(
-            f"Failed to download dataset {year}q{quarter}: {exc}"
-        ) from exc
+            f"Failed to download dataset {year}q{quarter}: {last_exc}"
+        ) from last_exc
 
 
 def read_tsv_from_zip(
