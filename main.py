@@ -19,6 +19,7 @@ def run_historical_acquisition(
     start_period: str,
     end_period: str,
     batch_size: int = 5000,
+    force: bool = False,
 ) -> int:
     """
     Execute historical SEC dataset acquisition from start_period to end_period
@@ -65,8 +66,8 @@ def run_historical_acquisition(
     for year, qtr, period_str in period_range:
         periods_processed += 1
 
-        # Check resume state: skip completed periods; retry failed/partial/unknown
-        if state_mgr.should_skip_period(period_str):
+        # Check resume state: skip completed periods unless force=True; retry failed/partial/unknown
+        if not force and state_mgr.should_skip_period(period_str):
             print(f"Period {period_str}: Already completed. Skipping.")
             continue
 
@@ -233,8 +234,9 @@ def main() -> int:
         parser.add_argument("cmd", nargs="*")
         parser.add_argument("--start", default="2006-Q1", help="Start period (e.g. 2006-Q1)")
         parser.add_argument("--end", default="2026-Q2", help="End period (e.g. 2026-Q2)")
+        parser.add_argument("--force", action="store_true", help="Force re-processing of completed periods")
         args = parser.parse_args()
-        return run_historical_acquisition(args.start, args.end)
+        return run_historical_acquisition(args.start, args.end, force=args.force)
 
     try:
         settings = load_environment()
