@@ -278,3 +278,75 @@ def test_sec_historical_orchestrator_rejects_unsafe_historical_filename():
         orchestrator._extract_historical_filenames(
             malicious_submissions
   )
+
+
+def test_historical_acquisition_retry_previously_failed_period(
+    tmp_path,
+    monkeypatch,
+):
+    """
+    Verify historical acquisition can retry a period that previously failed after writing provenance,
+    without raising duplicate key error on dataset_period provenance.
+    """
+    import main
+    from data.acquisition_state import AcquisitionStateManager
+    from database.connection import connect
+    from storage.repository import store_provenance
+
+    db_file = tmp_path / "retry_test.db"
+    db_url = f"sqlite:///{db_file}"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/1.0 test@example.com")
+
+    # Simulate previous run that failed after writing dataset_period provenance
+    store_provenance(
+        db_url,
+        record_type="dataset_period",
+        record_id="2006-Q1",
+        source="SEC",
+        source_reference="https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/2006q1_form345.zip",
+        checksum="failed_checksum_123",
+        validation_status="validated",
+    )
+
+    state_mgr = AcquisitionStateManager(db_url)
+    state_mgr.record_period_completion(
+        period="2006-Q1",
+        records_parsed=0,
+        records_inserted=0,
+        duplicates_count=0,
+        invalid_count=0,
+        failures_count=1,
+        status="FAILED",
+    )
+
+    from tests.test_sec_bulk_datasets import create_mock_zip_bytes
+    mock_zip = create_mock_zip_bytes(case="default")
+
+    def mock_download(year, qtr, user_agent, target_path):
+        with open(target_path, "wb") as f:
+            f.write(mock_zip)
+
+    monkeypatch.setattr(
+        "data.sec_dataset_pipeline.download_dataset_zip_to_file",
+        mock_download,
+    )
+
+    res = main.run_historical_acquisition(
+        start_period="2006-Q1",
+        end_period="2006-Q1",
+    )
+
+    assert res == 0
+    assert state_mgr.get_period_status("2006-Q1") == "COMPLETED"
+
+    # Dataset-period provenance row count remains exactly 1
+    with connect(db_url) as conn:
+        prov_rows = conn.execute(
+            "SELECT record_type, record_id, source, checksum FROM provenance WHERE record_type = 'dataset_period'"
+        ).fetchall()
+
+    assert len(prov_rows) == 1
+    assert prov_rows[0]["record_id"] == "2006-Q1"
+    assert prov_rows[0]["checksum"] != "failed_checksum_123"
