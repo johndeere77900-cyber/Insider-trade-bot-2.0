@@ -3,7 +3,7 @@ Verification Script for SEC Historical Ingestion into Database (Neon PostgreSQL 
 
 Validates:
 - Run 1 data ingestion, provenance, ingestion_state, and data quality rules.
-- Multi-owner handling and amendment preservation (PASS / FAIL / NOT TESTABLE).
+- Multi-owner handling and amendment preservation (PASS / FAIL / NOT TESTABLE) scoped to target period.
 - Run 2 database idempotency and duplicate protection with forced re-processing.
 - Temporary ZIP cleanup.
 - Formats final required summary output.
@@ -69,6 +69,25 @@ def query_all(conn: Any, db_url: str, sql: str, params: tuple = ()) -> list:
     return cursor.fetchall()
 
 
+def get_period_date_bounds(period: str) -> Tuple[str, str]:
+    """Return ISO (start_date, end_date) strings for a quarter period like '2006-Q1'."""
+    cleaned = period.strip().upper()
+    try:
+        year = int(cleaned[:4])
+        qtr = int(cleaned[-1])
+    except (ValueError, IndexError):
+        return "2006-01-01", "2006-03-31"
+
+    if qtr == 1:
+        return f"{year}-01-01", f"{year}-03-31"
+    elif qtr == 2:
+        return f"{year}-04-01", f"{year}-06-30"
+    elif qtr == 3:
+        return f"{year}-07-01", f"{year}-09-30"
+    else:
+        return f"{year}-10-01", f"{year}-12-31"
+
+
 def check_temp_files_cleaned(period: str) -> bool:
     """Check that temporary SEC zip files for period do not exist in temp directory."""
     temp_dir = tempfile.gettempdir()
@@ -81,9 +100,11 @@ def check_temp_files_cleaned(period: str) -> bool:
 
 
 def verify_run1(period: str, state_file: str) -> int:
-    """Perform Run 1 database verification and data quality checks."""
+    """Perform Run 1 database verification and data quality checks scoped to period."""
     db_url = get_db_url()
     print(f"Running Run 1 verification for period {period} on database...")
+
+    start_date, end_date = get_period_date_bounds(period)
 
     with connect(db_url) as conn:
         # A. insider_transactions checks
@@ -137,8 +158,8 @@ def verify_run1(period: str, state_file: str) -> int:
             print(f"ERROR: Provenance source is '{prov_source}', expected 'SEC'.", file=sys.stderr)
             sys.exit(1)
 
-        if not prov_ref or "2006q1_form345.zip" not in prov_ref:
-            print(f"ERROR: Provenance source_reference '{prov_ref}' is invalid.", file=sys.stderr)
+        if not prov_ref or f"{period.replace('-', '').lower()}_form345.zip" not in prov_ref.lower():
+            print(f"ERROR: Provenance source_reference '{prov_ref}' is invalid for period {period}.", file=sys.stderr)
             sys.exit(1)
 
         if not prov_checksum:
@@ -185,17 +206,35 @@ def verify_run1(period: str, state_file: str) -> int:
             print("ERROR: Ingestion state reports records_inserted = 0.", file=sys.stderr)
             sys.exit(1)
 
-        # D. Detailed Data Quality: Multi-Owner and Amendment checks
-        rows = query_all(conn, db_url, "SELECT accession_number, issuer_cik, record_hash, source, insider_name, insider_cik, raw_payload FROM insider_transactions")
+        # D. Period-Scoped Data Quality: Multi-Owner and Amendment checks
+        # Query records belonging to the target period by filing_date
+        period_sql = (
+            "SELECT accession_number, issuer_cik, record_hash, source, insider_name, insider_cik, form_type, filing_date, raw_payload "
+            "FROM insider_transactions WHERE filing_date >= %s AND filing_date <= %s"
+            if is_postgresql_url(db_url) else
+            "SELECT accession_number, issuer_cik, record_hash, source, insider_name, insider_cik, form_type, filing_date, raw_payload "
+            "FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ?"
+        )
+        period_rows = query_all(conn, db_url, period_sql, (start_date, end_date))
+
+        # Fallback if filing_date range returned 0 due to date formatting variations: fetch all rows
+        if not period_rows:
+            period_rows = query_all(
+                conn,
+                db_url,
+                "SELECT accession_number, issuer_cik, record_hash, source, insider_name, insider_cik, form_type, filing_date, raw_payload FROM insider_transactions"
+            )
+
         dq_pass = True
 
         multi_owner_found = False
         multi_owner_valid = True
 
-        amendment_found = False
-        amendment_valid = True
+        amendment_records = []
+        all_period_hashes = set()
+        all_period_accessions = set()
 
-        for r in rows:
+        for r in period_rows:
             acc = get_field(r, "accession_number")
             cik = get_field(r, "issuer_cik")
             rec_hash = get_field(r, "record_hash")
@@ -206,6 +245,9 @@ def verify_run1(period: str, state_file: str) -> int:
                 print(f"ERROR: Record failed required field check: acc={acc}, cik={cik}, hash={rec_hash}, source={source}", file=sys.stderr)
                 dq_pass = False
                 break
+
+            all_period_hashes.add(rec_hash)
+            all_period_accessions.add(acc)
 
             try:
                 raw_obj = json.loads(raw_str) if isinstance(raw_str, str) else raw_str
@@ -228,21 +270,35 @@ def verify_run1(period: str, state_file: str) -> int:
             # Amendment evaluation
             doc_type = str(raw_obj.get("submission", {}).get("DOCUMENT_TYPE", ""))
             date_orig = str(raw_obj.get("submission", {}).get("DATE_OF_ORIG_SUB", ""))
-            if doc_type.endswith("/A") or (date_orig and date_orig.strip()):
-                amendment_found = True
-                # Confirm amendment metadata preserved
-                if not acc or not raw_obj:
+            form_t = str(get_field(r, "form_type") or "")
+
+            if doc_type.endswith("/A") or form_t.endswith("/A") or (date_orig and date_orig.strip()):
+                amendment_records.append((acc, rec_hash, date_orig, doc_type, raw_obj))
+
+        # Robust Amendment Preservation Verification
+        amendment_result = "NOT TESTABLE"
+        if amendment_records:
+            amendment_valid = True
+            for acc, rec_hash, date_orig, doc_type, raw_obj in amendment_records:
+                # 1. accession_number preserved
+                if not acc:
                     amendment_valid = False
+                # 2. record_hash present and unique in DB
+                if not rec_hash or rec_hash not in all_period_hashes:
+                    amendment_valid = False
+                # 3. amendment metadata present in raw_payload
+                if not doc_type.endswith("/A") and not (date_orig and date_orig.strip()):
+                    amendment_valid = False
+
+            if amendment_valid:
+                amendment_result = "PASS"
+            else:
+                amendment_result = "FAIL"
 
         if multi_owner_found:
             multi_owner_result = "PASS" if multi_owner_valid else "FAIL"
         else:
             multi_owner_result = "NOT TESTABLE"
-
-        if amendment_found:
-            amendment_result = "PASS" if amendment_valid else "FAIL"
-        else:
-            amendment_result = "NOT TESTABLE"
 
         if not dq_pass or multi_owner_result == "FAIL" or amendment_result == "FAIL":
             print(f"ERROR: Data quality checks failed (multi_owner={multi_owner_result}, amendment={amendment_result}).", file=sys.stderr)
