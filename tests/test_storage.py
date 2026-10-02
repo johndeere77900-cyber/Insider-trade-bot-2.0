@@ -106,3 +106,86 @@ def test_postgresql_transaction_date_query_no_empty_string_comparison() -> None:
         "SELECT MIN(transaction_date), MAX(transaction_date) FROM insider_transactions WHERE transaction_date IS NOT NULL AND transaction_date != ''"
     )
     assert "!= ''" in main_sqlite_sql
+
+
+def test_store_provenance_idempotent_sqlite(tmp_path) -> None:
+    """Test that repeated store_provenance calls for the same record key do not fail and update fields."""
+    from database.connection import connect
+    from storage.repository import count_records, store_provenance
+
+    db_url = f"sqlite:///{tmp_path / 'provenance_test.db'}"
+
+    # 1. First dataset-period provenance insert succeeds.
+    store_provenance(
+        db_url,
+        record_type="dataset_period",
+        record_id="2006-Q1",
+        source="SEC",
+        source_reference="http://example.com/2006q1.zip",
+        checksum="checksum_v1",
+        validation_status="validated",
+    )
+
+    assert count_records(db_url, "provenance") == 1
+
+    with connect(db_url) as conn:
+        row = conn.execute(
+            "SELECT source_reference, checksum, validation_status FROM provenance WHERE record_id = '2006-Q1'"
+        ).fetchone()
+        assert row["source_reference"] == "http://example.com/2006q1.zip"
+        assert row["checksum"] == "checksum_v1"
+
+    # 2. Repeating the same dataset-period provenance write does NOT raise a unique-constraint error.
+    store_provenance(
+        db_url,
+        record_type="dataset_period",
+        record_id="2006-Q1",
+        source="SEC",
+        source_reference="http://example.com/2006q1_retry.zip",
+        checksum="checksum_v2",
+        validation_status="validated",
+    )
+
+    # 3. Provenance row count remains exactly one.
+    assert count_records(db_url, "provenance") == 1
+
+    # 4. The latest checksum/status/retrieval information remains valid.
+    with connect(db_url) as conn:
+        row = conn.execute(
+            "SELECT source_reference, checksum, validation_status FROM provenance WHERE record_id = '2006-Q1'"
+        ).fetchone()
+        assert row["source_reference"] == "http://example.com/2006q1_retry.zip"
+        assert row["checksum"] == "checksum_v2"
+
+
+def test_store_provenance_idempotent_postgresql(monkeypatch) -> None:
+    """Test that store_provenance uses ON CONFLICT for PostgreSQL and includes DO UPDATE SET clause."""
+    from unittest.mock import MagicMock
+    import storage.repository as repo
+    import database.connection as db_conn
+
+    mock_conn = MagicMock()
+
+    conn_cm = MagicMock()
+    conn_cm.__enter__.return_value = mock_conn
+
+    monkeypatch.setattr(repo, "connect", lambda url: conn_cm)
+    monkeypatch.setattr(db_conn, "connect", lambda url: conn_cm)
+    monkeypatch.setattr(repo, "is_postgresql_url", lambda url: True)
+    monkeypatch.setattr(repo, "initialize_database", lambda url: None)
+
+    pg_url = "postgresql://user:pass@localhost:5432/testdb"
+    repo.store_provenance(
+        pg_url,
+        record_type="dataset_period",
+        record_id="2006-Q1",
+        source="SEC",
+        source_reference="http://example.com/2006q1.zip",
+        checksum="checksum1",
+        validation_status="validated",
+    )
+
+    assert mock_conn.execute.called
+    executed_sql = mock_conn.execute.call_args[0][0]
+    assert "ON CONFLICT (record_type, record_id, source)" in executed_sql
+    assert "DO UPDATE SET" in executed_sql

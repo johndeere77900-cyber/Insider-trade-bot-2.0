@@ -124,7 +124,7 @@ def store_provenance(
     checksum: str | None,
     validation_status: str,
 ) -> None:
-    """Store provenance information for a record."""
+    """Store provenance information for a record (idempotent)."""
 
     if not record_type.strip():
         raise ValueError("record_type cannot be empty.")
@@ -163,6 +163,12 @@ def store_provenance(
                 {placeholder},
                 {placeholder}
             )
+            ON CONFLICT (record_type, record_id, source)
+            DO UPDATE SET
+                source_reference = EXCLUDED.source_reference,
+                retrieved_at = EXCLUDED.retrieved_at,
+                checksum = EXCLUDED.checksum,
+                validation_status = EXCLUDED.validation_status
             """,
             (
                 record_type,
