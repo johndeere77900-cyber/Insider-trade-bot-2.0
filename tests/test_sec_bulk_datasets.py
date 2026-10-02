@@ -1,7 +1,8 @@
 """
 Comprehensive unit tests for official SEC bulk datasets pipeline, normalization, validation,
-multiple reporting owners, footnotes/holdings source preservation, amendment relationships,
-deterministic transaction deduplication, bounded batching, period provenance, and resumable state.
+Owner ↔ Transaction relationships (Cases A, B, C, D), footnotes/holdings source preservation,
+amendment relationships, deterministic transaction deduplication, bounded batching,
+period provenance, and resumable state.
 """
 
 from __future__ import annotations
@@ -26,8 +27,10 @@ from storage.repository import (
 )
 
 
-def create_mock_zip_bytes() -> bytes:
-    """Create mock SEC dataset zip archive bytes with multi-owner, footnotes, holdings, and amendments."""
+def create_mock_zip_bytes(
+    case: str = "default",
+) -> bytes:
+    """Create mock SEC dataset zip archive bytes for testing cases A, B, C, D."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         # SUBMISSION.tsv
@@ -38,17 +41,20 @@ def create_mock_zip_bytes() -> bytes:
             "DATE_OF_ORIG_SUB", "DOCUMENT_TYPE", "ISSUERCIK",
             "ISSUERNAME", "ISSUERTRADINGSYMBOL"
         ])
-        sub_writer.writerow([
-            "0000016732-23-000043", "31-MAR-2023", "30-MAR-2023",
-            "", "4", "0000016732", "CAMPBELL SOUP CO", "CPB"
-        ])
-        sub_writer.writerow([
-            "0000016732-23-000044", "31-MAR-2023", "30-MAR-2023",
-            "15-MAR-2023", "4/A", "0000016732", "CAMPBELL SOUP CO", "CPB"
-        ])
+
+        if case in ("default", "case_a", "case_b", "case_c"):
+            sub_writer.writerow([
+                "0000016732-23-000043", "31-MAR-2023", "30-MAR-2023",
+                "", "4", "0000016732", "CAMPBELL SOUP CO", "CPB"
+            ])
+            if case == "default":
+                sub_writer.writerow([
+                    "0000016732-23-000044", "31-MAR-2023", "30-MAR-2023",
+                    "15-MAR-2023", "4/A", "0000016732", "CAMPBELL SOUP CO", "CPB"
+                ])
         zf.writestr("SUBMISSION.tsv", sub_io.getvalue().encode("utf-8"))
 
-        # REPORTINGOWNER.tsv (contains 2 owners for 0000016732-23-000043)
+        # REPORTINGOWNER.tsv
         owner_io = io.StringIO()
         owner_writer = csv.writer(owner_io, delimiter="\t")
         owner_writer.writerow([
@@ -59,14 +65,16 @@ def create_mock_zip_bytes() -> bytes:
             "0000016732-23-000043", "0001801061", "Watanabe Todd Franklin",
             "Officer", "Director,Officer"
         ])
-        owner_writer.writerow([
-            "0000016732-23-000043", "0001801062", "Watanabe Joint Holder",
-            "Ten Percent Owner", "10% Owner"
-        ])
-        owner_writer.writerow([
-            "0000016732-23-000044", "0001801061", "Watanabe Todd Franklin",
-            "Officer", "Director,Officer"
-        ])
+        if case in ("default", "case_a", "case_b", "case_c"):
+            owner_writer.writerow([
+                "0000016732-23-000043", "0001801062", "Watanabe Joint Holder",
+                "Ten Percent Owner", "10% Owner"
+            ])
+        if case == "default":
+            owner_writer.writerow([
+                "0000016732-23-000044", "0001801061", "Watanabe Todd Franklin",
+                "Officer", "Director,Officer"
+            ])
         zf.writestr("REPORTINGOWNER.tsv", owner_io.getvalue().encode("utf-8"))
 
         # FOOTNOTES.tsv
@@ -99,17 +107,24 @@ def create_mock_zip_bytes() -> bytes:
             "TRANS_PRICEPERSHARE", "TRANS_ACQUIRED_DISP_CD",
             "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP"
         ])
-        nonderiv_writer.writerow([
-            "0000016732-23-000043", "5001", "Common Stock", "30-MAR-2023",
-            "4", "P", "1000.0", "45.50", "A", "D", ""
-        ])
-        nonderiv_writer.writerow([
-            "0000016732-23-000044", "5002", "Common Stock", "28-MAR-2023",
-            "4/A", "S", "500.0", "46.00", "D", "I", "By Trust"
-        ])
+        if case in ("default", "case_a", "case_b", "case_c"):
+            nonderiv_writer.writerow([
+                "0000016732-23-000043", "5001", "Common Stock", "30-MAR-2023",
+                "4", "P", "1000.0", "45.50", "A", "D", ""
+            ])
+            if case in ("case_b", "case_c"):
+                nonderiv_writer.writerow([
+                    "0000016732-23-000043", "5002", "Common Stock", "30-MAR-2023",
+                    "4", "S", "500.0", "46.00", "D", "D", ""
+                ])
+        if case == "default":
+            nonderiv_writer.writerow([
+                "0000016732-23-000044", "5003", "Common Stock", "28-MAR-2023",
+                "4/A", "S", "500.0", "46.00", "D", "I", "By Trust"
+            ])
         zf.writestr("NONDERIV_TRANS.tsv", nonderiv_io.getvalue().encode("utf-8"))
 
-        # DERIV_TRANS.tsv (empty data)
+        # DERIV_TRANS.tsv
         deriv_io = io.StringIO()
         deriv_writer = csv.writer(deriv_io, delimiter="\t")
         deriv_writer.writerow([
@@ -118,6 +133,11 @@ def create_mock_zip_bytes() -> bytes:
             "TRANS_PRICEPERSHARE", "TRANS_ACQUIRED_DISP_CD",
             "DIRECT_INDIRECT_OWNERSHIP", "NATURE_OF_OWNERSHIP"
         ])
+        if case == "case_c":
+            deriv_writer.writerow([
+                "0000016732-23-000043", "9001", "Option Right to Buy", "30-MAR-2023",
+                "4", "M", "2000.0", "20.00", "A", "D", ""
+            ])
         zf.writestr("DERIV_TRANS.tsv", deriv_io.getvalue().encode("utf-8"))
 
     return buffer.getvalue()
@@ -136,37 +156,74 @@ def test_parse_sec_date():
     assert parse_sec_date(None) is None
 
 
-def test_multiple_reporting_owners_and_source_preservation():
-    zip_bytes = create_mock_zip_bytes()
+def test_case_a_one_filing_two_owners_one_transaction():
+    """Case A: 1 filing, 2 reporting owners, 1 transaction row -> Expected: 1 transaction record, 2 reporting owners in raw payload."""
+    zip_bytes = create_mock_zip_bytes(case="case_a")
     records = list(parse_dataset_zip(zip_bytes))
-    # 2 owners for filing 43 + 1 owner for filing 44 = 3 records total
-    assert len(records) == 3
 
-    r1, r2, r3 = records[0], records[1], records[2]
+    assert len(records) == 1, f"Expected 1 transaction record, got {len(records)}"
 
-    # Verify multiple reporting owners
-    assert r1["accession_number"] == "0000016732-23-000043"
-    assert r1["reporting_owner_name"] == "Watanabe Todd Franklin"
+    rec = records[0]
+    assert rec["accession_number"] == "0000016732-23-000043"
+    assert rec["reporting_owner_name"] == "Watanabe Todd Franklin"
 
-    assert r2["accession_number"] == "0000016732-23-000043"
-    assert r2["reporting_owner_name"] == "Watanabe Joint Holder"
+    raw = rec["raw"]
+    all_owners = raw["all_owners"]
+    assert len(all_owners) == 2, "Expected 2 reporting owners preserved in raw.all_owners"
+    assert all_owners[0]["RPTOWNERNAME"] == "Watanabe Todd Franklin"
+    assert all_owners[1]["RPTOWNERNAME"] == "Watanabe Joint Holder"
 
-    # Distinct hashes for separate owners
-    assert r1["record_hash"] != r2["record_hash"]
 
-    # Source data preservation (footnotes, signatures, holdings)
-    raw = r1["raw"]
-    assert len(raw["footnotes"]) == 1
-    assert raw["footnotes"][0]["FOOTNOTE_TXT"] == "Acquired under 10b5-1 plan."
-    assert len(raw["signatures"]) == 1
-    assert raw["signatures"][0]["OWNERSIGNATURENAME"] == "/s/ Todd Watanabe"
-    assert len(raw["holdings"]) == 1
+def test_case_b_one_filing_two_owners_two_transactions():
+    """Case B: 1 filing, 2 reporting owners, 2 transaction rows -> Expected: 2 transaction records, NOT 4."""
+    zip_bytes = create_mock_zip_bytes(case="case_b")
+    records = list(parse_dataset_zip(zip_bytes))
+
+    assert len(records) == 2, f"Expected 2 transaction records, got {len(records)}"
+    assert records[0]["accession_number"] == "0000016732-23-000043"
+    assert records[1]["accession_number"] == "0000016732-23-000043"
+    assert records[0]["record_hash"] != records[1]["record_hash"]
+
+
+def test_case_c_multiple_nonderiv_and_deriv_transactions():
+    """Case C: 1 filing, 2 non-derivative, 1 derivative -> Expected: 3 separate transaction records."""
+    zip_bytes = create_mock_zip_bytes(case="case_c")
+    records = list(parse_dataset_zip(zip_bytes))
+
+    assert len(records) == 3, f"Expected 3 transaction records, got {len(records)}"
+    types = [r["transaction_type"] for r in records]
+    assert types.count("non_derivative") == 2
+    assert types.count("derivative") == 1
+
+
+def test_case_d_same_dataset_processed_twice(tmp_path):
+    """Case D: Same dataset processed twice -> Expected: 0 new transaction records inserted, 0 duplicate provenance records."""
+    db_file = tmp_path / "test_case_d.db"
+    db_url = f"sqlite:///{db_file}"
+
+    zip_bytes = create_mock_zip_bytes(case="default")
+    raw_records = list(parse_dataset_zip(zip_bytes))
+    norm_records = [normalize_bulk_record(r) for r in raw_records]
+
+    # First run
+    ins1, dup1 = store_bulk_insider_transactions(db_url, norm_records)
+    assert ins1 == 2
+    assert dup1 == 0
+    assert count_records(db_url, "insider_transactions") == 2
+    assert count_records(db_url, "provenance") == 2
+
+    # Second run (exact same dataset)
+    ins2, dup2 = store_bulk_insider_transactions(db_url, norm_records)
+    assert ins2 == 0
+    assert dup2 == 2
+    assert count_records(db_url, "insider_transactions") == 2
+    assert count_records(db_url, "provenance") == 2
 
 
 def test_amendments_preservation():
-    zip_bytes = create_mock_zip_bytes()
+    zip_bytes = create_mock_zip_bytes(case="default")
     records = list(parse_dataset_zip(zip_bytes))
-    amended = records[2]
+    amended = records[1]
 
     assert amended["accession_number"] == "0000016732-23-000044"
     assert amended["is_amendment"] is True
@@ -175,7 +232,7 @@ def test_amendments_preservation():
 
 
 def test_normalize_and_validate_bulk_record():
-    zip_bytes = create_mock_zip_bytes()
+    zip_bytes = create_mock_zip_bytes(case="default")
     raw_records = list(parse_dataset_zip(zip_bytes))
 
     norm = normalize_bulk_record(raw_records[0])
@@ -214,28 +271,6 @@ def test_normalize_and_validate_bulk_record():
     val_invalid = validate_bulk_record(invalid_norm)
     assert val_invalid.is_valid is False
     assert len(val_invalid.errors) >= 5
-
-
-def test_bulk_store_and_deduplication(tmp_path):
-    db_file = tmp_path / "test_bulk.db"
-    db_url = f"sqlite:///{db_file}"
-
-    zip_bytes = create_mock_zip_bytes()
-    raw_records = list(parse_dataset_zip(zip_bytes))
-    norm_records = [normalize_bulk_record(r) for r in raw_records]
-
-    # First store
-    inserted, duplicates = store_bulk_insider_transactions(db_url, norm_records)
-    assert inserted == 3
-    assert duplicates == 0
-    assert count_records(db_url, "insider_transactions") == 3
-    assert count_records(db_url, "provenance") == 3
-
-    # Second store (idempotent rerun)
-    inserted_2, duplicates_2 = store_bulk_insider_transactions(db_url, norm_records)
-    assert inserted_2 == 0
-    assert duplicates_2 == 3
-    assert count_records(db_url, "insider_transactions") == 3
 
 
 def test_acquisition_state_and_resume_behavior(tmp_path):

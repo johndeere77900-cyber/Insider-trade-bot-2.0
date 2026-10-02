@@ -172,8 +172,6 @@ def read_tsv_from_zip(
 
 def compute_transaction_identity(
     accession_number: str,
-    reporting_owner_cik: str,
-    reporting_owner_name: str,
     transaction_type: str,
     transaction_sk: str,
     security_title: str,
@@ -183,25 +181,25 @@ def compute_transaction_identity(
     price_per_share: Any,
     acquired_disposed: str,
     is_amendment: bool,
+    form_type: str = "",
 ) -> str:
     """
-    Create a deterministic, highly collision-resistant transaction identity hash.
-    Distinguishes separate owners, transaction rows, derivative vs non-derivative,
-    securities, dates, codes, quantities, prices, and amendments.
+    Create a deterministic, unique SEC transaction identity hash based on SEC source keys.
+    Key structure: ACCESSION_NUMBER + transaction_type + transaction_sk + form_type + is_amendment + transaction fields.
+    Guarantees 1 transaction record per SEC transaction row.
     """
     raw_key = (
         f"{accession_number}|"
-        f"{reporting_owner_cik}|"
-        f"{reporting_owner_name}|"
         f"{transaction_type}|"
         f"{transaction_sk}|"
+        f"{form_type}|"
+        f"{'1' if is_amendment else '0'}|"
         f"{security_title}|"
         f"{transaction_date}|"
         f"{transaction_code}|"
         f"{shares}|"
         f"{price_per_share}|"
-        f"{acquired_disposed}|"
-        f"{'1' if is_amendment else '0'}"
+        f"{acquired_disposed}"
     )
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
@@ -215,7 +213,7 @@ def parse_dataset_zip(
 
     Combines:
     - SUBMISSION.tsv
-    - REPORTINGOWNER.tsv (supports multiple owners per accession)
+    - REPORTINGOWNER.tsv (preserves all reporting owners without multiplying transactions)
     - NONDERIV_TRANS.tsv
     - DERIV_TRANS.tsv
     - NONDERIV_HOLDING.tsv / DERIV_HOLDING.tsv
@@ -279,13 +277,15 @@ def parse_dataset_zip(
                 deriv_holdings[acc] = []
             deriv_holdings[acc].append(row)
 
-    def build_records_for_transaction(
+    def build_record_for_transaction(
         acc: str,
         trans_row: Dict[str, str],
         transaction_type: str,  # 'non_derivative' or 'derivative'
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         sub_info = submissions.get(acc, {})
         owners_list = reporting_owners.get(acc, [{}])
+        primary_owner = owners_list[0] if owners_list else {}
+
         fn_list = footnotes.get(acc, [])
         sig_list = signatures.get(acc, [])
         hld_list = (
@@ -311,90 +311,85 @@ def parse_dataset_zip(
         doc_type = sub_info.get("DOCUMENT_TYPE", "")
         is_amendment = bool(date_orig_sub) or doc_type.endswith("/A")
 
-        records = []
         trans_sk = (
             trans_row.get("NONDERIV_TRANS_SK")
             if transaction_type == "non_derivative"
             else trans_row.get("DERIV_TRANS_SK")
         ) or ""
 
-        for owner_info in owners_list:
-            owner_cik = owner_info.get("RPTOWNERCIK", "")
-            if owner_cik and owner_cik.isdigit():
-                owner_cik = owner_cik.zfill(10)
+        owner_cik = primary_owner.get("RPTOWNERCIK", "")
+        if owner_cik and owner_cik.isdigit():
+            owner_cik = owner_cik.zfill(10)
 
-            owner_name = owner_info.get("RPTOWNERNAME", "")
+        owner_name = primary_owner.get("RPTOWNERNAME", "")
 
-            # Deterministic transaction identity
-            rec_hash = compute_transaction_identity(
-                accession_number=acc,
-                reporting_owner_cik=owner_cik,
-                reporting_owner_name=owner_name,
-                transaction_type=transaction_type,
-                transaction_sk=str(trans_sk),
-                security_title=trans_row.get("SECURITY_TITLE", ""),
-                transaction_date=trans_date or "",
-                transaction_code=trans_row.get("TRANS_CODE", ""),
-                shares=trans_row.get("TRANS_SHARES", ""),
-                price_per_share=trans_row.get("TRANS_PRICEPERSHARE", ""),
-                acquired_disposed=trans_row.get("TRANS_ACQUIRED_DISP_CD", ""),
-                is_amendment=is_amendment,
-            )
+        form_type = trans_row.get("TRANS_FORM_TYPE") or doc_type or "4"
 
-            rec_source_url = source_url or f"https://www.sec.gov/Archives/edgar/data/{clean_issuer_cik_dir}/{acc.replace('-', '')}/{acc}.txt"
+        # Deterministic SEC transaction identity (1 transaction record per SEC transaction row)
+        rec_hash = compute_transaction_identity(
+            accession_number=acc,
+            transaction_type=transaction_type,
+            transaction_sk=str(trans_sk),
+            security_title=trans_row.get("SECURITY_TITLE", ""),
+            transaction_date=trans_date or "",
+            transaction_code=trans_row.get("TRANS_CODE", ""),
+            shares=trans_row.get("TRANS_SHARES", ""),
+            price_per_share=trans_row.get("TRANS_PRICEPERSHARE", ""),
+            acquired_disposed=trans_row.get("TRANS_ACQUIRED_DISP_CD", ""),
+            is_amendment=is_amendment,
+            form_type=form_type,
+        )
 
-            record = {
-                "accession_number": acc,
-                "source": "SEC",
-                "source_url": rec_source_url,
-                "form_type": trans_row.get("TRANS_FORM_TYPE") or doc_type or "4",
-                "filing_date": filing_date,
-                "transaction_date": trans_date,
-                "issuer_cik": issuer_cik,
-                "issuer_name": sub_info.get("ISSUERNAME", ""),
-                "ticker": sub_info.get("ISSUERTRADINGSYMBOL", ""),
-                "reporting_owner_cik": owner_cik,
-                "reporting_owner_name": owner_name,
-                "reporting_owner_title": owner_info.get("RPTOWNER_TITLE", ""),
-                "reporting_owner_relationship": owner_info.get("RPTOWNER_RELATIONSHIP", ""),
-                "security_title": trans_row.get("SECURITY_TITLE", ""),
-                "transaction_code": trans_row.get("TRANS_CODE", ""),
-                "shares": trans_row.get("TRANS_SHARES", ""),
-                "price_per_share": trans_row.get("TRANS_PRICEPERSHARE", ""),
-                "acquired_disposed": trans_row.get("TRANS_ACQUIRED_DISP_CD", ""),
-                "direct_indirect": trans_row.get("DIRECT_INDIRECT_OWNERSHIP", ""),
-                "ownership_nature": trans_row.get("NATURE_OF_OWNERSHIP", ""),
-                "transaction_type": transaction_type,
-                "is_amendment": is_amendment,
-                "date_of_orig_submission": parse_sec_date(date_orig_sub) if date_orig_sub else None,
-                "record_hash": rec_hash,
-                "raw": {
-                    "submission": sub_info,
-                    "owner": owner_info,
-                    "all_owners": owners_list,
-                    "transaction": trans_row,
-                    "footnotes": fn_list,
-                    "signatures": sig_list,
-                    "holdings": hld_list,
-                },
-            }
-            records.append(record)
+        rec_source_url = source_url or f"https://www.sec.gov/Archives/edgar/data/{clean_issuer_cik_dir}/{acc.replace('-', '')}/{acc}.txt"
 
-        return records
+        record = {
+            "accession_number": acc,
+            "source": "SEC",
+            "source_url": rec_source_url,
+            "form_type": form_type,
+            "filing_date": filing_date,
+            "transaction_date": trans_date,
+            "issuer_cik": issuer_cik,
+            "issuer_name": sub_info.get("ISSUERNAME", ""),
+            "ticker": sub_info.get("ISSUERTRADINGSYMBOL", ""),
+            "reporting_owner_cik": owner_cik,
+            "reporting_owner_name": owner_name,
+            "reporting_owner_title": primary_owner.get("RPTOWNER_TITLE", ""),
+            "reporting_owner_relationship": primary_owner.get("RPTOWNER_RELATIONSHIP", ""),
+            "security_title": trans_row.get("SECURITY_TITLE", ""),
+            "transaction_code": trans_row.get("TRANS_CODE", ""),
+            "shares": trans_row.get("TRANS_SHARES", ""),
+            "price_per_share": trans_row.get("TRANS_PRICEPERSHARE", ""),
+            "acquired_disposed": trans_row.get("TRANS_ACQUIRED_DISP_CD", ""),
+            "direct_indirect": trans_row.get("DIRECT_INDIRECT_OWNERSHIP", ""),
+            "ownership_nature": trans_row.get("NATURE_OF_OWNERSHIP", ""),
+            "transaction_type": transaction_type,
+            "is_amendment": is_amendment,
+            "date_of_orig_submission": parse_sec_date(date_orig_sub) if date_orig_sub else None,
+            "record_hash": rec_hash,
+            "raw": {
+                "submission": sub_info,
+                "owner": primary_owner,
+                "all_owners": owners_list,
+                "transaction": trans_row,
+                "footnotes": fn_list,
+                "signatures": sig_list,
+                "holdings": hld_list,
+            },
+        }
+        return record
 
-    # Parse non-derivative transactions
+    # Parse non-derivative transactions (1 record per transaction row)
     for row in read_tsv_from_zip(zf, "NONDERIV_TRANS.tsv"):
         acc = row.get("ACCESSION_NUMBER", "")
         if acc:
-            for rec in build_records_for_transaction(acc, row, "non_derivative"):
-                yield rec
+            yield build_record_for_transaction(acc, row, "non_derivative")
 
-    # Parse derivative transactions
+    # Parse derivative transactions (1 record per transaction row)
     for row in read_tsv_from_zip(zf, "DERIV_TRANS.tsv"):
         acc = row.get("ACCESSION_NUMBER", "")
         if acc:
-            for rec in build_records_for_transaction(acc, row, "derivative"):
-                yield rec
+            yield build_record_for_transaction(acc, row, "derivative")
 
 
 def normalize_bulk_record(raw_record: Dict[str, Any]) -> NormalizedBulkTransaction:
@@ -485,7 +480,6 @@ def validate_bulk_record(record: NormalizedBulkTransaction) -> BulkValidationRes
             errors.append(f"Invalid date_of_orig_submission format: {record.date_of_orig_submission}")
 
     if record.transaction_date and record.filing_date:
-        # A transaction date far in the future compared to filing date is suspicious
         try:
             t_dt = datetime.strptime(record.transaction_date, "%Y-%m-%d")
             f_dt = datetime.strptime(record.filing_date, "%Y-%m-%d")
