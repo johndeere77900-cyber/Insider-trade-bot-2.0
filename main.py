@@ -182,10 +182,13 @@ def run_historical_acquisition(
     earliest_date = None
     latest_date = None
 
+    tx_date_sql = (
+        "SELECT MIN(transaction_date), MAX(transaction_date) FROM insider_transactions WHERE transaction_date IS NOT NULL"
+        if is_postgresql_url(db_url) else
+        "SELECT MIN(transaction_date), MAX(transaction_date) FROM insider_transactions WHERE transaction_date IS NOT NULL AND transaction_date != ''"
+    )
     with connect(db_url) as conn:
-        cursor = conn.execute(
-            "SELECT MIN(transaction_date), MAX(transaction_date) FROM insider_transactions WHERE transaction_date IS NOT NULL AND transaction_date != ''"
-        )
+        cursor = conn.execute(tx_date_sql)
         row = cursor.fetchone()
         if row:
             if is_postgresql_url(db_url):

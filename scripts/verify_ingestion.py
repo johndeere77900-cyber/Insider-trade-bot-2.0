@@ -129,7 +129,7 @@ def verify_run1(period: str, state_file: str) -> int:
         date_range_sql = (
             "SELECT MIN(transaction_date) AS min_d, MAX(transaction_date) AS max_d "
             "FROM insider_transactions WHERE filing_date >= %s AND filing_date <= %s "
-            "AND transaction_date IS NOT NULL AND transaction_date != ''"
+            "AND transaction_date IS NOT NULL"
             if is_postgresql_url(db_url) else
             "SELECT MIN(transaction_date) AS min_d, MAX(transaction_date) AS max_d "
             "FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ? "

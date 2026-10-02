@@ -405,8 +405,14 @@ def store_bulk_insider_transactions(
                 VALUES ({prov_placeholder_str})
             """
 
-        connection.executemany(insert_sql, rows_to_insert)
-        connection.executemany(prov_sql, provenance_rows)
+        if is_postgresql_url(database_url):
+            with connection.cursor() as cursor:
+                cursor.executemany(insert_sql, rows_to_insert)
+                cursor.executemany(prov_sql, provenance_rows)
+        else:
+            connection.executemany(insert_sql, rows_to_insert)
+            connection.executemany(prov_sql, provenance_rows)
+
         connection.commit()
 
     final_count = count_records(database_url, "insider_transactions")
