@@ -4,6 +4,44 @@ Insider Trade Bot 2.0 is a Python-based research and trading system designed
 for historical insider-trading analysis, market-data research, event studies,
 signal generation, backtesting, paper trading, and controlled execution.
 
+## Target Storage Architecture
+
+Insider Trade Bot 2.0 uses a tiered, cost-efficient storage architecture designed for Neon PostgreSQL constraints:
+
+```
+SEC Quarterly ZIP (Official SEC Data)
+    ↓
+Immutable Raw Dataset Archive (Disk / S3 / R2 cold storage)
+    ↓
+Normalized Operational Database (Neon PostgreSQL)
+    ↓
+Research & Signal Engine
+```
+
+1. **Normalized Operational Database (Neon):** Retains parsed, normalized transaction fields required for querying, signal generation, and research (`insider_transactions`, `ingestion_state`, `dataset_period` provenance).
+2. **Immutable Raw Archive:** Preserves complete quarterly SEC datasets and raw payloads separately for full auditing/reprocessing without bloating database index storage.
+3. **Dataset-Level Provenance:** Provenance is tracked at the dataset period level (`dataset_period`) rather than per-transaction.
+
+## Storage Recovery Production Sequence
+
+When recovering Neon storage or preparing for production historical SEC backfill, execute the following explicit maintenance sequence:
+
+1. **Merge Code Changes:** Deploy the storage architecture repair PR.
+2. **Run Storage Audit:** Inspect database storage usage:
+   `python main.py storage-audit`
+3. **Run Redundant Index Migration:** Drop duplicate index `idx_insider_tx_uniq`:
+   `python scripts/migrate_storage.py`
+4. **Verify Storage Recovery:** Confirm index storage space has been reclaimed in Neon.
+5. **Audit Legacy Provenance:** Verify legacy transaction-level provenance rows and safety prerequisites:
+   `python main.py storage-maintenance provenance-audit`
+6. **Perform Explicit Legacy Provenance Cleanup:** Clean up legacy per-transaction provenance rows:
+   Dry-run mode: `python main.py storage-maintenance provenance-cleanup --dry-run`
+   Execute mode: `python main.py storage-maintenance provenance-cleanup --execute`
+7. **Run Final Storage Audit:** Verify recovered storage:
+   `python main.py storage-audit`
+8. **Resume Historical SEC Backfill:** Only after verifying storage recovery, resume SEC backfill:
+   `python main.py historical --start 2006-Q1 --end 2026-Q2`
+
 ## Current System Principles
 
 The system is designed around the following boundaries:
