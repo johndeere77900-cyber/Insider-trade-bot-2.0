@@ -46,7 +46,7 @@ jobs:
 
       - name: Initialize Database Schema
         run: |
-          python -c "from database.connection import initialize_database, load_environment; initialize_database(load_environment().database_url)"
+          python -c "from database.connection import initialize_database; from config.environment import load_environment; initialize_database(load_environment().database_url)"
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
