@@ -91,12 +91,36 @@ def connect(database_url: str) -> Any:
     if is_postgresql_url(database_url):
         try:
             import psycopg
+            import psycopg.conninfo
         except ImportError as exc:
             raise RuntimeError(
                 "PostgreSQL support requires the psycopg package."
             ) from exc
 
-        return psycopg.connect(database_url)
+        import socket
+
+        kwargs = psycopg.conninfo.conninfo_to_dict(database_url)
+        host = kwargs.get("host")
+
+        if host and not host.startswith("/") and not host.startswith("."):
+            try:
+                addrinfo = socket.getaddrinfo(
+                    host, None, family=socket.AF_INET, type=socket.SOCK_STREAM
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not resolve an IPv4 address for PostgreSQL host: {host}"
+                ) from exc
+
+            if not addrinfo:
+                raise RuntimeError(
+                    f"Could not resolve an IPv4 address for PostgreSQL host: {host}"
+                )
+
+            ipv4_address = addrinfo[0][4][0]
+            kwargs["hostaddr"] = ipv4_address
+
+        return psycopg.connect(**kwargs)
 
     raise ValueError(
         "Unsupported database URL. "
