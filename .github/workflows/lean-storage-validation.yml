@@ -1,0 +1,81 @@
+name: Lean Storage Validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lean-storage-validation:
+    name: Fresh Neon Lean Storage Validation (2006-Q1)
+    runs-on: ubuntu-latest
+
+    env:
+      SEC_STORE_RAW_PAYLOAD: "false"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify Configuration & Enforcement
+        run: |
+          if [ -z "${DATABASE_URL}" ]; then
+            echo "::error::DATABASE_URL secret is missing or empty. Please set DATABASE_URL secret pointing to fresh Neon database."
+            exit 1
+          fi
+          if [ "${SEC_STORE_RAW_PAYLOAD}" != "false" ]; then
+            echo "::error::SEC_STORE_RAW_PAYLOAD must be set to 'false'. Got: ${SEC_STORE_RAW_PAYLOAD}"
+            exit 1
+          fi
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_STORE_RAW_PAYLOAD: "false"
+
+      - name: Compile Code & Run Tests
+        run: |
+          python -m compileall .
+          pytest -q
+
+      - name: Initialize Database Schema
+        run: |
+          python -c "from database.connection import initialize_database; from config.environment import load_environment; initialize_database(load_environment().database_url)"
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Run First Historical Ingestion (SEC 2006-Q1)
+        run: |
+          python main.py historical --start 2006-Q1 --end 2006-Q1
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT || 'InsiderTradeBot/2.0 contact@example.com' }}
+          SEC_STORE_RAW_PAYLOAD: "false"
+
+      - name: Verify Run 1 Ingestion
+        run: |
+          python scripts/verify_lean_storage.py --run 1 --period 2006-Q1
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_STORE_RAW_PAYLOAD: "false"
+
+      - name: Run Second Historical Ingestion (Idempotency Test)
+        run: |
+          python main.py historical --start 2006-Q1 --end 2006-Q1 --force
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT || 'InsiderTradeBot/2.0 contact@example.com' }}
+          SEC_STORE_RAW_PAYLOAD: "false"
+
+      - name: Verify Lean Storage, Idempotency & Generate Summary
+        run: |
+          python scripts/verify_lean_storage.py --run 2 --period 2006-Q1
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_STORE_RAW_PAYLOAD: "false"
