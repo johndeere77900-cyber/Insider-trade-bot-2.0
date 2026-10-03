@@ -359,10 +359,21 @@ def store_bulk_insider_transactions(
 
     for r in records:
         # Use persisted semantic transaction identity (record_hash) if available
-        r_hash = getattr(r, "record_hash", None) or sha256_record(getattr(r, "raw_payload", None) or {})
+        r_hash = getattr(r, "record_hash", None)
+        raw_payload_val = getattr(r, "raw_payload", None)
+
+        if not r_hash:
+            if raw_payload_val:
+                r_hash = sha256_record(raw_payload_val)
+            else:
+                raise ValueError(
+                    "Transaction record identity cannot be established: "
+                    "both record_hash and raw_payload are missing."
+                )
+
         raw_json = (
-            json.dumps(r.raw_payload, sort_keys=True, default=str)
-            if should_store_raw and getattr(r, "raw_payload", None) is not None
+            json.dumps(raw_payload_val, sort_keys=True, default=str)
+            if should_store_raw and raw_payload_val is not None
             else None
         )
 

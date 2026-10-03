@@ -5,9 +5,12 @@ Deterministic tests for Lean Operational Storage Mode (SEC_STORE_RAW_PAYLOAD).
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from typing import Any
 import pytest
 
 from config.environment import load_environment
+from core.hashing import sha256_record
 from data.acquisition_state import AcquisitionStateManager
 from data.sec_dataset_pipeline import normalize_bulk_record
 from database.connection import connect, initialize_database
@@ -212,3 +215,124 @@ def test_raw_payload_enabled_mode(tmp_path, monkeypatch) -> None:
         assert row["raw_payload"] is not None
         parsed_payload = json.loads(row["raw_payload"])
         assert parsed_payload["owner"]["NAME"] == "JANE DOE"
+
+
+@dataclass
+class DummyRecord:
+    source: str = "SEC"
+    accession_number: str = "000000"
+    issuer_cik: str = "000000"
+    issuer_name: str | None = None
+    ticker: str | None = None
+    reporting_owner_name: str | None = None
+    reporting_owner_cik: str | None = None
+    transaction_date: str | None = None
+    filing_date: str | None = None
+    form_type: str | None = "4"
+    transaction_code: str | None = None
+    security_title: str | None = None
+    shares: float | None = None
+    price_per_share: float | None = None
+    transaction_type: str | None = None
+    ownership_type: str | None = None
+    ownership_nature: str | None = None
+    source_url: str = "https://sec.gov"
+    record_hash: str | None = None
+    raw_payload: dict[str, Any] | None = None
+
+
+def test_missing_identity_rejection(tmp_path) -> None:
+    """
+    Verify that if BOTH record_hash and raw_payload are missing:
+    - store_bulk_insider_transactions rejects the record with ValueError
+    - it does NOT generate sha256({})
+    """
+    db_file = tmp_path / "missing_id_test.db"
+    db_url = f"sqlite:///{db_file}"
+    initialize_database(db_url)
+
+    bad_record = DummyRecord(record_hash=None, raw_payload=None)
+
+    with pytest.raises(ValueError, match="Transaction record identity cannot be established"):
+        store_bulk_insider_transactions(db_url, [bad_record])
+
+
+def test_legacy_fallback_hash_from_raw_payload(tmp_path) -> None:
+    """
+    Verify that if record_hash is missing BUT raw_payload exists:
+    - legacy fallback behavior computes hash from raw_payload
+    """
+    db_file = tmp_path / "legacy_fallback_test.db"
+    db_url = f"sqlite:///{db_file}"
+    initialize_database(db_url)
+
+    raw_p = {"data": "test_legacy_payload"}
+    rec = DummyRecord(
+        accession_number="000111",
+        record_hash=None,
+        raw_payload=raw_p,
+    )
+
+    expected_hash = sha256_record(raw_p)
+    inserted, duplicates = store_bulk_insider_transactions(db_url, [rec])
+    assert inserted == 1
+
+    with connect(db_url) as conn:
+        cursor = conn.execute(
+            "SELECT record_hash FROM insider_transactions WHERE accession_number = '000111'"
+        )
+        row = cursor.fetchone()
+        assert row is not None
+        assert row["record_hash"] == expected_hash
+
+
+def test_historical_acquisition_configuration_propagation(tmp_path, monkeypatch) -> None:
+    """
+    Verify historical acquisition path explicitly passes settings.sec_store_raw_payload
+    to store_bulk_insider_transactions.
+    """
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+    db_file = tmp_path / "config_prop_test.db"
+    db_url = f"sqlite:///{db_file}"
+
+    initialize_database(db_url)
+
+    captured_calls = []
+
+    def mock_store_bulk(database_url: str, records: list[Any], *, store_raw_payload: bool | None = None):
+        captured_calls.append((database_url, store_raw_payload))
+        return len(records), 0
+
+    monkeypatch.setattr("storage.repository.store_bulk_insider_transactions", mock_store_bulk)
+
+    # Patch download and state manager to avoid real network/files
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **kw: None)
+    monkeypatch.setattr("storage.repository.store_provenance", lambda *a, **kw: None)
+
+    fake_raw = {
+        "accession_number": "0000000001-24-000001",
+        "issuer_cik": "0000000001",
+        "reporting_owner_name": "JOHN DOE",
+        "reporting_owner_cik": "0000000002",
+        "source": "SEC",
+        "source_url": "https://sec.gov",
+        "form_type": "4",
+        "record_hash": "hash_proc",
+        "raw": {"data": "test"},
+    }
+
+    def mock_parse(*args, **kwargs):
+        yield fake_raw
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", mock_parse)
+
+    # Override environment settings DATABASE_URL
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestAgent/1.0")
+
+    import main
+    main.run_historical_acquisition("2006-Q1", "2006-Q1", batch_size=5000, force=True)
+
+    assert len(captured_calls) > 0
+    for _, passed_store_raw in captured_calls:
+        assert passed_store_raw is False

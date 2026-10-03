@@ -116,14 +116,22 @@ def run_historical_acquisition(
                     p_invalid += 1
 
                 if len(batch) >= batch_size:
-                    b_ins, b_dup = store_bulk_insider_transactions(db_url, batch)
+                    b_ins, b_dup = store_bulk_insider_transactions(
+                        db_url,
+                        batch,
+                        store_raw_payload=settings.sec_store_raw_payload,
+                    )
                     p_inserted += b_ins
                     p_duplicates += b_dup
                     batch.clear()
 
             # Process final remaining batch for period
             if batch:
-                b_ins, b_dup = store_bulk_insider_transactions(db_url, batch)
+                b_ins, b_dup = store_bulk_insider_transactions(
+                    db_url,
+                    batch,
+                    store_raw_payload=settings.sec_store_raw_payload,
+                )
                 p_inserted += b_ins
                 p_duplicates += b_dup
                 batch.clear()
