@@ -5,13 +5,17 @@ NEVER calls initialize_database() or mutates schema/indexes.
 Executes only read-only SELECT queries.
 
 Reports:
-- Total database size, table sizes, index sizes
-- insider_transactions row count & dataset_period row counts
-- Provenance breakdown by record_type (dataset_period vs insider_transaction)
-- Provenance dependency analysis
-- raw_payload statistics (count, total size, average size)
-- Average storage per transaction based on actual current database
-- Dynamic projected storage requirements based on observed historical dataset rates
+A. OBSERVED CURRENT STORAGE
+   - Total database size, table sizes, index sizes from actual relation measurements.
+   - Physical payload size via pg_column_size(raw_payload) on PostgreSQL vs logical LENGTH(raw_payload).
+   - Observed current bytes/transaction calculated directly from relation sizes.
+   - Observed historical imported dataset quarter volumes.
+
+B. PROJECTED STORAGE USING OBSERVED RATES
+   - Projections calculated dynamically from observed transactions per imported period and observed relation sizes.
+
+C. ARCHITECTURAL ESTIMATES / SCENARIOS
+   - Explicitly labeled estimates for future unmaterialized schemas (e.g., removing raw_payload to cold storage).
 """
 
 from __future__ import annotations
@@ -104,19 +108,22 @@ def run_storage_audit(database_url: str) -> dict:
             except Exception:
                 prov_breakdown = []
 
+            # raw_payload physical vs logical size measurement
             try:
                 raw_stats = conn.execute(
                     """
                     SELECT
                         COUNT(raw_payload),
-                        COALESCE(SUM(LENGTH(raw_payload)), 0),
-                        COALESCE(AVG(LENGTH(raw_payload)), 0)
+                        COALESCE(SUM(LENGTH(raw_payload)), 0) AS logical_sum,
+                        COALESCE(AVG(LENGTH(raw_payload)), 0) AS logical_avg,
+                        COALESCE(SUM(pg_column_size(raw_payload)), 0) AS physical_sum,
+                        COALESCE(AVG(pg_column_size(raw_payload)), 0) AS physical_avg
                     FROM insider_transactions
                     WHERE raw_payload IS NOT NULL AND raw_payload != ''
                     """
                 ).fetchone()
             except Exception:
-                raw_stats = (0, 0, 0.0)
+                raw_stats = (0, 0, 0.0, 0, 0.0)
 
             try:
                 imported_periods = conn.execute(
@@ -157,14 +164,16 @@ def run_storage_audit(database_url: str) -> dict:
                     """
                     SELECT
                         COUNT(raw_payload),
-                        COALESCE(SUM(LENGTH(raw_payload)), 0),
-                        COALESCE(AVG(LENGTH(raw_payload)), 0)
+                        COALESCE(SUM(LENGTH(raw_payload)), 0) AS logical_sum,
+                        COALESCE(AVG(LENGTH(raw_payload)), 0) AS logical_avg,
+                        COALESCE(SUM(LENGTH(raw_payload)), 0) AS physical_sum,
+                        COALESCE(AVG(LENGTH(raw_payload)), 0) AS physical_avg
                     FROM insider_transactions
                     WHERE raw_payload IS NOT NULL AND raw_payload != ''
                     """
                 ).fetchone()
             except Exception:
-                raw_stats = (0, 0, 0.0)
+                raw_stats = (0, 0, 0.0, 0, 0.0)
 
             try:
                 imported_periods = conn.execute(
@@ -174,97 +183,90 @@ def run_storage_audit(database_url: str) -> dict:
                 imported_periods = 0
 
     raw_count = raw_stats[0] if raw_stats else 0
-    raw_sum_bytes = raw_stats[1] if raw_stats else 0
-    raw_avg_chars = float(raw_stats[2]) if raw_stats else 0.0
+    raw_logical_sum = raw_stats[1] if raw_stats else 0
+    raw_logical_avg = float(raw_stats[2]) if raw_stats else 0.0
+    raw_physical_sum = raw_stats[3] if raw_stats else 0
+    raw_physical_avg = float(raw_stats[4]) if raw_stats else 0.0
 
-    print(f"Database Total Size:        {db_size_bytes / (1024 * 1024):.2f} MB ({db_size_bytes:,} bytes)")
-    print(f"insider_transactions Rows:  {it_rows:,}")
-    print(f"provenance Rows:            {prov_rows:,}")
-    print(f"Imported Periods (Quarters): {imported_periods:,}\n")
+    prov_dict = {r_type: count for r_type, count in prov_breakdown}
+    tx_prov_count = prov_dict.get("insider_transaction", 0)
+    dataset_prov_count = prov_dict.get("dataset_period", 0)
 
-    print("TABLE & INDEX BREAKDOWN:")
+    # -------------------------------------------------------------------------
+    # A. OBSERVED CURRENT STORAGE
+    # -------------------------------------------------------------------------
+    print("A. OBSERVED CURRENT STORAGE (From Actual Database Measurements):")
+    print(f"  Database Total Physical Size:     {db_size_bytes / (1024 * 1024):.2f} MB ({db_size_bytes:,} bytes)")
+    print(f"  insider_transactions Rows:        {it_rows:,}")
+    print(f"  provenance Total Rows:            {prov_rows:,}")
+    print(f"    - Dataset-level provenance:     {dataset_prov_count:,} rows")
+    print(f"    - Transaction-level provenance: {tx_prov_count:,} rows")
+    print(f"  Imported Dataset Periods:         {imported_periods:,} quarters\n")
+
+    print("  TABLE & INDEX PHYSICAL BREAKDOWN:")
     for t_name, s in table_stats.items():
         if s["total_bytes"] > 0 or s.get("count", 0) > 0:
             count_str = f" ({s['count']:,} rows)" if "count" in s else ""
-            print(f"  {t_name:22s} Total: {s['total_bytes'] / (1024 * 1024):.2f} MB | Table: {s['table_bytes'] / (1024 * 1024):.2f} MB | Indexes: {s['index_bytes'] / (1024 * 1024):.2f} MB{count_str}")
+            print(f"    {t_name:22s} Total: {s['total_bytes'] / (1024 * 1024):.2f} MB | Table: {s['table_bytes'] / (1024 * 1024):.2f} MB | Indexes: {s['index_bytes'] / (1024 * 1024):.2f} MB{count_str}")
     print()
 
     if indexes_detail:
-        print("INDEX DETAILS:")
+        print("  INDEX DETAILS:")
         for idx_name, idx_size in indexes_detail:
-            print(f"  {idx_name:55s} {idx_size / (1024 * 1024):.2f} MB ({idx_size:,} bytes)")
+            print(f"    {idx_name:55s} {idx_size / (1024 * 1024):.2f} MB ({idx_size:,} bytes)")
         print()
 
-    print("PROVENANCE BREAKDOWN BY RECORD TYPE:")
-    prov_dict = {}
-    for r_type, count in prov_breakdown:
-        prov_dict[r_type] = count
-        print(f"  {r_type:25s}: {count:,} rows")
-    if not prov_breakdown:
-        print("  (No provenance records found)")
+    print("  RAW_PAYLOAD STORAGE MEASUREMENTS:")
+    print(f"    Rows with raw_payload:               {raw_count:,}")
+    print(f"    Logical string length (characters):  {raw_logical_sum:,} total chars ({raw_logical_avg:.1f} chars/row avg)")
+    if is_postgresql_url(database_url):
+        print(f"    Physical PostgreSQL storage (bytes): {raw_physical_sum / (1024 * 1024):.2f} MB ({raw_physical_sum:,} bytes, {raw_physical_avg:.1f} bytes/row avg)")
+    else:
+        print(f"    Physical storage (estimated/SQLite):  {raw_physical_sum / (1024 * 1024):.2f} MB ({raw_physical_sum:,} bytes)")
     print()
 
-    # Provenance Dependency Analysis
-    tx_prov_count = prov_dict.get("insider_transaction", 0)
-    dataset_prov_count = prov_dict.get("dataset_period", 0)
-    print("PROVENANCE DEPENDENCY ANALYSIS:")
-    print(f"  Transaction-level provenance rows: {tx_prov_count:,}")
-    print(f"  Dataset-level provenance rows:     {dataset_prov_count:,}")
-    print("  Foreign Key Dependencies on provenance: NONE (provenance is an isolated audit table)")
-    print("  Application Code Dependencies: ONLY dataset_period is queried during verification/ingestion.")
-    print("  Transaction identity is preserved via record_hash on insider_transactions table.")
-    print()
-
-    print("RAW_PAYLOAD STATISTICS:")
-    print(f"  Rows with raw_payload:    {raw_count:,}")
-    print(f"  Total raw_payload size:   {raw_sum_bytes / (1024 * 1024):.2f} MB ({raw_sum_bytes:,} bytes)")
-    print(f"  Average raw_payload size: {raw_avg_chars:.1f} characters/bytes\n")
-
-    # Dynamic Volume and Storage Calculations
+    # Calculate actual observed relation averages per transaction
     it_stats = table_stats.get("insider_transactions", {})
     it_total_bytes = it_stats.get("total_bytes", 0)
     it_table_bytes = it_stats.get("table_bytes", 0)
     it_index_bytes = it_stats.get("index_bytes", 0)
 
-    # Use observed actual current storage rates if available, else derive from empirical database facts
+    prov_stats = table_stats.get("provenance", {})
+    prov_total_bytes = prov_stats.get("total_bytes", 0)
+
     if it_rows > 0 and it_total_bytes > 0:
         obs_table_bytes_per_tx = it_table_bytes / it_rows
         obs_index_bytes_per_tx = it_index_bytes / it_rows
-        obs_total_bytes_per_tx = it_total_bytes / it_rows
+        obs_prov_bytes_per_tx = (prov_total_bytes / it_rows) if it_rows > 0 else 0
+        obs_total_bytes_per_tx = (it_total_bytes + prov_total_bytes) / it_rows
     else:
-        # Based on actual Neon 379,581 transactions audit:
-        # Table size: 579 MB (~1,525 bytes/tx)
-        # Indexes: 227 MB total (1 duplicate unique ~68MB, 1 unique ~68MB, 1 date ~91MB => ~600 bytes/tx)
-        obs_table_bytes_per_tx = 1525
-        obs_index_bytes_per_tx = 600
-        obs_total_bytes_per_tx = 2125
+        # Fallback based on live Neon production audit measurements (379,581 transactions):
+        # insider_transactions table: 579 MB (~1,525 bytes/tx)
+        # insider_transactions indexes: 227 MB (~600 bytes/tx)
+        # provenance table + index: 192 MB (~505 bytes/tx)
+        obs_table_bytes_per_tx = 1525.0
+        obs_index_bytes_per_tx = 600.0
+        obs_prov_bytes_per_tx = 505.0
+        obs_total_bytes_per_tx = 2630.0
 
     if imported_periods > 0 and it_rows > 0:
         obs_tx_per_quarter = it_rows / imported_periods
     else:
-        # Empirical observed average across 2006-Q1 & 2006-Q2 = 379,581 / 2 = 189,790
+        # Observed rate from 2006-Q1 and 2006-Q2 imports: 379,581 txs / 2 quarters = 189,790
         obs_tx_per_quarter = 189790.0
 
-    print("DYNAMIC OBSERVED METRICS:")
-    print(f"  Observed transactions / imported quarter:  {obs_tx_per_quarter:,.0f}")
-    print(f"  Observed table storage per transaction:     {obs_table_bytes_per_tx:.0f} bytes")
-    print(f"  Observed index storage per transaction:     {obs_index_bytes_per_tx:.0f} bytes")
-    print(f"  Observed current total storage / transaction: {obs_total_bytes_per_tx:.0f} bytes\n")
+    print("  OBSERVED PER-TRANSACTION STORAGE METRICS (Calculated from Actual Relation Sizes):")
+    print(f"    Observed imported dataset rate:      {obs_tx_per_quarter:,.0f} transactions/quarter")
+    print(f"    Observed table storage / transaction:  {obs_table_bytes_per_tx:.1f} bytes")
+    print(f"    Observed index storage / transaction:  {obs_index_bytes_per_tx:.1f} bytes")
+    print(f"    Observed provenance overhead / tx:    {obs_prov_bytes_per_tx:.1f} bytes")
+    print(f"    Observed current total storage / tx:  {obs_total_bytes_per_tx:.1f} bytes\n")
 
-    # Dynamic Historical Projections
-    # Formula: Total Storage = (Quarters * Observed_Tx_Per_Quarter) * Bytes_Per_Tx
-    # Architecture Scenarios:
-    # 1. Current Bloated: Table + 2 Unique Indexes + Date Index + Tx-level Provenance (~2,180 bytes/tx)
-    # 2. Repaired Neon: Duplicate Index Dropped + Tx-level Provenance Dropped + raw_payload retained (~1,944 bytes/tx)
-    # 3. Repaired + Cold Archive: raw_payload offloaded to S3/disk archive, normalized fields only in Neon (~669 bytes/tx)
-
-    bytes_tx_current = obs_total_bytes_per_tx + (192 if tx_prov_count > 0 else 0)  # include per-tx provenance overhead
-    bytes_tx_repaired = obs_table_bytes_per_tx + 419  # Single UNIQUE (~179 bytes) + Date index (~240 bytes)
-    bytes_tx_archived = 250 + 419  # Normalized fields (~250 bytes) + Indexes (~419 bytes)
-
-    print("DYNAMIC STORAGE PROJECTIONS:")
-    print("  Note: Projections dynamically calculate volume using observed dataset rate:")
-    print(f"  Rate: {obs_tx_per_quarter:,.0f} transactions/quarter based on {imported_periods if imported_periods > 0 else 2} imported quarters.\n")
+    # -------------------------------------------------------------------------
+    # B. PROJECTED STORAGE USING OBSERVED RATES
+    # -------------------------------------------------------------------------
+    print("B. PROJECTED STORAGE USING OBSERVED RATES (Unmodified Bloated Schema):")
+    print(f"   Formula: Total Storage = (Quarters × {obs_tx_per_quarter:,.0f} tx/quarter) × {obs_total_bytes_per_tx:.1f} bytes/tx\n")
 
     ranges = [
         ("2006-Q1 -> 2010-Q4", 20),
@@ -274,14 +276,28 @@ def run_storage_audit(database_url: str) -> dict:
 
     for label, qtrs in ranges:
         proj_txs = int(qtrs * obs_tx_per_quarter)
-        mb_current = (proj_txs * bytes_tx_current) / (1024 * 1024)
-        mb_repaired = (proj_txs * bytes_tx_repaired) / (1024 * 1024)
-        mb_archived = (proj_txs * bytes_tx_archived) / (1024 * 1024)
+        mb_current = (proj_txs * obs_total_bytes_per_tx) / (1024 * 1024)
+        print(f"   {label} ({qtrs} quarters / ~{proj_txs:,} txs): {mb_current:,.0f} MB ({mb_current/1024:.2f} GB)")
+    print()
 
-        print(f"  {label} ({qtrs} quarters / ~{proj_txs:,} transactions):")
-        print(f"    - Current Bloated Architecture:                              {mb_current:,.0f} MB ({mb_current/1024:.2f} GB)")
-        print(f"    - Repaired Architecture (Duplicates/Prov Dropped, raw in DB): {mb_repaired:,.0f} MB ({mb_repaired/1024:.2f} GB)")
-        print(f"    - Repaired + Cold Archive (raw_payload offloaded to archive):  {mb_archived:,.0f} MB ({mb_archived/1024:.2f} GB)")
+    # -------------------------------------------------------------------------
+    # C. ARCHITECTURAL ESTIMATES / SCENARIOS
+    # -------------------------------------------------------------------------
+    print("C. ARCHITECTURAL ESTIMATES / SCENARIOS (Model Estimates for Unmaterialized Schemas):")
+    print("   Note: These are engineering estimates based on dropping redundant components.\n")
+
+    # Estimate 1: Repaired Neon DB (Duplicate index idx_insider_tx_uniq removed [~179 bytes/tx], per-tx provenance removed [~505 bytes/tx], raw_payload retained)
+    est_bytes_repaired = max(100.0, obs_total_bytes_per_tx - 179.0 - obs_prov_bytes_per_tx)
+    # Estimate 2: Repaired DB + Cold Archive (raw_payload offloaded to cold storage [~1275 bytes saved], normalized fields only in Neon [~250 bytes table + ~420 bytes indexes])
+    est_bytes_archived = 670.0
+
+    for label, qtrs in ranges:
+        proj_txs = int(qtrs * obs_tx_per_quarter)
+        mb_repaired = (proj_txs * est_bytes_repaired) / (1024 * 1024)
+        mb_archived = (proj_txs * est_bytes_archived) / (1024 * 1024)
+        print(f"   {label} ({qtrs} quarters / ~{proj_txs:,} txs):")
+        print(f"     - ESTIMATE [Repaired DB (Duplicate Index & Tx Provenance Removed, raw in DB)]: {mb_repaired:,.0f} MB ({mb_repaired/1024:.2f} GB) [~{est_bytes_repaired:.0f} bytes/tx]")
+        print(f"     - ESTIMATE [Repaired DB + Cold Archive (raw_payload offloaded to S3/disk)]:   {mb_archived:,.0f} MB ({mb_archived/1024:.2f} GB) [~{est_bytes_archived:.0f} bytes/tx]")
     print("=====================================================================\n")
 
     audit_data.update({
@@ -290,11 +306,13 @@ def run_storage_audit(database_url: str) -> dict:
         "provenance_count": prov_rows,
         "provenance_breakdown": prov_dict,
         "raw_payload_count": raw_count,
-        "raw_payload_total_bytes": raw_sum_bytes,
-        "raw_payload_avg_chars": raw_avg_chars,
+        "raw_payload_logical_sum": raw_logical_sum,
+        "raw_payload_physical_sum": raw_physical_sum,
+        "raw_payload_physical_avg": raw_physical_avg,
         "table_stats": table_stats,
         "imported_periods": imported_periods,
         "obs_tx_per_quarter": obs_tx_per_quarter,
+        "obs_total_bytes_per_tx": obs_total_bytes_per_tx,
     })
 
     return audit_data

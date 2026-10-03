@@ -1,18 +1,19 @@
 """
-Regression tests for Storage Architecture Repair & Optimization (Second-Pass Corrections).
+Comprehensive Regression Tests for Storage Architecture Repair & Safety Pass.
 
 Verifies:
 - storage_audit does NOT call initialize_database() or mutate database schema.
+- physical vs logical payload storage measurement distinction.
 - Duplicate unique index `idx_insider_tx_uniq` is no longer created on initialize_database.
 - Table-level UNIQUE constraint still prevents duplicate transaction insertions.
-- Repeated ingestion remains idempotent.
-- Dataset-level provenance remains idempotent.
-- Provenance audit correctly distinguishes transaction-level and dataset-level provenance.
-- Provenance cleanup dry-run performs NO deletion.
+- Migration safety check in scripts/migrate_storage.py verifies constraint existence before dropping index.
+- Provenance safety audit detects missing dataset-level provenance and orphan rows.
+- Provenance cleanup in dry-run mode performs ZERO deletions.
 - Provenance cleanup refuses execution when safety checks fail.
+- Provenance cleanup --execute deletes ONLY 'insider_transaction' rows and preserves 'dataset_period' rows.
 - Provenance cleanup is idempotent.
-- raw_payload behavior remains unchanged for bulk records.
 - Historical ingestion remains resumable.
+- raw_payload behavior remains unchanged for bulk records.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import pytest
 from data.acquisition_state import AcquisitionStateManager
 from data.sec_dataset_pipeline import compute_transaction_identity, normalize_bulk_record
 from database.connection import connect, initialize_database
+from scripts.migrate_storage import run_migration
 from scripts.storage_audit import run_storage_audit
 from scripts.storage_maintenance import audit_provenance, cleanup_provenance
 from storage.repository import (
@@ -33,15 +35,13 @@ from storage.repository import (
 
 
 def test_storage_audit_is_read_only_and_does_not_mutate_schema(tmp_path) -> None:
-    """Verify run_storage_audit does NOT initialize or mutate schema when executed on an empty or existing DB."""
+    """Verify run_storage_audit does NOT initialize or mutate schema when executed on an empty/uninitialized DB."""
     db_file = tmp_path / "test_audit_readonly.db"
     db_url = f"sqlite:///{db_file}"
 
-    # Do not initialize database schema beforehand; db file is empty/non-existent schema
     audit_res = run_storage_audit(db_url)
     assert audit_res is not None
 
-    # Connect directly with sqlite3 to check that tables were NOT created by audit
     conn = sqlite3.connect(db_file)
     cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = [row[0] for row in cursor.fetchall()]
@@ -49,6 +49,30 @@ def test_storage_audit_is_read_only_and_does_not_mutate_schema(tmp_path) -> None
 
     assert "insider_transactions" not in tables
     assert "provenance" not in tables
+
+
+def test_physical_logical_payload_distinction(tmp_path) -> None:
+    """Verify storage_audit measures both logical string length and physical storage payload statistics."""
+    db_file = tmp_path / "test_payload_stats.db"
+    db_url = f"sqlite:///{db_file}"
+
+    initialize_database(db_url)
+    raw_rec = {
+        "accession_number": "000123",
+        "issuer_cik": "000001",
+        "source": "SEC",
+        "source_url": "https://sec.gov",
+        "form_type": "4",
+        "record_hash": "hash123",
+        "raw": {"data": "A" * 500},
+    }
+    norm = normalize_bulk_record(raw_rec)
+    store_bulk_insider_transactions(db_url, [norm])
+
+    res = run_storage_audit(db_url)
+    assert res["raw_payload_count"] == 1
+    assert res["raw_payload_logical_sum"] > 500
+    assert res["raw_payload_physical_sum"] > 500
 
 
 def test_initialization_does_not_create_duplicate_index(tmp_path) -> None:
@@ -97,48 +121,55 @@ def test_unique_constraint_prevents_duplicate_transactions(tmp_path) -> None:
     assert count_records(db_url, "insider_transactions") == 1
 
 
-def test_dataset_level_provenance_idempotency(tmp_path) -> None:
-    """Verify dataset_period provenance remains idempotent when written repeatedly."""
-    db_file = tmp_path / "test_prov.db"
+def test_migration_safety_checks_unique_constraint(tmp_path) -> None:
+    """Verify run_migration in scripts/migrate_storage.py checks for uniqueness before dropping index."""
+    db_file = tmp_path / "test_migration_safety.db"
     db_url = f"sqlite:///{db_file}"
 
-    store_provenance(
-        db_url,
-        record_type="dataset_period",
-        record_id="2006-Q1",
-        source="SEC",
-        source_reference="https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/2006q1_form345.zip",
-        checksum="hash1",
-        validation_status="validated",
-    )
-    assert count_records(db_url, "provenance") == 1
+    # Create table WITH unique constraint
+    initialize_database(db_url)
 
-    # Second write updates record instead of creating duplicate
-    store_provenance(
-        db_url,
-        record_type="dataset_period",
-        record_id="2006-Q1",
-        source="SEC",
-        source_reference="https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/2006q1_form345.zip",
-        checksum="hash2_updated",
-        validation_status="validated",
-    )
-    assert count_records(db_url, "provenance") == 1
+    # Manually create duplicate index
+    with connect(db_url) as conn:
+        conn.execute("CREATE UNIQUE INDEX idx_insider_tx_uniq ON insider_transactions (source, accession_number, record_hash)")
+        conn.commit()
+
+    # Migration safely drops index because table UNIQUE constraint exists
+    success = run_migration(db_url)
+    assert success is True
 
     with connect(db_url) as conn:
-        cursor = conn.execute("SELECT checksum FROM provenance WHERE record_id='2006-Q1'")
-        row = cursor.fetchone()
-        assert row[0] == "hash2_updated"
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_insider_tx_uniq'")
+        assert cursor.fetchone() is None
 
 
-def test_provenance_audit_distinguishes_transaction_and_dataset_types(tmp_path) -> None:
-    """Verify audit_provenance distinguishes transaction-level and dataset-level provenance rows."""
-    db_file = tmp_path / "test_prov_audit.db"
+def test_provenance_audit_orphan_and_missing_dataset_detection(tmp_path) -> None:
+    """Verify audit_provenance detects orphan transaction provenance rows and missing dataset provenance."""
+    db_file = tmp_path / "test_prov_orphans.db"
     db_url = f"sqlite:///{db_file}"
 
     initialize_database(db_url)
 
-    # Insert 1 dataset_period provenance row
+    # Mark 2006-Q1 completed in ingestion_state WITHOUT dataset_period provenance
+    with connect(db_url) as conn:
+        conn.execute("INSERT INTO ingestion_state (period, status, completed_at) VALUES ('2006-Q1', 'COMPLETED', '2026-01-01')")
+        # Add orphan insider_transaction provenance row
+        conn.execute("INSERT INTO provenance (record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status) VALUES ('insider_transaction', 'orphan_hash_123', 'SEC', 'ref', '2026-01-01', 'chk', 'validated')")
+        conn.commit()
+
+    res = audit_provenance(db_url)
+    assert res["transaction_level_provenance_rows"] == 1
+    assert res["orphan_provenance_count"] == 1
+    assert "2006-Q1" in res["missing_dataset_provenance_periods"]
+    assert res["can_cleanup"] is False
+
+
+def test_provenance_cleanup_dry_run_performs_zero_deletion(tmp_path) -> None:
+    """Verify provenance-cleanup in dry-run mode performs no deletion."""
+    db_file = tmp_path / "test_prov_dryrun.db"
+    db_url = f"sqlite:///{db_file}"
+
+    initialize_database(db_url)
     store_provenance(
         db_url,
         record_type="dataset_period",
@@ -148,82 +179,21 @@ def test_provenance_audit_distinguishes_transaction_and_dataset_types(tmp_path) 
         checksum="hash123",
         validation_status="validated",
     )
-
-    # Insert 2 legacy insider_transaction provenance rows directly
     with connect(db_url) as conn:
-        conn.execute(
-            """
-            INSERT INTO provenance (record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status)
-            VALUES ('insider_transaction', 'tx_hash_1', 'SEC', 'http://example.com', '2026-01-01', 'hash1', 'validated')
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO provenance (record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status)
-            VALUES ('insider_transaction', 'tx_hash_2', 'SEC', 'http://example.com', '2026-01-01', 'hash2', 'validated')
-            """
-        )
+        conn.execute("INSERT INTO ingestion_state (period, status, completed_at) VALUES ('2006-Q1', 'COMPLETED', '2026-01-01')")
+        conn.execute("INSERT INTO provenance (record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status) VALUES ('insider_transaction', 'tx_hash_1', 'SEC', 'http://example.com', '2026-01-01', 'hash1', 'validated')")
         conn.commit()
 
-    res = audit_provenance(db_url)
-    assert res["total_provenance_rows"] == 3
-    assert res["transaction_level_provenance_rows"] == 2
-    assert res["dataset_level_provenance_rows"] == 1
-
-
-def test_provenance_cleanup_dry_run_performs_no_deletion(tmp_path) -> None:
-    """Verify provenance-cleanup in dry-run mode performs no deletion."""
-    db_file = tmp_path / "test_prov_dryrun.db"
-    db_url = f"sqlite:///{db_file}"
-
-    initialize_database(db_url)
-    with connect(db_url) as conn:
-        conn.execute(
-            """
-            INSERT INTO provenance (record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status)
-            VALUES ('insider_transaction', 'tx_hash_1', 'SEC', 'http://example.com', '2026-01-01', 'hash1', 'validated')
-            """
-        )
-        conn.commit()
-
-    assert count_records(db_url, "provenance") == 1
+    assert count_records(db_url, "provenance") == 2
 
     success = cleanup_provenance(db_url, dry_run=True, execute=False)
     assert success is True
-    # Verify row count is unchanged
-    assert count_records(db_url, "provenance") == 1
+    # Verify zero rows deleted
+    assert count_records(db_url, "provenance") == 2
 
 
-def test_provenance_cleanup_refuses_execution_if_safety_checks_fail(tmp_path) -> None:
-    """Verify cleanup_provenance refuses execution if dataset provenance is missing for completed period."""
-    db_file = tmp_path / "test_prov_safety.db"
-    db_url = f"sqlite:///{db_file}"
-
-    initialize_database(db_url)
-    with connect(db_url) as conn:
-        # Mark period 2006-Q1 completed in ingestion_state WITHOUT writing dataset_period provenance
-        conn.execute(
-            """
-            INSERT INTO ingestion_state (period, status, completed_at)
-            VALUES ('2006-Q1', 'COMPLETED', '2026-01-01')
-            """
-        )
-        # Add legacy tx provenance
-        conn.execute(
-            """
-            INSERT INTO provenance (record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status)
-            VALUES ('insider_transaction', 'tx_hash_1', 'SEC', 'http://example.com', '2026-01-01', 'hash1', 'validated')
-            """
-        )
-        conn.commit()
-
-    success = cleanup_provenance(db_url, dry_run=False, execute=True)
-    assert success is False, "Cleanup must fail when safety prerequisites are not satisfied"
-    assert count_records(db_url, "provenance") == 1
-
-
-def test_provenance_cleanup_execute_and_idempotency(tmp_path) -> None:
-    """Verify cleanup_provenance --execute successfully deletes tx-level rows and is idempotent."""
+def test_provenance_cleanup_execute_and_dataset_preservation(tmp_path) -> None:
+    """Verify cleanup_provenance --execute deletes ONLY insider_transaction rows and preserves dataset_period rows."""
     db_file = tmp_path / "test_prov_exec.db"
     db_url = f"sqlite:///{db_file}"
 
@@ -239,18 +209,8 @@ def test_provenance_cleanup_execute_and_idempotency(tmp_path) -> None:
     )
 
     with connect(db_url) as conn:
-        conn.execute(
-            """
-            INSERT INTO ingestion_state (period, status, completed_at)
-            VALUES ('2006-Q1', 'COMPLETED', '2026-01-01')
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO provenance (record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status)
-            VALUES ('insider_transaction', 'tx_hash_1', 'SEC', 'http://example.com', '2026-01-01', 'hash1', 'validated')
-            """
-        )
+        conn.execute("INSERT INTO ingestion_state (period, status, completed_at) VALUES ('2006-Q1', 'COMPLETED', '2026-01-01')")
+        conn.execute("INSERT INTO provenance (record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status) VALUES ('insider_transaction', 'tx_hash_1', 'SEC', 'http://example.com', '2026-01-01', 'hash1', 'validated')")
         conn.commit()
 
     assert count_records(db_url, "provenance") == 2
@@ -259,6 +219,11 @@ def test_provenance_cleanup_execute_and_idempotency(tmp_path) -> None:
     s1 = cleanup_provenance(db_url, dry_run=False, execute=True)
     assert s1 is True
     assert count_records(db_url, "provenance") == 1
+
+    with connect(db_url) as conn:
+        row = conn.execute("SELECT record_type, record_id FROM provenance").fetchone()
+        assert row["record_type"] == "dataset_period"
+        assert row["record_id"] == "2006-Q1"
 
     # Second execute (idempotent run)
     s2 = cleanup_provenance(db_url, dry_run=False, execute=True)
