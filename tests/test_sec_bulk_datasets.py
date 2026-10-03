@@ -201,7 +201,7 @@ def test_case_c_multiple_nonderiv_and_deriv_transactions():
 
 
 def test_case_d_same_dataset_processed_twice(tmp_path):
-    """Case D: Same dataset re-ingested = 0 new transaction records inserted, 0 duplicate provenance records."""
+    """Case D: Same dataset re-ingested = 0 new transaction records inserted. Provenance is dataset-level."""
     db_file = tmp_path / "test_case_d.db"
     db_url = f"sqlite:///{db_file}"
 
@@ -214,14 +214,15 @@ def test_case_d_same_dataset_processed_twice(tmp_path):
     assert ins1 == 2
     assert dup1 == 0
     assert count_records(db_url, "insider_transactions") == 2
-    assert count_records(db_url, "provenance") == 2
+    # Per-transaction provenance is intentionally no longer written during bulk transaction storage
+    assert count_records(db_url, "provenance") == 0
 
     # Second run (exact same dataset)
     ins2, dup2 = store_bulk_insider_transactions(db_url, norm_records)
     assert ins2 == 0
     assert dup2 == 2
     assert count_records(db_url, "insider_transactions") == 2
-    assert count_records(db_url, "provenance") == 2
+    assert count_records(db_url, "provenance") == 0
 
 
 def test_persisted_semantic_transaction_identity():

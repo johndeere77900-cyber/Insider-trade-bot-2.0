@@ -77,7 +77,7 @@ def test_postgresql_bulk_insert_uses_cursor(monkeypatch) -> None:
     pg_url = "postgresql://user:pass@localhost:5432/testdb"
     ins, dup = repo.store_bulk_insider_transactions(pg_url, [fake_record])
 
-    assert mock_cursor.executemany.call_count == 2
+    assert mock_cursor.executemany.call_count == 1
     assert not mock_conn.executemany.called
 
 

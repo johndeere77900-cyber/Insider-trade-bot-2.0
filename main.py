@@ -230,6 +230,16 @@ def main() -> int:
     and safety layers and is disabled by default.
     """
 
+    if len(sys.argv) >= 2 and sys.argv[1] in ("storage_audit", "storage-audit"):
+        from scripts.storage_audit import main as audit_main
+        sys.argv.pop(1)
+        return audit_main()
+
+    if len(sys.argv) >= 2 and sys.argv[1] in ("storage_maintenance", "storage-maintenance"):
+        from scripts.storage_maintenance import main as maint_main
+        sys.argv.pop(1)
+        return maint_main()
+
     if len(sys.argv) >= 2 and sys.argv[1] in ("historical", "historical_acquisition"):
         # Argument parsing for historical acquisition
         import argparse
