@@ -71,6 +71,7 @@ class EnvironmentSettings:
 
     sec_user_agent: str
     sec_timeout_seconds: int
+    sec_store_raw_payload: bool
 
     telegram_bot_token: str
     telegram_allowed_user_ids: tuple[str, ...]
@@ -186,6 +187,11 @@ def load_environment(
             source,
             "SEC_TIMEOUT_SECONDS",
             30,
+        ),
+        sec_store_raw_payload=_get_bool(
+            source,
+            "SEC_STORE_RAW_PAYLOAD",
+            False,
         ),
         telegram_bot_token=telegram_bot_token,
         telegram_allowed_user_ids=allowed_user_ids,

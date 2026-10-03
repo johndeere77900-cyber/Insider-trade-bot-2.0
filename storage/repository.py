@@ -14,6 +14,7 @@ backend selected by database_url.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -35,6 +36,16 @@ ALLOWED_PAYLOAD_TABLES = {
 def utc_now() -> str:
     """Return the current UTC timestamp in ISO-8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _should_store_raw_payload(override: bool | None = None) -> bool:
+    """Determine if raw_payload should be stored based on parameter or SEC_STORE_RAW_PAYLOAD env var."""
+    if override is not None:
+        return bool(override)
+    value = os.getenv("SEC_STORE_RAW_PAYLOAD")
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _placeholder(database_url: str) -> str:
@@ -206,6 +217,7 @@ def store_insider_transaction(
     ownership_nature: str | None = None,
     source_url: str | None = None,
     raw_payload: dict[str, Any],
+    store_raw_payload: bool | None = None,
 ) -> str:
     """Store an insider transaction and return its record hash."""
 
@@ -238,6 +250,16 @@ def store_insider_transaction(
         created_at
     """
 
+    raw_payload_str = (
+        json.dumps(
+            raw_payload,
+            sort_keys=True,
+            default=str,
+        )
+        if _should_store_raw_payload(store_raw_payload)
+        else None
+    )
+
     values = (
         source,
         accession_number,
@@ -257,11 +279,7 @@ def store_insider_transaction(
         ownership_type,
         ownership_nature,
         source_url,
-        json.dumps(
-            raw_payload,
-            sort_keys=True,
-            default=str,
-        ),
+        raw_payload_str,
         record_hash,
         utc_now(),
     )
@@ -311,6 +329,8 @@ def store_insider_transaction(
 def store_bulk_insider_transactions(
     database_url: str,
     records: list[Any],
+    *,
+    store_raw_payload: bool | None = None,
 ) -> tuple[int, int]:
     """
     Batch store normalized insider transactions with deduplication.
@@ -335,11 +355,16 @@ def store_bulk_insider_transactions(
 
     now = utc_now()
     rows_to_insert = []
+    should_store_raw = _should_store_raw_payload(store_raw_payload)
 
     for r in records:
         # Use persisted semantic transaction identity (record_hash) if available
-        r_hash = getattr(r, "record_hash", None) or sha256_record(r.raw_payload)
-        raw_json = json.dumps(r.raw_payload, sort_keys=True, default=str)
+        r_hash = getattr(r, "record_hash", None) or sha256_record(getattr(r, "raw_payload", None) or {})
+        raw_json = (
+            json.dumps(r.raw_payload, sort_keys=True, default=str)
+            if should_store_raw and getattr(r, "raw_payload", None) is not None
+            else None
+        )
 
         form_t = getattr(r, "form_type", None) or getattr(r, "form", None) or "4"
         val_tuple = (
@@ -789,6 +814,7 @@ class Repository:
     def _store_compat_insider(
         self,
         record: Mapping[str, Any],
+        store_raw_payload: bool | None = None,
     ) -> dict[str, Any]:
         """
         Store the legacy lightweight insider-record compatibility shape.
@@ -817,10 +843,14 @@ class Repository:
             "symbol"
         )
 
-        raw_payload = json.dumps(
-            dict(record),
-            sort_keys=True,
-            default=str,
+        raw_payload = (
+            json.dumps(
+                dict(record),
+                sort_keys=True,
+                default=str,
+            )
+            if _should_store_raw_payload(store_raw_payload)
+            else None
         )
 
         placeholder = _placeholder(
