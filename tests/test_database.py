@@ -41,3 +41,52 @@ def test_database_connection_creates_database_file(tmp_path) -> None:
     connection.close()
 
     assert database_path.exists()
+
+
+def test_postgres_connection_resolves_ipv4(monkeypatch) -> None:
+    import socket
+    import sys
+    from unittest.mock import MagicMock
+    from database.connection import connect
+
+    called_kwargs = {}
+
+    mock_psycopg = MagicMock()
+
+    def mock_connect(**kwargs):
+        nonlocal called_kwargs
+        called_kwargs = kwargs
+        return MagicMock()
+
+    mock_psycopg.connect = mock_connect
+
+    def mock_conninfo_to_dict(url):
+        return {
+            "user": "user",
+            "password": "pass",
+            "dbname": "neondb",
+            "host": "ep-foo-bar.us-east-2.aws.neon.tech",
+            "port": "5432",
+            "sslmode": "require",
+        }
+
+    mock_psycopg.conninfo.conninfo_to_dict = mock_conninfo_to_dict
+
+    def mock_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if family == socket.AF_INET and host == "ep-foo-bar.us-east-2.aws.neon.tech":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 0))]
+        return []
+
+    monkeypatch.setitem(sys.modules, "psycopg", mock_psycopg)
+    monkeypatch.setitem(sys.modules, "psycopg.conninfo", mock_psycopg.conninfo)
+    monkeypatch.setattr(socket, "getaddrinfo", mock_getaddrinfo)
+
+    db_url = "postgresql://user:pass@ep-foo-bar.us-east-2.aws.neon.tech:5432/neondb?sslmode=require"
+    connect(db_url)
+
+    assert called_kwargs.get("host") == "ep-foo-bar.us-east-2.aws.neon.tech"
+    assert called_kwargs.get("hostaddr") == "192.0.2.1"
+    assert called_kwargs.get("sslmode") == "require"
+    assert called_kwargs.get("user") == "user"
+    assert called_kwargs.get("password") == "pass"
+    assert called_kwargs.get("dbname") == "neondb"
