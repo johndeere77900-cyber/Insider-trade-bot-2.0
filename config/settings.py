@@ -52,6 +52,8 @@ class Settings:
     # SEC
     sec_base_url: str
     sec_user_agent: str
+    sec_archive_backend: str
+    sec_archive_path: Path
 
     # Storage directories
     data_directory: Path
@@ -100,6 +102,11 @@ def load_settings() -> Settings:
             "SEC_USER_AGENT",
             "",
         ),
+        sec_archive_backend=os.getenv(
+            "SEC_ARCHIVE_BACKEND",
+            "filesystem",
+        ).strip().lower(),
+        sec_archive_path=data_directory / "archive",
 
         data_directory=data_directory,
         raw_data_directory=data_directory / "raw",

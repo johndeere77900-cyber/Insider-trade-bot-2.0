@@ -36,6 +36,7 @@ def test_verify_run1_date_json_serialization(tmp_path: Path, monkeypatch: pytest
     db_url = f"sqlite:///{db_path}"
     monkeypatch.setenv("DATABASE_URL", db_url)
     monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(tmp_path / "archive"))
 
     initialize_database(db_url)
 
@@ -199,8 +200,15 @@ def test_main_historical_force_reprocessing(tmp_path: Path, monkeypatch: pytest.
 
     assert state_mgr.should_skip_period("2006-Q1") is True
 
+    import zipfile
     import data.sec_dataset_pipeline as pipeline
-    monkeypatch.setattr(pipeline, "download_dataset_zip_to_file", lambda y, q, user_agent, target_path: target_path)
+
+    def mock_download(year, qtr, user_agent, target_path):
+        with zipfile.ZipFile(target_path, "w") as zf:
+            zf.writestr("test.txt", "dummy content")
+        return target_path
+
+    monkeypatch.setattr(pipeline, "download_dataset_zip_to_file", mock_download)
     monkeypatch.setattr(pipeline, "parse_dataset_zip", lambda zip_path, source_url="": [])
 
     ret = main.run_historical_acquisition("2006-Q1", "2006-Q1", force=True)

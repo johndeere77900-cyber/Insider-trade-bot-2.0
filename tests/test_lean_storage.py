@@ -306,7 +306,13 @@ def test_historical_acquisition_configuration_propagation(tmp_path, monkeypatch)
     monkeypatch.setattr("storage.repository.store_bulk_insider_transactions", mock_store_bulk)
 
     # Patch download and state manager to avoid real network/files
-    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **kw: None)
+    import zipfile
+    def mock_download(year, qtr, user_agent, target_path, **kwargs):
+        with zipfile.ZipFile(target_path, "w") as zf:
+            zf.writestr("test.txt", "dummy content")
+        return target_path
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_download)
     monkeypatch.setattr("storage.repository.store_provenance", lambda *a, **kw: None)
 
     fake_raw = {

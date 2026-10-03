@@ -11,16 +11,24 @@ Insider Trade Bot 2.0 uses a tiered, cost-efficient storage architecture designe
 ```
 SEC Quarterly ZIP (Official SEC Data)
     ↓
-Immutable Raw Dataset Archive (Disk / S3 / R2 cold storage)
+Immutable Raw Dataset Archive (Local Filesystem / Object Storage)
     ↓
-Normalized Operational Database (Neon PostgreSQL)
+Lean Normalized Operational Database (Neon PostgreSQL)
     ↓
-Research & Signal Engine
+Research Data Access Layer
+    ↓
+Event Study Engine
+    ↓
+Signals / Backtesting
 ```
 
-1. **Normalized Operational Database (Neon):** Retains parsed, normalized transaction fields required for querying, signal generation, and research (`insider_transactions`, `ingestion_state`, `dataset_period` provenance).
-2. **Immutable Raw Archive:** Official SEC quarterly ZIPs serve as the authoritative raw archive. Complete quarterly SEC datasets are preserved separately for auditing/reprocessing without duplicating raw JSON payloads inside every database transaction row.
-3. **Dataset-Level Provenance:** Provenance is tracked at the dataset period level (`dataset_period`) storing SEC dataset URL, quarter, SHA-256 checksum, validation status, and ingestion state.
+### System Layer Responsibilities
+
+- **Source of Truth (Immutable SEC Archive):** Official SEC quarterly ZIP archives are downloaded, validated for SHA-256 checksum integrity, and persisted immutably in the archive storage layer before ingestion. If the same period archive is ingested twice, identical checksums are handled idempotently, while differing checksums raise explicit immutability errors to prevent silent data corruption.
+- **Operational Database (Lean Neon PostgreSQL):** Stores parsed, normalized domain records (`insider_transactions`, `market_prices`, `ingestion_state`, `dataset_period` provenance). In lean operational storage mode (`SEC_STORE_RAW_PAYLOAD=false`), `raw_payload` is stored as NULL while retaining normalized fields, deterministic `record_hash` identity, and zero per-transaction provenance bloat.
+- **Research Data Access Layer:** A clean, read-only interface (`research.research_data_access`) that queries normalized insider transactions and market prices using parameter filters (date ranges, tickers, CIKs, transaction codes) without embedding SQL in research or signal calculations.
+- **Event Study Engine & Adapter:** An adapter (`research.insider_adapter`) maps normalized insider transactions into research event inputs for `research.research.event_study`, enforcing data quality safety checks (handling missing tickers, missing dates, missing market prices, and insufficient future observations).
+- **Signals & Backtesting:** Clean research event outputs feed directly into signal generation and backtesting simulation (`backtesting.engine`).
 
 ### Lean Operational Storage Mode (`SEC_STORE_RAW_PAYLOAD`)
 
@@ -28,6 +36,11 @@ Operational storage behavior is controlled by `SEC_STORE_RAW_PAYLOAD`:
 
 - **`SEC_STORE_RAW_PAYLOAD=false` (Default / Production):** `raw_payload` is NOT persisted into `insider_transactions`, saving substantial database storage while retaining all normalized transaction fields, deterministic transaction identity (`record_hash`), dataset-level provenance, and ingestion state.
 - **`SEC_STORE_RAW_PAYLOAD=true`:** Retains the existing behavior where `raw_payload` JSON is persisted into `insider_transactions`.
+
+### Immutable Archive Configuration
+
+- **`SEC_ARCHIVE_BACKEND` (Default: `filesystem`):** Archive storage backend implementation.
+- **`SEC_ARCHIVE_PATH` (Default: `data/archive`):** Local filesystem directory path for storing quarterly SEC ZIP archives and sidecar manifest JSON files.
 
 ## Storage Recovery Production Sequence
 
