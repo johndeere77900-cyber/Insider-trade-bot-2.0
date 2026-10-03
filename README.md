@@ -19,8 +19,15 @@ Research & Signal Engine
 ```
 
 1. **Normalized Operational Database (Neon):** Retains parsed, normalized transaction fields required for querying, signal generation, and research (`insider_transactions`, `ingestion_state`, `dataset_period` provenance).
-2. **Immutable Raw Archive:** Preserves complete quarterly SEC datasets and raw payloads separately for full auditing/reprocessing without bloating database index storage.
-3. **Dataset-Level Provenance:** Provenance is tracked at the dataset period level (`dataset_period`) rather than per-transaction.
+2. **Immutable Raw Archive:** Official SEC quarterly ZIPs serve as the authoritative raw archive. Complete quarterly SEC datasets are preserved separately for auditing/reprocessing without duplicating raw JSON payloads inside every database transaction row.
+3. **Dataset-Level Provenance:** Provenance is tracked at the dataset period level (`dataset_period`) storing SEC dataset URL, quarter, SHA-256 checksum, validation status, and ingestion state.
+
+### Lean Operational Storage Mode (`SEC_STORE_RAW_PAYLOAD`)
+
+Operational storage behavior is controlled by `SEC_STORE_RAW_PAYLOAD`:
+
+- **`SEC_STORE_RAW_PAYLOAD=false` (Default / Production):** `raw_payload` is NOT persisted into `insider_transactions`, saving substantial database storage while retaining all normalized transaction fields, deterministic transaction identity (`record_hash`), dataset-level provenance, and ingestion state.
+- **`SEC_STORE_RAW_PAYLOAD=true`:** Retains the existing behavior where `raw_payload` JSON is persisted into `insider_transactions`.
 
 ## Storage Recovery Production Sequence
 

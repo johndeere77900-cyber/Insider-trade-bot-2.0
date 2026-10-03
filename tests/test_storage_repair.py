@@ -67,7 +67,7 @@ def test_physical_logical_payload_distinction(tmp_path) -> None:
         "raw": {"data": "A" * 500},
     }
     norm = normalize_bulk_record(raw_rec)
-    store_bulk_insider_transactions(db_url, [norm])
+    store_bulk_insider_transactions(db_url, [norm], store_raw_payload=True)
 
     res = run_storage_audit(db_url)
     assert res["raw_payload_count"] == 1
@@ -319,7 +319,7 @@ def test_raw_payload_behavior_preserved(tmp_path) -> None:
     }
 
     norm = normalize_bulk_record(raw_rec)
-    store_bulk_insider_transactions(db_url, [norm])
+    store_bulk_insider_transactions(db_url, [norm], store_raw_payload=True)
 
     with connect(db_url) as conn:
         cursor = conn.execute("SELECT raw_payload FROM insider_transactions WHERE accession_number='000123'")

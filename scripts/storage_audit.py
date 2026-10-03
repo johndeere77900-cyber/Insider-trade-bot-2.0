@@ -216,8 +216,11 @@ def run_storage_audit(database_url: str) -> dict:
             print(f"    {idx_name:55s} {idx_size / (1024 * 1024):.2f} MB ({idx_size:,} bytes)")
         print()
 
+    raw_null_count = max(0, it_rows - raw_count)
+
     print("  RAW_PAYLOAD STORAGE MEASUREMENTS:")
     print(f"    Rows with raw_payload:               {raw_count:,}")
+    print(f"    Rows without raw_payload (NULL):     {raw_null_count:,}")
     print(f"    Logical string length (characters):  {raw_logical_sum:,} total chars ({raw_logical_avg:.1f} chars/row avg)")
     if is_postgresql_url(database_url):
         print(f"    Physical PostgreSQL storage (bytes): {raw_physical_sum / (1024 * 1024):.2f} MB ({raw_physical_sum:,} bytes, {raw_physical_avg:.1f} bytes/row avg)")
@@ -303,9 +306,13 @@ def run_storage_audit(database_url: str) -> dict:
     audit_data.update({
         "database_size_bytes": db_size_bytes,
         "insider_transactions_count": it_rows,
+        "insider_transactions_table_bytes": it_table_bytes,
+        "insider_transactions_index_bytes": it_index_bytes,
         "provenance_count": prov_rows,
+        "provenance_size_bytes": prov_total_bytes,
         "provenance_breakdown": prov_dict,
         "raw_payload_count": raw_count,
+        "raw_payload_null_count": raw_null_count,
         "raw_payload_logical_sum": raw_logical_sum,
         "raw_payload_physical_sum": raw_physical_sum,
         "raw_payload_physical_avg": raw_physical_avg,
