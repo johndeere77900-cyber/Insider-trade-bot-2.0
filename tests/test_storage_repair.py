@@ -134,13 +134,42 @@ def test_migration_safety_checks_unique_constraint(tmp_path) -> None:
         conn.execute("CREATE UNIQUE INDEX idx_insider_tx_uniq ON insider_transactions (source, accession_number, record_hash)")
         conn.commit()
 
-    # Migration safely drops index because table UNIQUE constraint exists
+    # Migration safely drops index because exact table UNIQUE constraint exists
     success = run_migration(db_url)
     assert success is True
 
     with connect(db_url) as conn:
         cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_insider_tx_uniq'")
         assert cursor.fetchone() is None
+
+
+def test_migration_refuses_drop_if_exact_unique_constraint_missing(tmp_path) -> None:
+    """Verify run_migration refuses to drop idx_insider_tx_uniq if an unrelated UNIQUE constraint exists instead of exact (source, accession_number, record_hash)."""
+    db_file = tmp_path / "test_migration_unrelated_uniq.db"
+    db_url = f"sqlite:///{db_file}"
+
+    # Create table WITHOUT exact UNIQUE(source, accession_number, record_hash) constraint, but WITH an unrelated UNIQUE(accession_number)
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            CREATE TABLE insider_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT,
+                accession_number TEXT UNIQUE,
+                record_hash TEXT
+            )
+            """
+        )
+        conn.execute("CREATE UNIQUE INDEX idx_insider_tx_uniq ON insider_transactions (source, accession_number, record_hash)")
+        conn.commit()
+
+    # Migration must REFUSE to drop idx_insider_tx_uniq because exact UNIQUE(source, accession_number, record_hash) is missing
+    success = run_migration(db_url)
+    assert success is False, "Migration must refuse to drop duplicate index if exact uniqueness protection is missing"
+
+    with connect(db_url) as conn:
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_insider_tx_uniq'")
+        assert cursor.fetchone() is not None, "idx_insider_tx_uniq must NOT be dropped when exact uniqueness protection is absent"
 
 
 def test_provenance_audit_orphan_and_missing_dataset_detection(tmp_path) -> None:
