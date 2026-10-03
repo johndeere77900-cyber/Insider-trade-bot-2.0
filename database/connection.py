@@ -149,6 +149,7 @@ def _postgres_schema() -> str:
         shares DOUBLE PRECISION,
         price DOUBLE PRECISION,
         transaction_type TEXT,
+        acquired_disposed TEXT,
         ownership_type TEXT,
         ownership_nature TEXT,
         source_url TEXT,
@@ -412,6 +413,7 @@ def initialize_database(database_url: str) -> Any:
                 ("ticker", "TEXT"),
                 ("security_title", "TEXT"),
                 ("transaction_type", "TEXT"),
+                ("acquired_disposed", "TEXT"),
                 ("ownership_nature", "TEXT"),
                 ("source_url", "TEXT"),
             ]
@@ -443,6 +445,7 @@ def initialize_database(database_url: str) -> Any:
                     "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS ticker TEXT;",
                     "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS security_title TEXT;",
                     "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS transaction_type TEXT;",
+                    "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS acquired_disposed TEXT;",
                     "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS ownership_nature TEXT;",
                     "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS source_url TEXT;",
                 ]

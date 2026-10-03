@@ -56,6 +56,64 @@ class EventAdapterResult:
     rejections: Tuple[EventAdapterRejection, ...]
 
 
+def _deduplicate_amendments(
+    transactions: List[NormalizedBulkTransaction],
+) -> Tuple[List[NormalizedBulkTransaction], List[EventAdapterRejection]]:
+    """
+    Deduplicate transactions where an amendment replaces an original filing.
+    Preserves both in operational storage, but selects only effective transactions for research.
+    """
+    # Group by filing identity: (accession_number, ticker, reporting_owner_cik/name, transaction_date, transaction_code, shares)
+    # If a transaction has is_amendment=True or form_type containing '/A', identify matching non-amendment or earlier filings and mark them superseded.
+    amendments: List[NormalizedBulkTransaction] = []
+    originals: List[NormalizedBulkTransaction] = []
+
+    for tx in transactions:
+        form = (tx.form_type or "4").upper()
+        if tx.is_amendment or "/A" in form:
+            amendments.append(tx)
+        else:
+            originals.append(tx)
+
+    if not amendments:
+        return transactions, []
+
+    effective_txs: List[NormalizedBulkTransaction] = []
+    rejections: List[EventAdapterRejection] = []
+    superseded_hashes = set()
+
+    for amend_tx in amendments:
+        # Match original by accession_number OR (issuer_cik, reporting_owner_cik, transaction_date, security_title, shares)
+        for orig_tx in originals:
+            same_accession = orig_tx.accession_number and orig_tx.accession_number == amend_tx.accession_number
+            same_business_key = (
+                orig_tx.issuer_cik == amend_tx.issuer_cik
+                and orig_tx.reporting_owner_cik == amend_tx.reporting_owner_cik
+                and orig_tx.transaction_date == amend_tx.transaction_date
+                and orig_tx.security_title == amend_tx.security_title
+            )
+            if same_accession or same_business_key:
+                superseded_hashes.add(orig_tx.record_hash or id(orig_tx))
+                rejections.append(
+                    EventAdapterRejection(
+                        accession_number=orig_tx.accession_number or "UNKNOWN",
+                        record_hash=orig_tx.record_hash,
+                        reason=REJECTION_AMENDMENT_SUPERSEDED,
+                        details=(
+                            f"Transaction superseded by amendment filing "
+                            f"(Accession: {amend_tx.accession_number})."
+                        ),
+                    )
+                )
+
+    for tx in transactions:
+        key = tx.record_hash or id(tx)
+        if key not in superseded_hashes:
+            effective_txs.append(tx)
+
+    return effective_txs, rejections
+
+
 def prepare_event_study_inputs(
     database_url: str,
     transactions: List[NormalizedBulkTransaction],
@@ -66,18 +124,20 @@ def prepare_event_study_inputs(
 
     Data Quality & Safety rules:
     - Missing ticker -> REJECTED_MISSING_TICKER
-    - Missing or invalid transaction_date -> REJECTED_MISSING_DATE / REJECTED_INVALID_DATE
-    - Missing market price on transaction date -> REJECTED_MISSING_PRICE
+    - Missing or invalid filing_date / transaction_date -> REJECTED_MISSING_DATE / REJECTED_INVALID_DATE
+    - Missing market price on filing date -> REJECTED_MISSING_PRICE
     - Insufficient future observations for horizon_days -> REJECTED_INSUFFICIENT_OBSERVATIONS
-    - Superseded amendments -> REJECTED_AMENDMENT_SUPERSEDED (or filtered)
+    - Superseded amendments -> REJECTED_AMENDMENT_SUPERSEDED
     """
     valid_events: List[ResearchEventInput] = []
-    rejections: List[EventAdapterRejection] = []
+
+    # 0. Deduplicate superseded filings/transactions
+    effective_transactions, rejections = _deduplicate_amendments(transactions)
 
     # Cache market prices per ticker to avoid repetitive queries
     price_cache: Dict[str, Dict[str, float]] = {}
 
-    for tx in transactions:
+    for tx in effective_transactions:
         acc = tx.accession_number or "UNKNOWN"
         rec_hash = tx.record_hash
 
@@ -95,19 +155,19 @@ def prepare_event_study_inputs(
 
         ticker = tx.ticker.strip().upper()
 
-        # 2. Date check
-        if not tx.transaction_date or not tx.transaction_date.strip():
+        # 2. Date check (Point-In-Time safety: event_date is public filing_date)
+        if not tx.filing_date or not tx.filing_date.strip():
             rejections.append(
                 EventAdapterRejection(
                     accession_number=acc,
                     record_hash=rec_hash,
                     reason=REJECTION_MISSING_DATE,
-                    details="Transaction record has no valid transaction date.",
+                    details="Transaction record has no valid filing date.",
                 )
             )
             continue
 
-        tx_date = tx.transaction_date.strip()
+        event_date = tx.filing_date.strip()
 
         # 3. Market price lookup for ticker
         if ticker not in price_cache:
@@ -115,21 +175,21 @@ def prepare_event_study_inputs(
 
         prices = price_cache[ticker]
 
-        if not prices or tx_date not in prices:
+        if not prices or event_date not in prices:
             rejections.append(
                 EventAdapterRejection(
                     accession_number=acc,
                     record_hash=rec_hash,
                     reason=REJECTION_MISSING_PRICE,
-                    details=f"No market price found for {ticker} on transaction date {tx_date}.",
+                    details=f"No market price found for {ticker} on filing date {event_date}.",
                 )
             )
             continue
 
-        event_price = prices[tx_date]
+        event_price = prices[event_date]
 
         # 4. Insufficient future observations check
-        future_dates = [d for d in sorted(prices.keys()) if d > tx_date]
+        future_dates = [d for d in sorted(prices.keys()) if d > event_date]
         if len(future_dates) < horizon_days:
             rejections.append(
                 EventAdapterRejection(
@@ -137,7 +197,7 @@ def prepare_event_study_inputs(
                     record_hash=rec_hash,
                     reason=REJECTION_INSUFFICIENT_OBSERVATIONS,
                     details=(
-                        f"Insufficient price observations ({len(future_dates)}) after {tx_date} "
+                        f"Insufficient price observations ({len(future_dates)}) after filing date {event_date} "
                         f"for horizon {horizon_days}."
                     ),
                 )
@@ -145,13 +205,13 @@ def prepare_event_study_inputs(
             continue
 
         # 5. Deterministic event_key
-        event_key = f"{ticker}|{tx_date}|{acc}|{rec_hash or 'nohash'}"
+        event_key = f"{ticker}|{event_date}|{acc}|{rec_hash or 'nohash'}"
 
         valid_events.append(
             ResearchEventInput(
                 event_key=event_key,
                 symbol=ticker,
-                event_date=tx_date,
+                event_date=event_date,
                 event_price=event_price,
                 prices=prices,
                 transaction=tx,

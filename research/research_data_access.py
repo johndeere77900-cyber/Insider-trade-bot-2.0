@@ -53,6 +53,7 @@ def query_insider_transactions(
             shares,
             price,
             transaction_type,
+            acquired_disposed,
             ownership_type,
             ownership_nature,
             source,
@@ -95,9 +96,8 @@ def query_insider_transactions(
             params.extend([code.upper() for code in tc_list])
 
     if acquired_disposed:
-        # Note: In schema, transaction_code or raw/ownership details might carry A/D or it's inferred.
-        # If there's an acquired_disposed field or check:
-        query += f" AND UPPER(ownership_type) = {param_placeholder}" if "acquired_disposed" in query else ""
+        query += f" AND UPPER(acquired_disposed) = {param_placeholder}"
+        params.append(acquired_disposed.strip().upper())
 
     if ownership_types:
         ot_list = [ownership_types] if isinstance(ownership_types, str) else list(ownership_types)
@@ -137,8 +137,7 @@ def query_insider_transactions(
                 except Exception:
                     raw_payload_data = {}
 
-            # Infer acquired_disposed if stored in raw or inferred
-            acq_disp = raw_payload_data.get("transaction", {}).get("TRANS_ACQUIRED_DISP_CD")
+            acq_disp = row["acquired_disposed"] or raw_payload_data.get("transaction", {}).get("TRANS_ACQUIRED_DISP_CD")
 
             records.append(
                 NormalizedBulkTransaction(

@@ -183,6 +183,7 @@ def test_main_historical_force_reprocessing(tmp_path: Path, monkeypatch: pytest.
     db_url = f"sqlite:///{db_path}"
     monkeypatch.setenv("DATABASE_URL", db_url)
     monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(tmp_path / "archive"))
 
     initialize_database(db_url)
 

@@ -31,46 +31,26 @@ def test_db(tmp_path):
     db_url = f"sqlite:///{db_file}"
     initialize_database(db_url)
 
-    # Insert market prices
-    store_market_price(
-        db_url,
-        symbol="AAPL",
-        price_date="2024-01-15",
-        open_price=150.0,
-        high=152.0,
-        low=149.0,
-        close=150.0,
-        adjusted_close=150.0,
-        volume=100000.0,
-        source="TEST",
-        raw_payload={"close": 150.0},
-    )
-    store_market_price(
-        db_url,
-        symbol="AAPL",
-        price_date="2024-01-16",
-        open_price=155.0,
-        high=157.0,
-        low=154.0,
-        close=155.0,
-        adjusted_close=155.0,
-        volume=100000.0,
-        source="TEST",
-        raw_payload={"close": 155.0},
-    )
-    store_market_price(
-        db_url,
-        symbol="AAPL",
-        price_date="2024-01-17",
-        open_price=160.0,
-        high=162.0,
-        low=159.0,
-        close=160.0,
-        adjusted_close=160.0,
-        volume=100000.0,
-        source="TEST",
-        raw_payload={"close": 160.0},
-    )
+    # Insert market prices for dates 2024-01-15, 2024-01-16, 2024-01-17, 2024-01-18
+    for d, p in [
+        ("2024-01-15", 150.0),
+        ("2024-01-16", 155.0),
+        ("2024-01-17", 160.0),
+        ("2024-01-18", 165.0),
+    ]:
+        store_market_price(
+            db_url,
+            symbol="AAPL",
+            price_date=d,
+            open_price=p,
+            high=p + 2.0,
+            low=p - 1.0,
+            close=p,
+            adjusted_close=p,
+            volume=100000.0,
+            source="TEST",
+            raw_payload={"close": p},
+        )
 
     # Insert transactions
     tx1 = NormalizedBulkTransaction(
@@ -222,6 +202,91 @@ def test_prepare_event_study_inputs_and_rejections(test_db):
     assert REJECTION_MISSING_PRICE in reasons
 
 
+def test_point_in_time_safety_and_acquired_disposed_filter(test_db):
+    # Verify point-in-time filing_date safety: event_date MUST be filing_date (2024-01-16), not transaction_date (2024-01-15)
+    txs_d = query_insider_transactions(test_db, acquired_disposed="D")
+    assert len(txs_d) == 1
+    assert txs_d[0].accession_number == "000001"
+
+    txs_a = query_insider_transactions(test_db, acquired_disposed="A")
+    assert len(txs_a) == 1
+    assert txs_a[0].accession_number == "000002"
+
+    adapter_res = prepare_event_study_inputs(test_db, txs_d, horizon_days=1)
+    event = adapter_res.valid_events[0]
+
+    # Point-in-time safety check: event_date uses public filing_date 2024-01-16, event_price is 155.0
+    assert event.event_date == "2024-01-16"
+    assert event.event_price == 155.0
+    assert event.transaction.transaction_date == "2024-01-15"
+
+
+def test_amendment_supersession_deduplication(test_db):
+    orig = NormalizedBulkTransaction(
+        accession_number="000010",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-16",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=1000.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_orig",
+        form_type="4",
+    )
+
+    amend = NormalizedBulkTransaction(
+        accession_number="000010",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-17",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=1200.0,  # Amended shares count
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=True,
+        date_of_orig_submission="2024-01-16",
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_amend",
+        form_type="4/A",
+    )
+
+    adapter_res = prepare_event_study_inputs(test_db, [orig, amend], horizon_days=1)
+
+    # Should select only 1 effective research event (the amendment), rejecting original as superseded
+    assert len(adapter_res.valid_events) == 1
+    assert adapter_res.valid_events[0].transaction.record_hash == "hash_amend"
+    assert adapter_res.valid_events[0].transaction.shares == 1200.0
+
+    rejections = adapter_res.rejections
+    assert len(rejections) == 1
+    assert rejections[0].reason == "REJECTED_AMENDMENT_SUPERSEDED"
+    assert rejections[0].record_hash == "hash_orig"
+
+
 def test_event_study_and_backtest_conversion(test_db):
     txs = query_insider_transactions(test_db, accession_numbers=["000001"])
     adapter_res = prepare_event_study_inputs(test_db, txs, horizon_days=1)
@@ -231,10 +296,11 @@ def test_event_study_and_backtest_conversion(test_db):
 
     assert summary.event_count == 1
     assert len(returns) == 1
-    assert returns[0].event_price == 150.0
-    assert returns[0].future_price == 155.0
+    # Point-in-time safety: filing_date is 2024-01-16 (price 155.0), next horizon price is 2024-01-17 (price 160.0)
+    assert returns[0].event_price == 155.0
+    assert returns[0].future_price == 160.0
 
     bt_trades = convert_events_to_backtest_trades(adapter_res.valid_events, holding_periods=1)
     assert len(bt_trades) == 1
     assert bt_trades[0]["symbol"] == "AAPL"
-    assert bt_trades[0]["entry_price"] == 150.0
+    assert bt_trades[0]["entry_price"] == 155.0

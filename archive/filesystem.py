@@ -69,7 +69,6 @@ class FilesystemSECArchive(SECArchiveInterface):
         period: str,
         content: Union[str, bytes, bytearray],
         metadata: Optional[ArchiveMetadata] = None,
-        overwrite: bool = False,
     ) -> ArchiveMetadata:
         norm_period = self._normalize_period(period)
         zip_file = self._zip_path(norm_period)
@@ -81,7 +80,7 @@ class FilesystemSECArchive(SECArchiveInterface):
             existing_meta = self.metadata(norm_period)
             if existing_meta.sha256 == calc_sha256:
                 return existing_meta
-            elif not overwrite:
+            else:
                 raise ArchiveExistsError(
                     f"Archive for period '{norm_period}' already exists with different SHA-256 "
                     f"({existing_meta.sha256} vs incoming {calc_sha256}). Immutable archives cannot be overwritten."

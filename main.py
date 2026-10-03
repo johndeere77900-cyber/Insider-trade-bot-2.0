@@ -112,7 +112,6 @@ def run_historical_acquisition(
                 period=period_str,
                 content=temp_zip_path,
                 metadata=archive_meta,
-                overwrite=force,
             )
 
             store_provenance(

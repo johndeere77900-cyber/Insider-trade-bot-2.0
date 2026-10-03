@@ -72,7 +72,6 @@ class SECArchiveInterface(ABC):
         period: str,
         content: Union[str, bytes, bytearray],
         metadata: Optional[ArchiveMetadata] = None,
-        overwrite: bool = False,
     ) -> ArchiveMetadata:
         """
         Store an original SEC archive ZIP and its metadata.
@@ -80,7 +79,8 @@ class SECArchiveInterface(ABC):
         Immutability rule:
         - If period does not exist: store ZIP and manifest.
         - If period exists and content SHA-256 matches existing: idempotent success.
-        - If period exists and content SHA-256 differs: raise ArchiveExistsError unless overwrite=True.
+        - If period exists and content SHA-256 differs: raise ArchiveExistsError.
+        - Overwriting different content is strictly forbidden under all circumstances.
         """
 
     @abstractmethod
