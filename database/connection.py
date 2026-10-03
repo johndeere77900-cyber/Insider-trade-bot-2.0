@@ -107,11 +107,18 @@ def connect(database_url: str) -> Any:
                 addrinfo = socket.getaddrinfo(
                     host, None, family=socket.AF_INET, type=socket.SOCK_STREAM
                 )
-                if addrinfo:
-                    ipv4_address = addrinfo[0][4][0]
-                    kwargs["hostaddr"] = ipv4_address
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not resolve an IPv4 address for PostgreSQL host: {host}"
+                ) from exc
+
+            if not addrinfo:
+                raise RuntimeError(
+                    f"Could not resolve an IPv4 address for PostgreSQL host: {host}"
+                )
+
+            ipv4_address = addrinfo[0][4][0]
+            kwargs["hostaddr"] = ipv4_address
 
         return psycopg.connect(**kwargs)
 
