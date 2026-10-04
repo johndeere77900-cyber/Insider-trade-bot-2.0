@@ -62,24 +62,24 @@ def _deduplicate_amendments(
     transactions: List[NormalizedBulkTransaction],
 ) -> Tuple[List[NormalizedBulkTransaction], List[EventAdapterRejection]]:
     """
-    Deduplicate transactions where an explicit SEC amendment replaces an original filing.
-    Preserves all records in operational storage, but selects only effective, authoritative transactions for research.
+    Deduplicate transactions where an SEC amendment occurs.
+    Preserves all records in operational storage (`insider_transactions`).
 
     Rules:
-    1. Authoritative Same-Accession Match:
-       If an amendment filing (/A) shares the EXACT same accession_number as an original filing
-       record (or represents an updated transaction inside the same accession), the original transaction
-       is deterministically superseded (REJECTED_AMENDMENT_SUPERSEDED), and the amendment is kept as effective.
-    2. Non-Authoritative / Cross-Accession Amendment:
-       When an amendment specifies `is_amendment=True` or form_type `/A` or `date_of_orig_submission`, but exists
-       in a different accession_number from original filings in the dataset:
-       - The SEC bulk dataset does NOT provide an original accession_number link.
-       - DATE_OF_ORIG_SUB is a date string and NOT an authoritative unique filing identifier.
-       - A single candidate matching by DATE_OF_ORIG_SUB + CIKs + transaction date is NOT treated as an authoritative supersession.
-       - Guessing is strictly avoided: original filings across different accessions are NOT marked superseded.
-       - The uncertain amendment transaction is excluded from research-event selection with REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL
-         to prevent double-counting.
-    3. Legitimate Same-Day Transactions:
+    1. SEC Bulk Dataset Limitation:
+       The SEC Form 3/4/5 bulk dataset does NOT provide an authoritative original accession
+       number link or original transaction key linking amendments across separate submissions.
+       DATE_OF_ORIG_SUB is solely a date string and NOT an authoritative unique filing identifier.
+    2. Zero Supersession by Heuristics:
+       Original filings are NEVER superseded based on DATE_OF_ORIG_SUB, same accession numbers,
+       or business-key matching heuristics.
+    3. Unresolved Amendment Handling:
+       Any amendment filing (`is_amendment=True`, `/A` form type, or non-empty `date_of_orig_submission`)
+       where an authoritative original link is absent in the source data is treated as an unresolved amendment.
+       The original transaction is kept as the valid research event.
+       The unresolved amendment is excluded from research-event selection with `REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL`
+       to prevent double-counting without guessing or corrupting effective events.
+    4. Legitimate Non-Amended Transactions:
        Non-amended transactions (even matching issuer, insider, transaction date, and security) are NEVER collapsed.
     """
     amendments: List[NormalizedBulkTransaction] = []
@@ -95,85 +95,27 @@ def _deduplicate_amendments(
     if not amendments:
         return transactions, []
 
-    effective_txs: List[NormalizedBulkTransaction] = []
+    effective_txs: List[NormalizedBulkTransaction] = list(originals)
     rejections: List[EventAdapterRejection] = []
-    excluded_hashes = set()
 
     for amend_tx in amendments:
-        amend_hash = amend_tx.record_hash or id(amend_tx)
-
-        # 1. Authoritative same-accession match
-        same_accession_candidates = [
-            orig_tx for orig_tx in originals
-            if orig_tx.accession_number and orig_tx.accession_number == amend_tx.accession_number
-        ]
-
-        if len(same_accession_candidates) == 1:
-            # Case A: Exactly 1 deterministic original candidate in same accession
-            orig_tx = same_accession_candidates[0]
-            orig_hash = orig_tx.record_hash or id(orig_tx)
-            excluded_hashes.add(orig_hash)
-            rejections.append(
-                EventAdapterRejection(
-                    accession_number=orig_tx.accession_number or "UNKNOWN",
-                    record_hash=orig_tx.record_hash,
-                    reason=REJECTION_AMENDMENT_SUPERSEDED,
-                    details=(
-                        f"Original transaction superseded by authoritative same-accession amendment filing "
-                        f"(Accession: {amend_tx.accession_number})."
-                    ),
-                )
+        # Since SEC bulk data lacks an authoritative original link field, cross-filing amendments
+        # cannot be linked deterministically to an original filing without guessing.
+        # Exclude the unresolved amendment from research events to prevent double counting,
+        # while keeping the original transaction intact and valid.
+        rejections.append(
+            EventAdapterRejection(
+                accession_number=amend_tx.accession_number or "UNKNOWN",
+                record_hash=amend_tx.record_hash,
+                reason=REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL,
+                details=(
+                    f"Unresolved SEC amendment filing (Accession: {amend_tx.accession_number}, "
+                    f"date_of_orig_submission: '{amend_tx.date_of_orig_submission}'): "
+                    f"SEC bulk dataset lacks an authoritative original filing key link. "
+                    f"Guessing avoided; original filings preserved."
+                ),
             )
-        elif len(same_accession_candidates) > 1:
-            # Case B: Ambiguous match (>1 same-accession candidates) -> Do not guess; exclude amendment and candidates
-            excluded_hashes.add(amend_hash)
-            for cand in same_accession_candidates:
-                cand_hash = cand.record_hash or id(cand)
-                excluded_hashes.add(cand_hash)
-                rejections.append(
-                    EventAdapterRejection(
-                        accession_number=cand.accession_number or "UNKNOWN",
-                        record_hash=cand.record_hash,
-                        reason=REJECTED_AMENDMENT_AMBIGUOUS,
-                        details=(
-                            f"Ambiguous same-accession filing relationship: multiple candidates ({len(same_accession_candidates)}) "
-                            f"in accession {amend_tx.accession_number}."
-                        ),
-                    )
-                )
-            rejections.append(
-                EventAdapterRejection(
-                    accession_number=amend_tx.accession_number or "UNKNOWN",
-                    record_hash=amend_tx.record_hash,
-                    reason=REJECTED_AMENDMENT_AMBIGUOUS,
-                    details=(
-                        f"Ambiguous amendment relationship: matches {len(same_accession_candidates)} candidate original filings in accession. "
-                        f"Guessing avoided."
-                    ),
-                )
-            )
-        else:
-            # Case C: Cross-accession amendment or no same-accession original found.
-            # Do NOT guess or use DATE_OF_ORIG_SUB heuristics to supersede originals in different accessions.
-            # Exclude the uncertain amendment transaction from research events to prevent double-counting.
-            excluded_hashes.add(amend_hash)
-            rejections.append(
-                EventAdapterRejection(
-                    accession_number=amend_tx.accession_number or "UNKNOWN",
-                    record_hash=amend_tx.record_hash,
-                    reason=REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL,
-                    details=(
-                        f"Unresolved cross-accession amendment: SEC bulk dataset lacks authoritative original accession link "
-                        f"(date_of_orig_submission: '{amend_tx.date_of_orig_submission}'). "
-                        f"Guessing avoided; original filings preserved."
-                    ),
-                )
-            )
-
-    for tx in transactions:
-        key = tx.record_hash or id(tx)
-        if key not in excluded_hashes:
-            effective_txs.append(tx)
+        )
 
     return effective_txs, rejections
 
