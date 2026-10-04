@@ -353,6 +353,124 @@ def test_amendment_supersession_deduplication_and_same_day_legitimate_txs(test_d
     assert len(legit_res.rejections) == 0
 
 
+def test_amendment_cases_ambiguous_and_unresolved(test_db):
+    # Case B: Ambiguous match (>1 original candidates match amendment metadata)
+    orig_cand1 = NormalizedBulkTransaction(
+        accession_number="000030",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-16",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=100.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_cand1",
+        form_type="4",
+    )
+
+    orig_cand2 = NormalizedBulkTransaction(
+        accession_number="000031",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-16",
+        transaction_code="P",
+        security_title="Common Stock",
+        shares=200.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="A",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_cand2",
+        form_type="4",
+    )
+
+    ambig_amend = NormalizedBulkTransaction(
+        accession_number="000032-AMEND",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-17",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=150.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=True,
+        date_of_orig_submission="2024-01-16",
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_ambig_amend",
+        form_type="4/A",
+    )
+
+    ambig_res = prepare_event_study_inputs(test_db, [orig_cand1, orig_cand2, ambig_amend], horizon_days=1)
+    assert len(ambig_res.valid_events) == 0
+    reasons = [r.reason for r in ambig_res.rejections]
+    assert "REJECTED_AMENDMENT_AMBIGUOUS" in reasons
+
+    # Case C: Unresolved match (0 original candidates found in dataset)
+    unresolved_amend = NormalizedBulkTransaction(
+        accession_number="000040-AMEND",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-17",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=150.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=True,
+        date_of_orig_submission="2023-01-01",  # No original exists in DB/input
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_unresolved_amend",
+        form_type="4/A",
+    )
+
+    unres_res = prepare_event_study_inputs(test_db, [unresolved_amend], horizon_days=1)
+    assert len(unres_res.valid_events) == 0
+    unres_reasons = [r.reason for r in unres_res.rejections]
+    assert "REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL" in unres_reasons
+
+
 def test_event_study_and_backtest_conversion(test_db):
     txs = query_insider_transactions(test_db, accession_numbers=["000001"])
     adapter_res = prepare_event_study_inputs(test_db, txs, horizon_days=1)

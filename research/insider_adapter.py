@@ -21,6 +21,8 @@ REJECTION_INVALID_DATE = "REJECTED_INVALID_DATE"
 REJECTION_MISSING_PRICE = "REJECTED_MISSING_PRICE"
 REJECTION_INSUFFICIENT_OBSERVATIONS = "REJECTED_INSUFFICIENT_OBSERVATIONS"
 REJECTION_AMENDMENT_SUPERSEDED = "REJECTED_AMENDMENT_SUPERSEDED"
+REJECTED_AMENDMENT_AMBIGUOUS = "REJECTED_AMENDMENT_AMBIGUOUS"
+REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL = "REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL"
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,11 @@ def _deduplicate_amendments(
     Deduplicate transactions where an explicit SEC amendment replaces an original filing.
     Preserves both in operational storage, but selects only effective transactions for research.
     Does NOT collapse legitimate same-day non-amended transactions.
+
+    Rules:
+    - Case A (Deterministic Match - 1 candidate): Mark original transaction superseded, retain amendment as effective event.
+    - Case B (Ambiguous Match - >1 candidates): Do not guess; exclude amendment and all candidate originals.
+    - Case C (Unresolved Match - 0 candidates): Exclude amendment with unresolved original rejection.
     """
     amendments: List[NormalizedBulkTransaction] = []
     originals: List[NormalizedBulkTransaction] = []
@@ -79,15 +86,15 @@ def _deduplicate_amendments(
 
     effective_txs: List[NormalizedBulkTransaction] = []
     rejections: List[EventAdapterRejection] = []
-    superseded_hashes = set()
+    excluded_hashes = set()
 
     for amend_tx in amendments:
+        candidates: List[NormalizedBulkTransaction] = []
+        amend_hash = amend_tx.record_hash or id(amend_tx)
+
         for orig_tx in originals:
-            # Explicit SEC amendment matching criteria:
-            # 1. Matching accession_number (amended transaction in same filing accession)
-            # 2. OR matching original submission date metadata / accession reference
-            same_accession = orig_tx.accession_number and orig_tx.accession_number == amend_tx.accession_number
-            matches_orig_sub_date = (
+            same_accession = bool(orig_tx.accession_number and orig_tx.accession_number == amend_tx.accession_number)
+            matches_orig_sub_date = bool(
                 amend_tx.date_of_orig_submission
                 and orig_tx.filing_date == amend_tx.date_of_orig_submission
                 and orig_tx.issuer_cik == amend_tx.issuer_cik
@@ -96,22 +103,70 @@ def _deduplicate_amendments(
             )
 
             if same_accession or matches_orig_sub_date:
-                superseded_hashes.add(orig_tx.record_hash or id(orig_tx))
+                candidates.append(orig_tx)
+
+        if len(candidates) == 1:
+            # Case A: Exactly 1 deterministic original candidate
+            orig_tx = candidates[0]
+            orig_hash = orig_tx.record_hash or id(orig_tx)
+            excluded_hashes.add(orig_hash)
+            rejections.append(
+                EventAdapterRejection(
+                    accession_number=orig_tx.accession_number or "UNKNOWN",
+                    record_hash=orig_tx.record_hash,
+                    reason=REJECTION_AMENDMENT_SUPERSEDED,
+                    details=(
+                        f"Original transaction superseded by explicit SEC amendment filing "
+                        f"(Accession: {amend_tx.accession_number})."
+                    ),
+                )
+            )
+        elif len(candidates) > 1:
+            # Case B: Ambiguous match (>1 candidates) -> Do not guess; exclude amendment and candidate originals
+            excluded_hashes.add(amend_hash)
+            for cand in candidates:
+                cand_hash = cand.record_hash or id(cand)
+                excluded_hashes.add(cand_hash)
                 rejections.append(
                     EventAdapterRejection(
-                        accession_number=orig_tx.accession_number or "UNKNOWN",
-                        record_hash=orig_tx.record_hash,
-                        reason=REJECTION_AMENDMENT_SUPERSEDED,
+                        accession_number=cand.accession_number or "UNKNOWN",
+                        record_hash=cand.record_hash,
+                        reason=REJECTED_AMENDMENT_AMBIGUOUS,
                         details=(
-                            f"Original transaction superseded by explicit SEC amendment filing "
-                            f"(Accession: {amend_tx.accession_number})."
+                            f"Ambiguous original filing relationship: multiple candidates ({len(candidates)}) "
+                            f"match amendment filing {amend_tx.accession_number}."
                         ),
                     )
                 )
+            rejections.append(
+                EventAdapterRejection(
+                    accession_number=amend_tx.accession_number or "UNKNOWN",
+                    record_hash=amend_tx.record_hash,
+                    reason=REJECTED_AMENDMENT_AMBIGUOUS,
+                    details=(
+                        f"Ambiguous amendment relationship: matches {len(candidates)} candidate original filings. "
+                        f"Guessing avoided."
+                    ),
+                )
+            )
+        else:
+            # Case C: Unresolved match (0 candidates) -> Amendment exists but original is missing in dataset
+            excluded_hashes.add(amend_hash)
+            rejections.append(
+                EventAdapterRejection(
+                    accession_number=amend_tx.accession_number or "UNKNOWN",
+                    record_hash=amend_tx.record_hash,
+                    reason=REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL,
+                    details=(
+                        f"Unresolved amendment relationship: original filing referenced by date_of_orig_submission "
+                        f"'{amend_tx.date_of_orig_submission}' was not found in operational dataset."
+                    ),
+                )
+            )
 
     for tx in transactions:
         key = tx.record_hash or id(tx)
-        if key not in superseded_hashes:
+        if key not in excluded_hashes:
             effective_txs.append(tx)
 
     return effective_txs, rejections
