@@ -58,6 +58,8 @@ def query_insider_transactions(
             ownership_nature,
             source,
             source_url,
+            is_amendment,
+            date_of_orig_submission,
             raw_payload,
             record_hash
         FROM insider_transactions
@@ -138,6 +140,9 @@ def query_insider_transactions(
                     raw_payload_data = {}
 
             acq_disp = row["acquired_disposed"] or raw_payload_data.get("transaction", {}).get("TRANS_ACQUIRED_DISP_CD")
+            form_t = row["form_type"] or "4"
+            is_amend_val = bool(row["is_amendment"]) if row["is_amendment"] is not None else ("/A" in form_t)
+            orig_sub_date = row["date_of_orig_submission"]
 
             records.append(
                 NormalizedBulkTransaction(
@@ -158,12 +163,12 @@ def query_insider_transactions(
                     ownership_type=row["ownership_type"],
                     ownership_nature=row["ownership_nature"],
                     source_url=row["source_url"] or "",
-                    is_amendment=bool(row["accession_number"] and ("/A" in row["form_type"] or False)),
-                    date_of_orig_submission=None,
+                    is_amendment=is_amend_val,
+                    date_of_orig_submission=orig_sub_date,
                     raw_payload=raw_payload_data,
                     source=row["source"] or "SEC",
                     record_hash=row["record_hash"],
-                    form_type=row["form_type"] or "4",
+                    form_type=form_t,
                 )
             )
 

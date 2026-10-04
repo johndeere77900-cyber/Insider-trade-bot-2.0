@@ -106,7 +106,12 @@ def load_settings() -> Settings:
             "SEC_ARCHIVE_BACKEND",
             "filesystem",
         ).strip().lower(),
-        sec_archive_path=data_directory / "archive",
+        sec_archive_path=Path(
+            os.getenv(
+                "SEC_ARCHIVE_PATH",
+                str(data_directory / "archive"),
+            )
+        ),
 
         data_directory=data_directory,
         raw_data_directory=data_directory / "raw",

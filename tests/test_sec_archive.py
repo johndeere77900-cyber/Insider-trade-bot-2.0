@@ -58,16 +58,33 @@ def test_archive_idempotency_and_immutability(tmp_path) -> None:
 
     saved_meta1 = archive.put("2006-Q1", str(zip_file1))
 
-    # Identical content write -> Idempotent success
+    # 1. Both exist with identical SHA-256 -> Idempotent success
     saved_meta2 = archive.put("2006-Q1", str(zip_file1))
     assert saved_meta1.sha256 == saved_meta2.sha256
+    assert saved_meta2.archive_path == "2006-Q1.zip"
 
-    # Different content write -> ArchiveExistsError
+    # 2. Both exist with different SHA-256 -> ArchiveExistsError
     zip_file2 = tmp_path / "test2.zip"
     create_dummy_zip(str(zip_file2), {"SUBMISSION.tsv": "DIFFERENT_CONTENT"})
 
     with pytest.raises(ArchiveExistsError, match="already exists with different SHA-256"):
         archive.put("2006-Q1", str(zip_file2))
+
+    # 3. ZIP exists but manifest missing -> ArchiveExistsError (do NOT overwrite)
+    zip_only_period = "2006-Q2"
+    z_file = archive_dir / f"{zip_only_period}.zip"
+    z_file.write_bytes(b"dummy zip content")
+
+    with pytest.raises(ArchiveExistsError, match="ZIP archive exists but manifest is missing"):
+        archive.put(zip_only_period, str(zip_file1))
+
+    # 4. Manifest exists but ZIP missing -> ArchiveExistsError (do NOT recreate)
+    manifest_only_period = "2006-Q3"
+    m_file = archive_dir / f"{manifest_only_period}.json"
+    m_file.write_text('{"period": "2006-Q3", "sha256": "abc"}')
+
+    with pytest.raises(ArchiveExistsError, match="Manifest exists but ZIP archive is missing"):
+        archive.put(manifest_only_period, str(zip_file1))
 
 
 def test_archive_metadata_and_list(tmp_path) -> None:

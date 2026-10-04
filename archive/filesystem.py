@@ -73,10 +73,14 @@ class FilesystemSECArchive(SECArchiveInterface):
         norm_period = self._normalize_period(period)
         zip_file = self._zip_path(norm_period)
         manifest_file = self._manifest_path(norm_period)
+        rel_zip_key = f"{norm_period}.zip"
+
+        zip_exists = os.path.exists(zip_file)
+        manifest_exists = os.path.exists(manifest_file)
 
         calc_sha256, calc_size = self._compute_sha256(content)
 
-        if self.exists(norm_period):
+        if zip_exists and manifest_exists:
             existing_meta = self.metadata(norm_period)
             if existing_meta.sha256 == calc_sha256:
                 return existing_meta
@@ -85,6 +89,16 @@ class FilesystemSECArchive(SECArchiveInterface):
                     f"Archive for period '{norm_period}' already exists with different SHA-256 "
                     f"({existing_meta.sha256} vs incoming {calc_sha256}). Immutable archives cannot be overwritten."
                 )
+        elif zip_exists and not manifest_exists:
+            raise ArchiveExistsError(
+                f"Incomplete archive state for period '{norm_period}': ZIP archive exists but manifest is missing. "
+                f"Overwriting incomplete archives is forbidden."
+            )
+        elif manifest_exists and not zip_exists:
+            raise ArchiveExistsError(
+                f"Incomplete archive state for period '{norm_period}': Manifest exists but ZIP archive is missing. "
+                f"Recreating incomplete archives is forbidden."
+            )
 
         # Write ZIP content
         if isinstance(content, str):
@@ -102,7 +116,7 @@ class FilesystemSECArchive(SECArchiveInterface):
                 source_url="",
                 sha256=calc_sha256,
                 retrieved_at=retrieved_at,
-                archive_path=zip_file,
+                archive_path=rel_zip_key,
                 validation_status="validated",
                 file_size_bytes=calc_size,
             )
@@ -113,7 +127,7 @@ class FilesystemSECArchive(SECArchiveInterface):
                 source_url=metadata.source_url or "",
                 sha256=calc_sha256,
                 retrieved_at=metadata.retrieved_at or retrieved_at,
-                archive_path=zip_file,
+                archive_path=rel_zip_key,
                 validation_status=metadata.validation_status or "validated",
                 file_size_bytes=calc_size,
             )

@@ -60,17 +60,16 @@ def _deduplicate_amendments(
     transactions: List[NormalizedBulkTransaction],
 ) -> Tuple[List[NormalizedBulkTransaction], List[EventAdapterRejection]]:
     """
-    Deduplicate transactions where an amendment replaces an original filing.
+    Deduplicate transactions where an explicit SEC amendment replaces an original filing.
     Preserves both in operational storage, but selects only effective transactions for research.
+    Does NOT collapse legitimate same-day non-amended transactions.
     """
-    # Group by filing identity: (accession_number, ticker, reporting_owner_cik/name, transaction_date, transaction_code, shares)
-    # If a transaction has is_amendment=True or form_type containing '/A', identify matching non-amendment or earlier filings and mark them superseded.
     amendments: List[NormalizedBulkTransaction] = []
     originals: List[NormalizedBulkTransaction] = []
 
     for tx in transactions:
         form = (tx.form_type or "4").upper()
-        if tx.is_amendment or "/A" in form:
+        if tx.is_amendment or "/A" in form or bool(tx.date_of_orig_submission):
             amendments.append(tx)
         else:
             originals.append(tx)
@@ -83,16 +82,20 @@ def _deduplicate_amendments(
     superseded_hashes = set()
 
     for amend_tx in amendments:
-        # Match original by accession_number OR (issuer_cik, reporting_owner_cik, transaction_date, security_title, shares)
         for orig_tx in originals:
+            # Explicit SEC amendment matching criteria:
+            # 1. Matching accession_number (amended transaction in same filing accession)
+            # 2. OR matching original submission date metadata / accession reference
             same_accession = orig_tx.accession_number and orig_tx.accession_number == amend_tx.accession_number
-            same_business_key = (
-                orig_tx.issuer_cik == amend_tx.issuer_cik
+            matches_orig_sub_date = (
+                amend_tx.date_of_orig_submission
+                and orig_tx.filing_date == amend_tx.date_of_orig_submission
+                and orig_tx.issuer_cik == amend_tx.issuer_cik
                 and orig_tx.reporting_owner_cik == amend_tx.reporting_owner_cik
                 and orig_tx.transaction_date == amend_tx.transaction_date
-                and orig_tx.security_title == amend_tx.security_title
             )
-            if same_accession or same_business_key:
+
+            if same_accession or matches_orig_sub_date:
                 superseded_hashes.add(orig_tx.record_hash or id(orig_tx))
                 rejections.append(
                     EventAdapterRejection(
@@ -100,7 +103,7 @@ def _deduplicate_amendments(
                         record_hash=orig_tx.record_hash,
                         reason=REJECTION_AMENDMENT_SUPERSEDED,
                         details=(
-                            f"Transaction superseded by amendment filing "
+                            f"Original transaction superseded by explicit SEC amendment filing "
                             f"(Accession: {amend_tx.accession_number})."
                         ),
                     )

@@ -153,6 +153,8 @@ def _postgres_schema() -> str:
         ownership_type TEXT,
         ownership_nature TEXT,
         source_url TEXT,
+        is_amendment BOOLEAN DEFAULT FALSE,
+        date_of_orig_submission TEXT,
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -284,6 +286,8 @@ def _sqlite_schema() -> str:
         ownership_type TEXT,
         ownership_nature TEXT,
         source_url TEXT,
+        is_amendment INTEGER DEFAULT 0,
+        date_of_orig_submission TEXT,
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -416,6 +420,8 @@ def initialize_database(database_url: str) -> Any:
                 ("acquired_disposed", "TEXT"),
                 ("ownership_nature", "TEXT"),
                 ("source_url", "TEXT"),
+                ("is_amendment", "INTEGER"),
+                ("date_of_orig_submission", "TEXT"),
             ]
 
             for col_name, col_type in new_columns:
@@ -448,6 +454,8 @@ def initialize_database(database_url: str) -> Any:
                     "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS acquired_disposed TEXT;",
                     "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS ownership_nature TEXT;",
                     "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS source_url TEXT;",
+                    "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS is_amendment BOOLEAN DEFAULT FALSE;",
+                    "ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS date_of_orig_submission TEXT;",
                 ]
 
                 for query in alter_queries:

@@ -45,6 +45,7 @@ ENV/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/archive/
 
 # ------------------------------------------------------------
 # Logs

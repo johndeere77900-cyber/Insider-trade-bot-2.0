@@ -221,9 +221,9 @@ def test_point_in_time_safety_and_acquired_disposed_filter(test_db):
     assert event.transaction.transaction_date == "2024-01-15"
 
 
-def test_amendment_supersession_deduplication(test_db):
+def test_amendment_supersession_deduplication_and_same_day_legitimate_txs(test_db):
     orig = NormalizedBulkTransaction(
-        accession_number="000010",
+        accession_number="000010-ORIG",
         issuer_cik="0000320193",
         issuer_name="Apple Inc.",
         ticker="AAPL",
@@ -249,7 +249,7 @@ def test_amendment_supersession_deduplication(test_db):
     )
 
     amend = NormalizedBulkTransaction(
-        accession_number="000010",
+        accession_number="000010-AMEND",
         issuer_cik="0000320193",
         issuer_name="Apple Inc.",
         ticker="AAPL",
@@ -274,9 +274,18 @@ def test_amendment_supersession_deduplication(test_db):
         form_type="4/A",
     )
 
-    adapter_res = prepare_event_study_inputs(test_db, [orig, amend], horizon_days=1)
+    # 1. Store both in database
+    store_bulk_insider_transactions(test_db, [orig, amend])
 
-    # Should select only 1 effective research event (the amendment), rejecting original as superseded
+    # 2. Verify date_of_orig_submission survives database storage -> research query retrieval
+    queried_txs = query_insider_transactions(test_db, accession_numbers=["000010-AMEND", "000010-ORIG"])
+    assert len(queried_txs) == 2
+    amend_queried = [t for t in queried_txs if t.accession_number == "000010-AMEND"][0]
+    assert amend_queried.is_amendment is True
+    assert amend_queried.date_of_orig_submission == "2024-01-16"
+
+    # 3. Adapter deduplication: selects only 1 effective research event (the amendment)
+    adapter_res = prepare_event_study_inputs(test_db, queried_txs, horizon_days=1)
     assert len(adapter_res.valid_events) == 1
     assert adapter_res.valid_events[0].transaction.record_hash == "hash_amend"
     assert adapter_res.valid_events[0].transaction.shares == 1200.0
@@ -285,6 +294,63 @@ def test_amendment_supersession_deduplication(test_db):
     assert len(rejections) == 1
     assert rejections[0].reason == "REJECTED_AMENDMENT_SUPERSEDED"
     assert rejections[0].record_hash == "hash_orig"
+
+    # 4. Verify two legitimate same-day non-amended transactions are NOT incorrectly collapsed
+    legit_tx1 = NormalizedBulkTransaction(
+        accession_number="000020",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-16",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=500.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_legit1",
+        form_type="4",
+    )
+
+    legit_tx2 = NormalizedBulkTransaction(
+        accession_number="000021",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-16",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=300.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_legit2",
+        form_type="4",
+    )
+
+    legit_res = prepare_event_study_inputs(test_db, [legit_tx1, legit_tx2], horizon_days=1)
+    assert len(legit_res.valid_events) == 2
+    assert len(legit_res.rejections) == 0
 
 
 def test_event_study_and_backtest_conversion(test_db):
