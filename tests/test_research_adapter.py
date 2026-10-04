@@ -221,7 +221,84 @@ def test_point_in_time_safety_and_acquired_disposed_filter(test_db):
     assert event.transaction.transaction_date == "2024-01-15"
 
 
-def test_amendment_supersession_deduplication_and_same_day_legitimate_txs(test_db):
+def test_authoritative_same_accession_amendment_deduplication(test_db):
+    # Authoritative Same-Accession Amendment Match
+    orig = NormalizedBulkTransaction(
+        accession_number="000010-SAME",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-16",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=1000.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_orig_same",
+        form_type="4",
+    )
+
+    amend = NormalizedBulkTransaction(
+        accession_number="000010-SAME",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-17",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=1200.0,  # Amended shares count
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=True,
+        date_of_orig_submission="2024-01-16",
+        raw_payload={},
+        source="SEC",
+        record_hash="hash_amend_same",
+        form_type="4/A",
+    )
+
+    # 1. Store both in database
+    store_bulk_insider_transactions(test_db, [orig, amend])
+
+    # 2. Verify date_of_orig_submission survives database storage -> research query retrieval
+    queried_txs = query_insider_transactions(test_db, accession_numbers=["000010-SAME"])
+    assert len(queried_txs) == 2
+    amend_queried = [t for t in queried_txs if t.is_amendment][0]
+    assert amend_queried.is_amendment is True
+    assert amend_queried.date_of_orig_submission == "2024-01-16"
+
+    # 3. Adapter deduplication: authoritative same-accession match selects 1 effective research event (amendment)
+    adapter_res = prepare_event_study_inputs(test_db, queried_txs, horizon_days=1)
+    assert len(adapter_res.valid_events) == 1
+    assert adapter_res.valid_events[0].transaction.record_hash == "hash_amend_same"
+    assert adapter_res.valid_events[0].transaction.shares == 1200.0
+
+    rejections = adapter_res.rejections
+    assert len(rejections) == 1
+    assert rejections[0].reason == "REJECTED_AMENDMENT_SUPERSEDED"
+    assert rejections[0].record_hash == "hash_orig_same"
+
+
+def test_cross_accession_amendment_not_superseded_by_heuristic(test_db):
+    # Proof that DATE_OF_ORIG_SUB across different accessions does NOT trigger a heuristic supersession
     orig = NormalizedBulkTransaction(
         accession_number="000010-ORIG",
         issuer_cik="0000320193",
@@ -244,12 +321,12 @@ def test_amendment_supersession_deduplication_and_same_day_legitimate_txs(test_d
         date_of_orig_submission=None,
         raw_payload={},
         source="SEC",
-        record_hash="hash_orig",
+        record_hash="hash_orig_cross",
         form_type="4",
     )
 
-    amend = NormalizedBulkTransaction(
-        accession_number="000010-AMEND",
+    amend_cross = NormalizedBulkTransaction(
+        accession_number="000010-AMEND-DIFFERENT",
         issuer_cik="0000320193",
         issuer_name="Apple Inc.",
         ticker="AAPL",
@@ -259,7 +336,7 @@ def test_amendment_supersession_deduplication_and_same_day_legitimate_txs(test_d
         filing_date="2024-01-17",
         transaction_code="S",
         security_title="Common Stock",
-        shares=1200.0,  # Amended shares count
+        shares=1200.0,
         price_per_share=150.0,
         transaction_type="non_derivative",
         acquired_disposed="D",
@@ -270,32 +347,25 @@ def test_amendment_supersession_deduplication_and_same_day_legitimate_txs(test_d
         date_of_orig_submission="2024-01-16",
         raw_payload={},
         source="SEC",
-        record_hash="hash_amend",
+        record_hash="hash_amend_cross",
         form_type="4/A",
     )
 
-    # 1. Store both in database
-    store_bulk_insider_transactions(test_db, [orig, amend])
+    adapter_res = prepare_event_study_inputs(test_db, [orig, amend_cross], horizon_days=1)
 
-    # 2. Verify date_of_orig_submission survives database storage -> research query retrieval
-    queried_txs = query_insider_transactions(test_db, accession_numbers=["000010-AMEND", "000010-ORIG"])
-    assert len(queried_txs) == 2
-    amend_queried = [t for t in queried_txs if t.accession_number == "000010-AMEND"][0]
-    assert amend_queried.is_amendment is True
-    assert amend_queried.date_of_orig_submission == "2024-01-16"
-
-    # 3. Adapter deduplication: selects only 1 effective research event (the amendment)
-    adapter_res = prepare_event_study_inputs(test_db, queried_txs, horizon_days=1)
+    # Original is NOT superseded by heuristic guessing across different accessions.
+    # Original is retained as a valid research event!
     assert len(adapter_res.valid_events) == 1
-    assert adapter_res.valid_events[0].transaction.record_hash == "hash_amend"
-    assert adapter_res.valid_events[0].transaction.shares == 1200.0
+    assert adapter_res.valid_events[0].transaction.record_hash == "hash_orig_cross"
 
-    rejections = adapter_res.rejections
-    assert len(rejections) == 1
-    assert rejections[0].reason == "REJECTED_AMENDMENT_SUPERSEDED"
-    assert rejections[0].record_hash == "hash_orig"
+    # The uncertain cross-accession amendment is excluded to prevent double counting
+    assert len(adapter_res.rejections) == 1
+    assert adapter_res.rejections[0].reason == "REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL"
+    assert adapter_res.rejections[0].record_hash == "hash_amend_cross"
 
-    # 4. Verify two legitimate same-day non-amended transactions are NOT incorrectly collapsed
+
+def test_legitimate_same_day_transactions_not_collapsed(test_db):
+    # Verify two legitimate same-day non-amended transactions are NOT incorrectly collapsed
     legit_tx1 = NormalizedBulkTransaction(
         accession_number="000020",
         issuer_cik="0000320193",
@@ -351,124 +421,6 @@ def test_amendment_supersession_deduplication_and_same_day_legitimate_txs(test_d
     legit_res = prepare_event_study_inputs(test_db, [legit_tx1, legit_tx2], horizon_days=1)
     assert len(legit_res.valid_events) == 2
     assert len(legit_res.rejections) == 0
-
-
-def test_amendment_cases_ambiguous_and_unresolved(test_db):
-    # Case B: Ambiguous match (>1 original candidates match amendment metadata)
-    orig_cand1 = NormalizedBulkTransaction(
-        accession_number="000030",
-        issuer_cik="0000320193",
-        issuer_name="Apple Inc.",
-        ticker="AAPL",
-        reporting_owner_name="Cook Tim",
-        reporting_owner_cik="0001214156",
-        transaction_date="2024-01-15",
-        filing_date="2024-01-16",
-        transaction_code="S",
-        security_title="Common Stock",
-        shares=100.0,
-        price_per_share=150.0,
-        transaction_type="non_derivative",
-        acquired_disposed="D",
-        ownership_type="D",
-        ownership_nature="Direct",
-        source_url="https://sec.gov",
-        is_amendment=False,
-        date_of_orig_submission=None,
-        raw_payload={},
-        source="SEC",
-        record_hash="hash_cand1",
-        form_type="4",
-    )
-
-    orig_cand2 = NormalizedBulkTransaction(
-        accession_number="000031",
-        issuer_cik="0000320193",
-        issuer_name="Apple Inc.",
-        ticker="AAPL",
-        reporting_owner_name="Cook Tim",
-        reporting_owner_cik="0001214156",
-        transaction_date="2024-01-15",
-        filing_date="2024-01-16",
-        transaction_code="P",
-        security_title="Common Stock",
-        shares=200.0,
-        price_per_share=150.0,
-        transaction_type="non_derivative",
-        acquired_disposed="A",
-        ownership_type="D",
-        ownership_nature="Direct",
-        source_url="https://sec.gov",
-        is_amendment=False,
-        date_of_orig_submission=None,
-        raw_payload={},
-        source="SEC",
-        record_hash="hash_cand2",
-        form_type="4",
-    )
-
-    ambig_amend = NormalizedBulkTransaction(
-        accession_number="000032-AMEND",
-        issuer_cik="0000320193",
-        issuer_name="Apple Inc.",
-        ticker="AAPL",
-        reporting_owner_name="Cook Tim",
-        reporting_owner_cik="0001214156",
-        transaction_date="2024-01-15",
-        filing_date="2024-01-17",
-        transaction_code="S",
-        security_title="Common Stock",
-        shares=150.0,
-        price_per_share=150.0,
-        transaction_type="non_derivative",
-        acquired_disposed="D",
-        ownership_type="D",
-        ownership_nature="Direct",
-        source_url="https://sec.gov",
-        is_amendment=True,
-        date_of_orig_submission="2024-01-16",
-        raw_payload={},
-        source="SEC",
-        record_hash="hash_ambig_amend",
-        form_type="4/A",
-    )
-
-    ambig_res = prepare_event_study_inputs(test_db, [orig_cand1, orig_cand2, ambig_amend], horizon_days=1)
-    assert len(ambig_res.valid_events) == 0
-    reasons = [r.reason for r in ambig_res.rejections]
-    assert "REJECTED_AMENDMENT_AMBIGUOUS" in reasons
-
-    # Case C: Unresolved match (0 original candidates found in dataset)
-    unresolved_amend = NormalizedBulkTransaction(
-        accession_number="000040-AMEND",
-        issuer_cik="0000320193",
-        issuer_name="Apple Inc.",
-        ticker="AAPL",
-        reporting_owner_name="Cook Tim",
-        reporting_owner_cik="0001214156",
-        transaction_date="2024-01-15",
-        filing_date="2024-01-17",
-        transaction_code="S",
-        security_title="Common Stock",
-        shares=150.0,
-        price_per_share=150.0,
-        transaction_type="non_derivative",
-        acquired_disposed="D",
-        ownership_type="D",
-        ownership_nature="Direct",
-        source_url="https://sec.gov",
-        is_amendment=True,
-        date_of_orig_submission="2023-01-01",  # No original exists in DB/input
-        raw_payload={},
-        source="SEC",
-        record_hash="hash_unresolved_amend",
-        form_type="4/A",
-    )
-
-    unres_res = prepare_event_study_inputs(test_db, [unresolved_amend], horizon_days=1)
-    assert len(unres_res.valid_events) == 0
-    unres_reasons = [r.reason for r in unres_res.rejections]
-    assert "REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL" in unres_reasons
 
 
 def test_event_study_and_backtest_conversion(test_db):

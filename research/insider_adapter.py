@@ -63,13 +63,24 @@ def _deduplicate_amendments(
 ) -> Tuple[List[NormalizedBulkTransaction], List[EventAdapterRejection]]:
     """
     Deduplicate transactions where an explicit SEC amendment replaces an original filing.
-    Preserves both in operational storage, but selects only effective transactions for research.
-    Does NOT collapse legitimate same-day non-amended transactions.
+    Preserves all records in operational storage, but selects only effective, authoritative transactions for research.
 
     Rules:
-    - Case A (Deterministic Match - 1 candidate): Mark original transaction superseded, retain amendment as effective event.
-    - Case B (Ambiguous Match - >1 candidates): Do not guess; exclude amendment and all candidate originals.
-    - Case C (Unresolved Match - 0 candidates): Exclude amendment with unresolved original rejection.
+    1. Authoritative Same-Accession Match:
+       If an amendment filing (/A) shares the EXACT same accession_number as an original filing
+       record (or represents an updated transaction inside the same accession), the original transaction
+       is deterministically superseded (REJECTED_AMENDMENT_SUPERSEDED), and the amendment is kept as effective.
+    2. Non-Authoritative / Cross-Accession Amendment:
+       When an amendment specifies `is_amendment=True` or form_type `/A` or `date_of_orig_submission`, but exists
+       in a different accession_number from original filings in the dataset:
+       - The SEC bulk dataset does NOT provide an original accession_number link.
+       - DATE_OF_ORIG_SUB is a date string and NOT an authoritative unique filing identifier.
+       - A single candidate matching by DATE_OF_ORIG_SUB + CIKs + transaction date is NOT treated as an authoritative supersession.
+       - Guessing is strictly avoided: original filings across different accessions are NOT marked superseded.
+       - The uncertain amendment transaction is excluded from research-event selection with REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL
+         to prevent double-counting.
+    3. Legitimate Same-Day Transactions:
+       Non-amended transactions (even matching issuer, insider, transaction date, and security) are NEVER collapsed.
     """
     amendments: List[NormalizedBulkTransaction] = []
     originals: List[NormalizedBulkTransaction] = []
@@ -89,25 +100,17 @@ def _deduplicate_amendments(
     excluded_hashes = set()
 
     for amend_tx in amendments:
-        candidates: List[NormalizedBulkTransaction] = []
         amend_hash = amend_tx.record_hash or id(amend_tx)
 
-        for orig_tx in originals:
-            same_accession = bool(orig_tx.accession_number and orig_tx.accession_number == amend_tx.accession_number)
-            matches_orig_sub_date = bool(
-                amend_tx.date_of_orig_submission
-                and orig_tx.filing_date == amend_tx.date_of_orig_submission
-                and orig_tx.issuer_cik == amend_tx.issuer_cik
-                and orig_tx.reporting_owner_cik == amend_tx.reporting_owner_cik
-                and orig_tx.transaction_date == amend_tx.transaction_date
-            )
+        # 1. Authoritative same-accession match
+        same_accession_candidates = [
+            orig_tx for orig_tx in originals
+            if orig_tx.accession_number and orig_tx.accession_number == amend_tx.accession_number
+        ]
 
-            if same_accession or matches_orig_sub_date:
-                candidates.append(orig_tx)
-
-        if len(candidates) == 1:
-            # Case A: Exactly 1 deterministic original candidate
-            orig_tx = candidates[0]
+        if len(same_accession_candidates) == 1:
+            # Case A: Exactly 1 deterministic original candidate in same accession
+            orig_tx = same_accession_candidates[0]
             orig_hash = orig_tx.record_hash or id(orig_tx)
             excluded_hashes.add(orig_hash)
             rejections.append(
@@ -116,15 +119,15 @@ def _deduplicate_amendments(
                     record_hash=orig_tx.record_hash,
                     reason=REJECTION_AMENDMENT_SUPERSEDED,
                     details=(
-                        f"Original transaction superseded by explicit SEC amendment filing "
+                        f"Original transaction superseded by authoritative same-accession amendment filing "
                         f"(Accession: {amend_tx.accession_number})."
                     ),
                 )
             )
-        elif len(candidates) > 1:
-            # Case B: Ambiguous match (>1 candidates) -> Do not guess; exclude amendment and candidate originals
+        elif len(same_accession_candidates) > 1:
+            # Case B: Ambiguous match (>1 same-accession candidates) -> Do not guess; exclude amendment and candidates
             excluded_hashes.add(amend_hash)
-            for cand in candidates:
+            for cand in same_accession_candidates:
                 cand_hash = cand.record_hash or id(cand)
                 excluded_hashes.add(cand_hash)
                 rejections.append(
@@ -133,8 +136,8 @@ def _deduplicate_amendments(
                         record_hash=cand.record_hash,
                         reason=REJECTED_AMENDMENT_AMBIGUOUS,
                         details=(
-                            f"Ambiguous original filing relationship: multiple candidates ({len(candidates)}) "
-                            f"match amendment filing {amend_tx.accession_number}."
+                            f"Ambiguous same-accession filing relationship: multiple candidates ({len(same_accession_candidates)}) "
+                            f"in accession {amend_tx.accession_number}."
                         ),
                     )
                 )
@@ -144,13 +147,15 @@ def _deduplicate_amendments(
                     record_hash=amend_tx.record_hash,
                     reason=REJECTED_AMENDMENT_AMBIGUOUS,
                     details=(
-                        f"Ambiguous amendment relationship: matches {len(candidates)} candidate original filings. "
+                        f"Ambiguous amendment relationship: matches {len(same_accession_candidates)} candidate original filings in accession. "
                         f"Guessing avoided."
                     ),
                 )
             )
         else:
-            # Case C: Unresolved match (0 candidates) -> Amendment exists but original is missing in dataset
+            # Case C: Cross-accession amendment or no same-accession original found.
+            # Do NOT guess or use DATE_OF_ORIG_SUB heuristics to supersede originals in different accessions.
+            # Exclude the uncertain amendment transaction from research events to prevent double-counting.
             excluded_hashes.add(amend_hash)
             rejections.append(
                 EventAdapterRejection(
@@ -158,8 +163,9 @@ def _deduplicate_amendments(
                     record_hash=amend_tx.record_hash,
                     reason=REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL,
                     details=(
-                        f"Unresolved amendment relationship: original filing referenced by date_of_orig_submission "
-                        f"'{amend_tx.date_of_orig_submission}' was not found in operational dataset."
+                        f"Unresolved cross-accession amendment: SEC bulk dataset lacks authoritative original accession link "
+                        f"(date_of_orig_submission: '{amend_tx.date_of_orig_submission}'). "
+                        f"Guessing avoided; original filings preserved."
                     ),
                 )
             )
