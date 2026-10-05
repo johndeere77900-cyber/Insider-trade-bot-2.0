@@ -10,6 +10,12 @@ jobs:
 
     env:
       SEC_STORE_RAW_PAYLOAD: "false"
+      SEC_ARCHIVE_BACKEND: "s3"
+      SEC_ARCHIVE_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+      SEC_ARCHIVE_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_REGION: "auto"
 
     steps:
       - name: Checkout repository

@@ -29,7 +29,7 @@ class S3SECArchive(SECArchiveInterface):
     def __init__(
         self,
         bucket: Optional[str] = None,
-        prefix: str = "",
+        prefix: Optional[str] = None,
         endpoint_url: Optional[str] = None,
         region_name: Optional[str] = None,
         aws_access_key_id: Optional[str] = None,
@@ -37,12 +37,13 @@ class S3SECArchive(SECArchiveInterface):
         s3_client: Optional[Any] = None,
     ) -> None:
         self.bucket = bucket or os.getenv("SEC_ARCHIVE_BUCKET", "")
-        self.prefix = prefix or os.getenv("SEC_ARCHIVE_PREFIX", "")
-        if self.prefix and not self.prefix.endswith("/"):
-            self.prefix += "/"
+        p = prefix if prefix is not None else os.getenv("SEC_ARCHIVE_PREFIX", "sec-archives/")
+        if p and not p.endswith("/"):
+            p += "/"
+        self.prefix = p
 
         self._endpoint_url = endpoint_url or os.getenv("SEC_ARCHIVE_ENDPOINT_URL")
-        self._region_name = region_name or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+        self._region_name = region_name or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "auto"
         self._aws_access_key_id = aws_access_key_id or os.getenv("AWS_ACCESS_KEY_ID")
         self._aws_secret_access_key = aws_secret_access_key or os.getenv("AWS_SECRET_ACCESS_KEY")
         self._client = s3_client

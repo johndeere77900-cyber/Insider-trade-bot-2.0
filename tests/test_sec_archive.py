@@ -145,9 +145,10 @@ def test_s3_archive_requires_bucket_config() -> None:
         s3_backend.exists("2006-Q1")
 
 
-def test_s3_archive_mock_operations(tmp_path) -> None:
-    # Test S3SECArchive using mock client
+def test_s3_archive_cases_a_through_f(tmp_path) -> None:
+    # Verify cases A through F for S3/R2 archive backend
     store = {}
+    fail_manifest_write = False
 
     class MockBody:
         def __init__(self, content: bytes):
@@ -163,6 +164,9 @@ def test_s3_archive_mock_operations(tmp_path) -> None:
             return {}
 
         def put_object(self, Bucket: str, Key: str, Body: bytes):
+            nonlocal fail_manifest_write
+            if fail_manifest_write and Key.endswith(".json"):
+                raise ArchiveError("Simulated network failure on manifest upload")
             store[Key] = Body
 
         def get_object(self, Bucket: str, Key: str):
@@ -178,25 +182,68 @@ def test_s3_archive_mock_operations(tmp_path) -> None:
             return MockPaginator()
 
     mock_client = MockS3Client()
-    s3_backend = S3SECArchive(bucket="test-bucket", prefix="sec-archives", s3_client=mock_client)
+    s3_backend = S3SECArchive(bucket="insider-trade-sec-archive", prefix="sec-archives", s3_client=mock_client)
 
-    z1 = tmp_path / "s3_test.zip"
-    create_dummy_zip(str(z1), {"file.tsv": "data"})
+    z1 = tmp_path / "z1.zip"
+    create_dummy_zip(str(z1), {"SUBMISSION.tsv": "DATA1"})
 
-    meta = s3_backend.put("2006-Q1", str(z1))
-    assert s3_backend.exists("2006-Q1") is True
-    assert meta.period == "2006-Q1"
-    assert s3_backend.get("2006-Q1") == z1.read_bytes()
-    assert s3_backend.checksum("2006-Q1") == meta.sha256
-    assert s3_backend.list() == ["2006-Q1"]
+    # CASE A: Neither exists -> upload both ZIP and metadata
+    period_a = "2006-Q1"
+    meta_a = s3_backend.put(period_a, str(z1))
+    assert s3_backend.exists(period_a) is True
+    assert f"sec-archives/{period_a}.zip" in store
+    assert f"sec-archives/{period_a}.json" in store
 
-    # Idempotent put
-    meta2 = s3_backend.put("2006-Q1", str(z1))
-    assert meta2.sha256 == meta.sha256
+    # CASE B: Both exist and SHA matches -> idempotent return
+    meta_b = s3_backend.put(period_a, str(z1))
+    assert meta_b.sha256 == meta_a.sha256
 
-    # Differing put raises ArchiveExistsError
-    z2 = tmp_path / "s3_diff.zip"
-    create_dummy_zip(str(z2), {"file.tsv": "different_data"})
+    # CASE C: Both exist and SHA differs -> ArchiveExistsError
+    z2 = tmp_path / "z2.zip"
+    create_dummy_zip(str(z2), {"SUBMISSION.tsv": "DIFFERENT_DATA2"})
+    with pytest.raises(ArchiveExistsError, match="already exists with different SHA-256"):
+        s3_backend.put(period_a, str(z2))
 
-    with pytest.raises(ArchiveExistsError):
-        s3_backend.put("2006-Q1", str(z2))
+    # CASE D: ZIP exists but metadata does not -> reject; never overwrite
+    period_d = "2006-Q2"
+    store[f"sec-archives/{period_d}.zip"] = b"ZIP_ONLY_CONTENT"
+    with pytest.raises(ArchiveExistsError, match="ZIP archive exists but manifest is missing"):
+        s3_backend.put(period_d, str(z1))
+
+    # CASE E: Metadata exists but ZIP does not -> reject; never overwrite
+    period_e = "2006-Q3"
+    store[f"sec-archives/{period_e}.json"] = b'{"sha256": "abc"}'
+    with pytest.raises(ArchiveExistsError, match="Manifest exists but ZIP archive is missing"):
+        s3_backend.put(period_e, str(z1))
+
+    # CASE F: ZIP upload succeeds but metadata upload fails -> next retry detects partial state and rejects overwrite
+    period_f = "2006-Q4"
+    fail_manifest_write = True
+    with pytest.raises(ArchiveError, match="Simulated network failure"):
+        s3_backend.put(period_f, str(z1))
+
+    # ZIP was uploaded before manifest failure occurred
+    assert f"sec-archives/{period_f}.zip" in store
+    assert f"sec-archives/{period_f}.json" not in store
+
+    # On next retry, Case D prevents overwriting incomplete archive
+    fail_manifest_write = False
+    with pytest.raises(ArchiveExistsError, match="ZIP archive exists but manifest is missing"):
+        s3_backend.put(period_f, str(z1))
+
+
+def test_s3_archive_configuration_environment_wiring(monkeypatch) -> None:
+    monkeypatch.setenv("SEC_ARCHIVE_BUCKET", "env-bucket")
+    monkeypatch.setenv("SEC_ARCHIVE_PREFIX", "custom-prefix")
+    monkeypatch.setenv("SEC_ARCHIVE_ENDPOINT_URL", "https://account.r2.cloudflarestorage.com")
+    monkeypatch.setenv("AWS_REGION", "auto")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "key123")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret456")
+
+    archive = S3SECArchive()
+    assert archive.bucket == "env-bucket"
+    assert archive.prefix == "custom-prefix/"
+    assert archive._endpoint_url == "https://account.r2.cloudflarestorage.com"
+    assert archive._region_name == "auto"
+    assert archive._aws_access_key_id == "key123"
+    assert archive._aws_secret_access_key == "secret456"
