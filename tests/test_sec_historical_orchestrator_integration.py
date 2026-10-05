@@ -298,6 +298,7 @@ def test_historical_acquisition_retry_previously_failed_period(
 
     monkeypatch.setenv("DATABASE_URL", db_url)
     monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/1.0 test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(tmp_path / "archive"))
 
     # Simulate previous run that failed after writing dataset_period provenance
     store_provenance(

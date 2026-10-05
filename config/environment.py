@@ -72,6 +72,8 @@ class EnvironmentSettings:
     sec_user_agent: str
     sec_timeout_seconds: int
     sec_store_raw_payload: bool
+    sec_archive_backend: str
+    sec_archive_path: str
 
     telegram_bot_token: str
     telegram_allowed_user_ids: tuple[str, ...]
@@ -193,6 +195,14 @@ def load_environment(
             "SEC_STORE_RAW_PAYLOAD",
             False,
         ),
+        sec_archive_backend=source.get(
+            "SEC_ARCHIVE_BACKEND",
+            "filesystem",
+        ).strip().lower(),
+        sec_archive_path=source.get(
+            "SEC_ARCHIVE_PATH",
+            "data/archive",
+        ).strip(),
         telegram_bot_token=telegram_bot_token,
         telegram_allowed_user_ids=allowed_user_ids,
         market_data_api_key=source.get(

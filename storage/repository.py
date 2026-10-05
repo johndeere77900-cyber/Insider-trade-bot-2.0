@@ -242,9 +242,12 @@ def store_insider_transaction(
         shares,
         price,
         transaction_type,
+        acquired_disposed,
         ownership_type,
         ownership_nature,
         source_url,
+        is_amendment,
+        date_of_orig_submission,
         raw_payload,
         record_hash,
         created_at
@@ -276,9 +279,12 @@ def store_insider_transaction(
         shares,
         price,
         transaction_type,
+        None,  # acquired_disposed
         ownership_type,
         ownership_nature,
         source_url,
+        0,  # is_amendment
+        None,  # date_of_orig_submission
         raw_payload_str,
         record_hash,
         utc_now(),
@@ -349,7 +355,8 @@ def store_bulk_insider_transactions(
         source, accession_number, issuer_cik, issuer_name, ticker,
         insider_name, insider_cik, transaction_date, filing_date,
         form_type, transaction_code, security_title, shares, price,
-        transaction_type, ownership_type, ownership_nature, source_url,
+        transaction_type, acquired_disposed, ownership_type, ownership_nature, source_url,
+        is_amendment, date_of_orig_submission,
         raw_payload, record_hash, created_at
     """
 
@@ -378,6 +385,10 @@ def store_bulk_insider_transactions(
         )
 
         form_t = getattr(r, "form_type", None) or getattr(r, "form", None) or "4"
+        acq_disp = getattr(r, "acquired_disposed", None)
+        is_amend = int(bool(getattr(r, "is_amendment", False)))
+        orig_sub_date = getattr(r, "date_of_orig_submission", None)
+
         val_tuple = (
             r.source,
             r.accession_number,
@@ -394,9 +405,12 @@ def store_bulk_insider_transactions(
             r.shares,
             r.price_per_share,
             r.transaction_type,
+            acq_disp,
             r.ownership_type,
             r.ownership_nature,
             r.source_url,
+            is_amend,
+            orig_sub_date,
             raw_json,
             r_hash,
             now,

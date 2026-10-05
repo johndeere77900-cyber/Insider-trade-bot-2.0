@@ -28,6 +28,8 @@ def run_historical_acquisition(
     import hashlib
     import os
     import tempfile
+    import zipfile
+    from archive import ArchiveMetadata, get_archive_backend
     from config.environment import load_environment
     from data.acquisition_state import AcquisitionStateManager
     from data.sec_dataset_pipeline import (
@@ -49,6 +51,10 @@ def run_historical_acquisition(
     settings = load_environment()
     db_url = settings.database_url
     user_agent = settings.sec_user_agent or "InsiderTradeBot/2.0 contact@example.com"
+    archive_backend = get_archive_backend(
+        backend_type=settings.sec_archive_backend,
+        archive_path=settings.sec_archive_path,
+    )
 
     state_mgr = AcquisitionStateManager(db_url)
     period_range = state_mgr.parse_period_range(start_period, end_period)
@@ -81,21 +87,40 @@ def run_historical_acquisition(
             download_dataset_zip_to_file(year, qtr, user_agent=user_agent, target_path=temp_zip_path)
             periods_downloaded += 1
 
-            # Calculate SHA256 checksum of downloaded ZIP file from disk
+            if not zipfile.is_zipfile(temp_zip_path):
+                raise ValueError(f"Downloaded file for period {period_str} is not a valid ZIP archive.")
+
             hasher = hashlib.sha256()
+            file_size = os.path.getsize(temp_zip_path)
             with open(temp_zip_path, "rb") as f:
                 while chunk := f.read(1024 * 1024):
                     hasher.update(chunk)
             zip_checksum = hasher.hexdigest()
 
             dataset_url = build_dataset_url(year, qtr)
+
+            # Store in immutable archive layer
+            archive_meta = ArchiveMetadata(
+                period=period_str,
+                source="SEC",
+                source_url=dataset_url,
+                sha256=zip_checksum,
+                validation_status="validated",
+                file_size_bytes=file_size,
+            )
+            saved_meta = archive_backend.put(
+                period=period_str,
+                content=temp_zip_path,
+                metadata=archive_meta,
+            )
+
             store_provenance(
                 db_url,
                 record_type="dataset_period",
                 record_id=period_str,
                 source="SEC",
                 source_reference=dataset_url,
-                checksum=zip_checksum,
+                checksum=saved_meta.sha256,
                 validation_status="validated",
             )
 

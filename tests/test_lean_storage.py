@@ -306,7 +306,13 @@ def test_historical_acquisition_configuration_propagation(tmp_path, monkeypatch)
     monkeypatch.setattr("storage.repository.store_bulk_insider_transactions", mock_store_bulk)
 
     # Patch download and state manager to avoid real network/files
-    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **kw: None)
+    import zipfile
+    def mock_download(year, qtr, user_agent, target_path, **kwargs):
+        with zipfile.ZipFile(target_path, "w") as zf:
+            zf.writestr("test.txt", "dummy content")
+        return target_path
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_download)
     monkeypatch.setattr("storage.repository.store_provenance", lambda *a, **kw: None)
 
     fake_raw = {
@@ -326,9 +332,10 @@ def test_historical_acquisition_configuration_propagation(tmp_path, monkeypatch)
 
     monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", mock_parse)
 
-    # Override environment settings DATABASE_URL
+    # Override environment settings DATABASE_URL and archive path
     monkeypatch.setenv("DATABASE_URL", db_url)
     monkeypatch.setenv("SEC_USER_AGENT", "TestAgent/1.0")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(tmp_path / "archive"))
 
     import main
     main.run_historical_acquisition("2006-Q1", "2006-Q1", batch_size=5000, force=True)
