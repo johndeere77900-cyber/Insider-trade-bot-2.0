@@ -189,3 +189,51 @@ def test_store_provenance_idempotent_postgresql(monkeypatch) -> None:
     executed_sql = mock_conn.execute.call_args[0][0]
     assert "ON CONFLICT (record_type, record_id, source)" in executed_sql
     assert "DO UPDATE SET" in executed_sql
+
+
+def test_trade_runs_compatibility_schema_validation(tmp_path) -> None:
+    """Test that trade_runs store accepts canonical run_id and rejects unsupported run_key."""
+    import pytest
+    from database.connection import connect
+
+    db_url = f"sqlite:///{tmp_path / 'trade_runs_test.db'}"
+    repository = Repository(database_url=db_url)
+
+    valid_record = {
+        "run_id": "test_run_001",
+        "mode": "paper",
+        "status": "integration_test",
+        "started_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    result = repository.store(
+        table="trade_runs",
+        record=valid_record,
+    )
+
+    assert result is not None
+    assert result["table"] == "trade_runs"
+    assert result["record"]["run_id"] == "test_run_001"
+
+    with connect(db_url) as conn:
+        row = conn.execute(
+            "SELECT run_id, mode, status, started_at FROM trade_runs WHERE run_id = ?",
+            ("test_run_001",),
+        ).fetchone()
+        assert row is not None
+        assert row["run_id"] == "test_run_001"
+        assert row["mode"] == "paper"
+        assert row["status"] == "integration_test"
+
+    invalid_record = {
+        "run_key": "test_run_002",
+        "mode": "paper",
+        "status": "integration_test",
+        "started_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    with pytest.raises(ValueError, match="Record contains unsupported columns: run_key"):
+        repository.store(
+            table="trade_runs",
+            record=invalid_record,
+        )

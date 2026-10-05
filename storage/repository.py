@@ -63,7 +63,7 @@ def _row_value(row: Any, key: str, index: int = 0) -> Any:
     if row is None:
         return None
 
-    if isinstance(row, Mapping):
+    if isinstance(row, Mapping) or hasattr(row, "keys"):
         return row[key]
 
     return row[index]
@@ -108,12 +108,12 @@ def _table_columns(
 
     if is_postgresql_url(database_url):
         return {
-            str(_row_value(row, "column_name"))
+            str(_row_value(row, "column_name", index=0))
             for row in rows
         }
 
     return {
-        str(_row_value(row, "name"))
+        str(_row_value(row, "name", index=1))
         for row in rows
     }
 

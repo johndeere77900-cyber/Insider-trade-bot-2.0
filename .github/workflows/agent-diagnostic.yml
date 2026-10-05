@@ -99,7 +99,7 @@ jobs:
           repository.store(
               table="trade_runs",
               record={
-                  "run_key": run_id,
+                  "run_id": run_id,
                   "mode": "paper",
                   "status": "integration_test",
                   "started_at": "2026-01-01T00:00:00+00:00",
@@ -109,9 +109,9 @@ jobs:
           with connect(database_url) as connection:
               row = connection.execute(
                   """
-                  SELECT run_key, mode, status
+                  SELECT run_id, mode, status
                   FROM trade_runs
-                  WHERE run_key = %s
+                  WHERE run_id = %s
                   """,
                   (run_id,),
               ).fetchone()
@@ -134,7 +134,7 @@ jobs:
               connection.execute(
                   """
                   DELETE FROM trade_runs
-                  WHERE run_key = %s
+                  WHERE run_id = %s
                   """,
                   (run_id,),
               )
