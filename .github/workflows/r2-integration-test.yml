@@ -51,6 +51,7 @@ jobs:
         run: |
           python - <<'PY'
           import os
+          import sys
           import uuid
           import zipfile
           import tempfile
@@ -78,68 +79,104 @@ jobs:
           )
 
           period = "2099-Q1"
+          test_failed = False
+          failure_reason = ""
 
-          # 1. Create tiny deterministic test ZIP
-          with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-              zip_path_1 = tmp.name
-          with zipfile.ZipFile(zip_path_1, "w") as zf:
-              zf.writestr("TEST.tsv", "HEADER\tVALUE\nTEST_ROW\t12345\n")
-
-          # 2. Upload test ZIP to R2 test prefix
-          meta1 = backend.put(period, zip_path_1)
-          print("PASS 1: Put archive to R2 succeeded.")
-
-          # 3. Verify ZIP exists & manifest exists
-          if not backend.exists(period):
-              raise SystemExit("FAIL: backend.exists(period) returned False after put.")
-          print("PASS 2: Archive exists in R2.")
-
-          # 4. Verify metadata & checksum
-          meta_retrieved = backend.metadata(period)
-          if meta_retrieved.sha256 != meta1.sha256:
-              raise SystemExit("FAIL: Retrieved metadata SHA-256 does not match original.")
-          print("PASS 3: Archive metadata retrieved and SHA-256 matches.")
-
-          # 5. Verify ZIP retrieval & byte integrity
-          zip_bytes = backend.get(period)
-          with open(zip_path_1, "rb") as f:
-              orig_bytes = f.read()
-          if zip_bytes != orig_bytes:
-              raise SystemExit("FAIL: Retrieved ZIP bytes do not match original bytes.")
-          print("PASS 4: Retrieved ZIP bytes match original file exactly.")
-
-          # 6. Verify idempotency (second put with same content)
-          meta2 = backend.put(period, zip_path_1)
-          if meta2.sha256 != meta1.sha256:
-              raise SystemExit("FAIL: Idempotent put returned differing metadata.")
-          print("PASS 5: Idempotent put succeeded.")
-
-          # 7. Verify immutability rejection (second put with different content)
-          with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp2:
-              zip_path_2 = tmp2.name
-          with zipfile.ZipFile(zip_path_2, "w") as zf:
-              zf.writestr("TEST.tsv", "HEADER\tVALUE\nDIFFERENT_ROW\t99999\n")
-
-          rejected = False
           try:
-              backend.put(period, zip_path_2)
-          except ArchiveExistsError:
-              rejected = True
+              # 1. Create tiny deterministic test ZIP
+              with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                  zip_path_1 = tmp.name
+              with zipfile.ZipFile(zip_path_1, "w") as zf:
+                  zf.writestr("TEST.tsv", "HEADER\tVALUE\nTEST_ROW\t12345\n")
 
-          if not rejected:
-              raise SystemExit("FAIL: Put with differing content was NOT rejected.")
-          print("PASS 6: Put with differing content rejected by ArchiveExistsError.")
+              # 2. Upload test ZIP to R2 test prefix
+              meta1 = backend.put(period, zip_path_1)
+              print("PASS 1: Put archive to R2 succeeded.")
 
-          # 8. Cleanup test objects from integration-tests/<run-id>/ prefix only
-          try:
-              client = backend._get_client()
-              z_key = backend._zip_key(period)
-              m_key = backend._manifest_key(period)
-              client.delete_object(Bucket=bucket, Key=z_key)
-              client.delete_object(Bucket=bucket, Key=m_key)
-              print("PASS 7: Cleanup removed integration test objects cleanly.")
+              # 3. Verify ZIP exists & manifest exists
+              if not backend.exists(period):
+                  test_failed = True
+                  failure_reason = "backend.exists(period) returned False after put"
+                  raise RuntimeError(failure_reason)
+              print("PASS 2: Archive exists in R2.")
+
+              # 4. Verify metadata & checksum
+              meta_retrieved = backend.metadata(period)
+              if meta_retrieved.sha256 != meta1.sha256:
+                  test_failed = True
+                  failure_reason = "Retrieved metadata SHA-256 does not match original"
+                  raise RuntimeError(failure_reason)
+              print("PASS 3: Archive metadata retrieved and SHA-256 matches.")
+
+              # 5. Verify ZIP retrieval & byte integrity
+              zip_bytes = backend.get(period)
+              with open(zip_path_1, "rb") as f:
+                  orig_bytes = f.read()
+              if zip_bytes != orig_bytes:
+                  test_failed = True
+                  failure_reason = "Retrieved ZIP bytes do not match original file"
+                  raise RuntimeError(failure_reason)
+              print("PASS 4: Retrieved ZIP bytes match original file exactly.")
+
+              # 6. Verify idempotency (second put with same content)
+              meta2 = backend.put(period, zip_path_1)
+              if meta2.sha256 != meta1.sha256:
+                  test_failed = True
+                  failure_reason = "Idempotent put returned differing metadata"
+                  raise RuntimeError(failure_reason)
+              print("PASS 5: Idempotent put succeeded.")
+
+              # 7. Verify immutability rejection (second put with different content)
+              with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp2:
+                  zip_path_2 = tmp2.name
+              with zipfile.ZipFile(zip_path_2, "w") as zf:
+                  zf.writestr("TEST.tsv", "HEADER\tVALUE\nDIFFERENT_ROW\t99999\n")
+
+              rejected = False
+              try:
+                  backend.put(period, zip_path_2)
+              except ArchiveExistsError:
+                  rejected = True
+
+              if not rejected:
+                  test_failed = True
+                  failure_reason = "Put with differing content was NOT rejected"
+                  raise RuntimeError(failure_reason)
+              print("PASS 6: Put with differing content rejected by ArchiveExistsError.")
+
           except Exception as exc:
-              print(f"WARNING: Cleanup encountered issue: {exc}")
+              if not test_failed:
+                  test_failed = True
+                  failure_reason = str(exc)
+              print(f"ERROR during integration test execution: {exc}")
+
+          finally:
+              # 8. Cleanup test objects from integration-tests/<run-id>/ prefix only
+              cleanup_failed = False
+              try:
+                  client = backend._get_client()
+                  z_key = backend._zip_key(period)
+                  m_key = backend._manifest_key(period)
+
+                  if backend._object_exists(z_key):
+                      client.delete_object(Bucket=bucket, Key=z_key)
+                  if backend._object_exists(m_key):
+                      client.delete_object(Bucket=bucket, Key=m_key)
+
+                  # Confirm cleanup succeeded
+                  if backend._object_exists(z_key) or backend._object_exists(m_key):
+                      cleanup_failed = True
+                      print(f"CRITICAL CLEANUP ERROR: Test keys still exist in bucket '{bucket}' under prefix '{prefix}'!")
+                  else:
+                      print("PASS 7: Cleanup removed integration test objects cleanly.")
+              except Exception as exc:
+                  cleanup_failed = True
+                  print(f"CRITICAL CLEANUP ERROR: Failed to clean up test objects: {exc}")
+
+              if test_failed:
+                  sys.exit(f"FAIL: R2 Integration Verification failed: {failure_reason}")
+              if cleanup_failed:
+                  sys.exit(f"FAIL: R2 Integration Verification failed during cleanup stage.")
 
           print("SUCCESS: All Cloudflare R2 live integration verifications passed.")
           PY

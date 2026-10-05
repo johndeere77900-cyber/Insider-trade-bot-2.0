@@ -81,4 +81,68 @@ def test_live_trading_requires_production() -> None:
     assert any(
         "production" in error.lower()
         for error in result.errors
-  )
+    )
+
+
+def test_filesystem_backend_works_without_r2_credentials() -> None:
+    values = base_environment()
+    values["SEC_ARCHIVE_BACKEND"] = "filesystem"
+    settings = load_environment(values)
+    assert settings.sec_archive_backend == "filesystem"
+
+
+def test_s3_backend_with_all_credentials_succeeds() -> None:
+    values = base_environment()
+    values["SEC_ARCHIVE_BACKEND"] = "s3"
+    values["SEC_ARCHIVE_BUCKET"] = "test-bucket"
+    values["SEC_ARCHIVE_ENDPOINT_URL"] = "https://example.r2.cloudflarestorage.com"
+    values["AWS_ACCESS_KEY_ID"] = "fake_key"
+    values["AWS_SECRET_ACCESS_KEY"] = "fake_secret"
+
+    settings = load_environment(values)
+    assert settings.sec_archive_backend == "s3"
+    assert settings.sec_archive_bucket == "test-bucket"
+
+
+def test_s3_backend_missing_bucket_fails() -> None:
+    values = base_environment()
+    values["SEC_ARCHIVE_BACKEND"] = "s3"
+    values["SEC_ARCHIVE_ENDPOINT_URL"] = "https://example.r2.cloudflarestorage.com"
+    values["AWS_ACCESS_KEY_ID"] = "fake_key"
+    values["AWS_SECRET_ACCESS_KEY"] = "fake_secret"
+
+    with pytest.raises(EnvironmentConfigurationError, match="SEC_ARCHIVE_BUCKET is required"):
+        load_environment(values)
+
+
+def test_s3_backend_missing_endpoint_fails() -> None:
+    values = base_environment()
+    values["SEC_ARCHIVE_BACKEND"] = "s3"
+    values["SEC_ARCHIVE_BUCKET"] = "test-bucket"
+    values["AWS_ACCESS_KEY_ID"] = "fake_key"
+    values["AWS_SECRET_ACCESS_KEY"] = "fake_secret"
+
+    with pytest.raises(EnvironmentConfigurationError, match="SEC_ARCHIVE_ENDPOINT_URL is required"):
+        load_environment(values)
+
+
+def test_s3_backend_missing_access_key_fails() -> None:
+    values = base_environment()
+    values["SEC_ARCHIVE_BACKEND"] = "s3"
+    values["SEC_ARCHIVE_BUCKET"] = "test-bucket"
+    values["SEC_ARCHIVE_ENDPOINT_URL"] = "https://example.r2.cloudflarestorage.com"
+    values["AWS_SECRET_ACCESS_KEY"] = "fake_secret"
+
+    with pytest.raises(EnvironmentConfigurationError, match="AWS_ACCESS_KEY_ID is required"):
+        load_environment(values)
+
+
+def test_s3_backend_missing_secret_key_fails() -> None:
+    values = base_environment()
+    values["SEC_ARCHIVE_BACKEND"] = "s3"
+    values["SEC_ARCHIVE_BUCKET"] = "test-bucket"
+    values["SEC_ARCHIVE_ENDPOINT_URL"] = "https://example.r2.cloudflarestorage.com"
+    values["AWS_ACCESS_KEY_ID"] = "fake_key"
+
+    with pytest.raises(EnvironmentConfigurationError, match="AWS_SECRET_ACCESS_KEY is required"):
+        load_environment(values)

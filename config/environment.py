@@ -160,6 +160,16 @@ def load_environment(
                 raise EnvironmentConfigurationError(
                     "SEC_ARCHIVE_ENDPOINT_URL is required when SEC_ARCHIVE_BACKEND is 's3'"
                 )
+            aws_access_key = source.get("AWS_ACCESS_KEY_ID", "").strip()
+            if not aws_access_key:
+                raise EnvironmentConfigurationError(
+                    "AWS_ACCESS_KEY_ID is required when SEC_ARCHIVE_BACKEND is 's3'"
+                )
+            aws_secret_key = source.get("AWS_SECRET_ACCESS_KEY", "").strip()
+            if not aws_secret_key:
+                raise EnvironmentConfigurationError(
+                    "AWS_SECRET_ACCESS_KEY is required when SEC_ARCHIVE_BACKEND is 's3'"
+                )
 
     telegram_enabled = _get_bool(
         source,

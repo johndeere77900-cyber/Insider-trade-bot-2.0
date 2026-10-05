@@ -51,9 +51,18 @@ def run_historical_acquisition(
     settings = load_environment()
     db_url = settings.database_url
     user_agent = settings.sec_user_agent
+
+    archive_kwargs = {}
+    if settings.sec_archive_bucket:
+        archive_kwargs["bucket"] = settings.sec_archive_bucket
+    if settings.sec_archive_endpoint_url:
+        archive_kwargs["endpoint_url"] = settings.sec_archive_endpoint_url
+    archive_kwargs["region_name"] = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "auto"
+
     archive_backend = get_archive_backend(
         backend_type=settings.sec_archive_backend,
         archive_path=settings.sec_archive_path,
+        **archive_kwargs,
     )
 
     state_mgr = AcquisitionStateManager(db_url)
