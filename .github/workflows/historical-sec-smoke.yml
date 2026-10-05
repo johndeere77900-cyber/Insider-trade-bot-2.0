@@ -8,6 +8,15 @@ jobs:
     name: Real SEC to Neon Historical Ingestion Validation
     runs-on: ubuntu-latest
 
+    env:
+      SEC_STORE_RAW_PAYLOAD: "false"
+      SEC_ARCHIVE_BACKEND: "s3"
+      SEC_ARCHIVE_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+      SEC_ARCHIVE_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_REGION: "auto"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,31 +37,40 @@ jobs:
             echo "::error::DATABASE_URL secret is missing or empty. Please set DATABASE_URL secret in repository settings."
             exit 1
           fi
+          if [ -z "${SEC_USER_AGENT}" ]; then
+            echo "::error::SEC_USER_AGENT secret is missing or empty. Please set SEC_USER_AGENT secret in repository settings."
+            exit 1
+          fi
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
 
       - name: Run First Historical Ingestion (SEC 2006-Q1)
         run: |
           python main.py historical --start 2006-Q1 --end 2006-Q1
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT || 'InsiderTradeBot/2.0 contact@example.com' }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          SEC_STORE_RAW_PAYLOAD: "false"
 
       - name: Verify First Ingestion & Data Quality
         run: |
           python scripts/verify_ingestion.py --run 1 --period 2006-Q1
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_STORE_RAW_PAYLOAD: "false"
 
       - name: Run Second Historical Ingestion (Idempotency Test)
         run: |
           python main.py historical --start 2006-Q1 --end 2006-Q1 --force
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT || 'InsiderTradeBot/2.0 contact@example.com' }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          SEC_STORE_RAW_PAYLOAD: "false"
 
       - name: Verify Idempotency & Output Summary Report
         run: |
           python scripts/verify_ingestion.py --run 2 --period 2006-Q1
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_STORE_RAW_PAYLOAD: "false"

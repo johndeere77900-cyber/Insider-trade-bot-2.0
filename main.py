@@ -50,10 +50,19 @@ def run_historical_acquisition(
 
     settings = load_environment()
     db_url = settings.database_url
-    user_agent = settings.sec_user_agent or "InsiderTradeBot/2.0 contact@example.com"
+    user_agent = settings.sec_user_agent
+
+    archive_kwargs = {}
+    if settings.sec_archive_bucket:
+        archive_kwargs["bucket"] = settings.sec_archive_bucket
+    if settings.sec_archive_endpoint_url:
+        archive_kwargs["endpoint_url"] = settings.sec_archive_endpoint_url
+    archive_kwargs["region_name"] = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "auto"
+
     archive_backend = get_archive_backend(
         backend_type=settings.sec_archive_backend,
         archive_path=settings.sec_archive_path,
+        **archive_kwargs,
     )
 
     state_mgr = AcquisitionStateManager(db_url)
@@ -79,41 +88,53 @@ def run_historical_acquisition(
 
         print(f"Processing period {period_str}...")
 
-        # Create temporary file for downloading ZIP archive to disk
+        # Create temporary file for working ZIP archive
         temp_fd, temp_zip_path = tempfile.mkstemp(suffix=".zip", prefix=f"sec_{period_str}_")
         os.close(temp_fd)
 
         try:
-            download_dataset_zip_to_file(year, qtr, user_agent=user_agent, target_path=temp_zip_path)
-            periods_downloaded += 1
-
-            if not zipfile.is_zipfile(temp_zip_path):
-                raise ValueError(f"Downloaded file for period {period_str} is not a valid ZIP archive.")
-
-            hasher = hashlib.sha256()
-            file_size = os.path.getsize(temp_zip_path)
-            with open(temp_zip_path, "rb") as f:
-                while chunk := f.read(1024 * 1024):
-                    hasher.update(chunk)
-            zip_checksum = hasher.hexdigest()
-
             dataset_url = build_dataset_url(year, qtr)
 
-            # Store in immutable archive layer
-            archive_meta = ArchiveMetadata(
-                period=period_str,
-                source="SEC",
-                source_url=dataset_url,
-                sha256=zip_checksum,
-                validation_status="validated",
-                file_size_bytes=file_size,
-            )
-            saved_meta = archive_backend.put(
-                period=period_str,
-                content=temp_zip_path,
-                metadata=archive_meta,
-            )
+            # Step 1: Reuse existing intact archive or download anew
+            if archive_backend.exists(period_str):
+                print(f"Period {period_str}: Found existing immutable archive. Reusing archive.")
+                zip_bytes = archive_backend.get(period_str)
+                with open(temp_zip_path, "wb") as f:
+                    f.write(zip_bytes)
+                saved_meta = archive_backend.metadata(period_str)
+            else:
+                # SEC Download
+                download_dataset_zip_to_file(year, qtr, user_agent=user_agent, target_path=temp_zip_path)
+                periods_downloaded += 1
 
+                # ZIP Validation
+                if not zipfile.is_zipfile(temp_zip_path):
+                    raise ValueError(f"Downloaded file for period {period_str} is not a valid ZIP archive.")
+
+                # SHA-256 calculation
+                hasher = hashlib.sha256()
+                file_size = os.path.getsize(temp_zip_path)
+                with open(temp_zip_path, "rb") as f:
+                    while chunk := f.read(1024 * 1024):
+                        hasher.update(chunk)
+                zip_checksum = hasher.hexdigest()
+
+                # Immutable Archive persistence
+                archive_meta = ArchiveMetadata(
+                    period=period_str,
+                    source="SEC",
+                    source_url=dataset_url,
+                    sha256=zip_checksum,
+                    validation_status="validated",
+                    file_size_bytes=file_size,
+                )
+                saved_meta = archive_backend.put(
+                    period=period_str,
+                    content=temp_zip_path,
+                    metadata=archive_meta,
+                )
+
+            # Dataset Provenance tracking
             store_provenance(
                 db_url,
                 record_type="dataset_period",
@@ -124,6 +145,7 @@ def run_historical_acquisition(
                 validation_status="validated",
             )
 
+            # Normalized Ingestion
             p_parsed = 0
             p_invalid = 0
             p_inserted = 0
@@ -161,6 +183,7 @@ def run_historical_acquisition(
                 p_duplicates += b_dup
                 batch.clear()
 
+            # Mark COMPLETED only after normalized ingestion completes successfully
             state_mgr.record_period_completion(
                 period=period_str,
                 records_parsed=p_parsed,
@@ -182,14 +205,14 @@ def run_historical_acquisition(
             )
 
         except SECDatasetDownloadError as exc:
-            print(f"Period {period_str}: Download failed ({exc}). Marking failed.")
+            print(f"Period {period_str}: Download failed ({exc}). Marking FAILED.")
             total_failures += 1
             state_mgr.record_period_completion(
                 period_str, 0, 0, 0, 0, 1, status="FAILED"
             )
 
         except Exception as exc:
-            print(f"Period {period_str}: Error during processing ({exc}). Marking FAILED.")
+            print(f"Period {period_str}: Ingestion error ({exc}). Marking FAILED.")
             total_failures += 1
             state_mgr.record_period_completion(
                 period=period_str,
@@ -224,10 +247,7 @@ def run_historical_acquisition(
         cursor = conn.execute(tx_date_sql)
         row = cursor.fetchone()
         if row:
-            if is_postgresql_url(db_url):
-                earliest_date, latest_date = row[0], row[1]
-            else:
-                earliest_date, latest_date = row[0], row[1]
+            earliest_date, latest_date = row[0], row[1]
 
     print("\n================ HISTORICAL ACQUISITION SUMMARY ================")
     print(f"Periods processed: {periods_processed}")

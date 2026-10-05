@@ -128,12 +128,14 @@ def prepare_event_study_inputs(
     """
     Convert normalized insider transactions into event-study engine inputs.
 
-    Data Quality & Safety rules:
+    Data Quality & Point-In-Time Safety rules:
     - Missing ticker -> REJECTED_MISSING_TICKER
     - Missing or invalid filing_date / transaction_date -> REJECTED_MISSING_DATE / REJECTED_INVALID_DATE
-    - Missing market price on filing date -> REJECTED_MISSING_PRICE
-    - Insufficient future observations for horizon_days -> REJECTED_INSUFFICIENT_OBSERVATIONS
-    - Superseded amendments -> REJECTED_AMENDMENT_SUPERSEDED
+    - Point-In-Time safety: event_price is strictly sourced from the first available market-price
+      observation STRICTLY AFTER filing_date (never same-day closing price on filing_date).
+    - Missing price observation strictly after filing_date -> REJECTED_MISSING_PRICE
+    - Insufficient price observations after post-filing entry date for horizon_days -> REJECTED_INSUFFICIENT_OBSERVATIONS
+    - Superseded / unresolved amendments -> REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL
     """
     valid_events: List[ResearchEventInput] = []
 
@@ -161,7 +163,7 @@ def prepare_event_study_inputs(
 
         ticker = tx.ticker.strip().upper()
 
-        # 2. Date check (Point-In-Time safety: event_date is public filing_date)
+        # 2. Date check (Point-In-Time safety: public information date is filing_date)
         if not tx.filing_date or not tx.filing_date.strip():
             rejections.append(
                 EventAdapterRejection(
@@ -173,7 +175,7 @@ def prepare_event_study_inputs(
             )
             continue
 
-        event_date = tx.filing_date.strip()
+        filing_date = tx.filing_date.strip()
 
         # 3. Market price lookup for ticker
         if ticker not in price_cache:
@@ -181,43 +183,48 @@ def prepare_event_study_inputs(
 
         prices = price_cache[ticker]
 
-        if not prices or event_date not in prices:
+        # Strict Point-In-Time boundary:
+        # event_price MUST come from the first available price observation STRICTLY AFTER filing_date.
+        post_filing_dates = [d for d in sorted(prices.keys()) if d > filing_date]
+
+        if not post_filing_dates:
             rejections.append(
                 EventAdapterRejection(
                     accession_number=acc,
                     record_hash=rec_hash,
                     reason=REJECTION_MISSING_PRICE,
-                    details=f"No market price found for {ticker} on filing date {event_date}.",
+                    details=f"No market price observation strictly after filing date {filing_date} for {ticker}.",
                 )
             )
             continue
 
-        event_price = prices[event_date]
+        post_filing_date = post_filing_dates[0]
+        event_price = prices[post_filing_date]
 
-        # 4. Insufficient future observations check
-        future_dates = [d for d in sorted(prices.keys()) if d > event_date]
-        if len(future_dates) < horizon_days:
+        # 4. Insufficient future observations check after post_filing_date
+        future_dates_after_entry = [d for d in post_filing_dates if d > post_filing_date]
+        if len(future_dates_after_entry) < horizon_days:
             rejections.append(
                 EventAdapterRejection(
                     accession_number=acc,
                     record_hash=rec_hash,
                     reason=REJECTION_INSUFFICIENT_OBSERVATIONS,
                     details=(
-                        f"Insufficient price observations ({len(future_dates)}) after filing date {event_date} "
-                        f"for horizon {horizon_days}."
+                        f"Insufficient price observations ({len(future_dates_after_entry)}) after entry date {post_filing_date} "
+                        f"(filing date {filing_date}) for horizon {horizon_days}."
                     ),
                 )
             )
             continue
 
         # 5. Deterministic event_key
-        event_key = f"{ticker}|{event_date}|{acc}|{rec_hash or 'nohash'}"
+        event_key = f"{ticker}|{filing_date}|{acc}|{rec_hash or 'nohash'}"
 
         valid_events.append(
             ResearchEventInput(
                 event_key=event_key,
                 symbol=ticker,
-                event_date=event_date,
+                event_date=post_filing_date,
                 event_price=event_price,
                 prices=prices,
                 transaction=tx,
