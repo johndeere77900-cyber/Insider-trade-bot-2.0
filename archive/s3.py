@@ -19,6 +19,29 @@ from archive.interface import (
 )
 
 
+def _is_not_found_exception(exc: Exception) -> bool:
+    """
+    Return True strictly if exc represents an S3 object-not-found error (404/NoSuchKey/NotFound).
+    Any non-404 error (e.g. 403 AccessDenied, network error, throttling) returns False.
+    """
+    try:
+        from botocore.exceptions import ClientError
+        if isinstance(exc, ClientError):
+            error_code = str(exc.response.get("Error", {}).get("Code", ""))
+            http_status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if error_code in {"404", "NoSuchKey", "NotFound"} or http_status == 404:
+                return True
+            return False
+    except ImportError:
+        pass
+
+    exc_str = str(exc).lower()
+    if "404" in exc_str or "nosuchkey" in exc_str or "notfound" in exc_str or "not found" in exc_str:
+        return True
+
+    return False
+
+
 class S3SECArchive(SECArchiveInterface):
     """
     Object-storage backend (AWS S3, Cloudflare R2, MinIO, GCS S3 API)
@@ -43,7 +66,7 @@ class S3SECArchive(SECArchiveInterface):
         self.prefix = p
 
         self._endpoint_url = endpoint_url or os.getenv("SEC_ARCHIVE_ENDPOINT_URL")
-        self._region_name = region_name or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "auto"
+        self._region_name = region_name or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULTREGION") or "auto"
         self._aws_access_key_id = aws_access_key_id or os.getenv("AWS_ACCESS_KEY_ID")
         self._aws_secret_access_key = aws_secret_access_key or os.getenv("AWS_SECRET_ACCESS_KEY")
         self._client = s3_client
@@ -99,13 +122,64 @@ class S3SECArchive(SECArchiveInterface):
         try:
             client.head_object(Bucket=self.bucket, Key=key)
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            if _is_not_found_exception(exc):
+                return False
+            raise ArchiveError(
+                f"S3 head_object error for bucket '{self.bucket}', key '{key}': {exc}"
+            ) from exc
 
     def exists(self, period: str) -> bool:
         z_key = self._zip_key(period)
         m_key = self._manifest_key(period)
         return self._object_exists(z_key) and self._object_exists(m_key)
+
+    def delete_incomplete_archive(self, period: str) -> bool:
+        """
+        Safely remove a genuinely incomplete archive for period (ZIP exists without manifest,
+        or manifest exists without ZIP).
+
+        Refuses to delete/recover a complete archive (where both ZIP and manifest exist).
+        Returns True if an incomplete component was removed, False if period was clean.
+        """
+        norm_period = self._normalize_period(period)
+        zip_key = self._zip_key(norm_period)
+        manifest_key = self._manifest_key(norm_period)
+
+        zip_exists = self._object_exists(zip_key)
+        manifest_exists = self._object_exists(manifest_key)
+
+        if zip_exists and manifest_exists:
+            raise ArchiveExistsError(
+                f"Cannot delete or recover complete archive for period '{norm_period}'. "
+                f"Both ZIP ({zip_key}) and manifest ({manifest_key}) exist intact."
+            )
+
+        if not zip_exists and not manifest_exists:
+            return False
+
+        client = self._get_client()
+        removed = False
+
+        if zip_exists:
+            try:
+                client.delete_object(Bucket=self.bucket, Key=zip_key)
+                removed = True
+            except Exception as exc:
+                raise ArchiveError(
+                    f"Failed to delete incomplete ZIP object '{zip_key}' in bucket '{self.bucket}': {exc}"
+                ) from exc
+
+        if manifest_exists:
+            try:
+                client.delete_object(Bucket=self.bucket, Key=manifest_key)
+                removed = True
+            except Exception as exc:
+                raise ArchiveError(
+                    f"Failed to delete incomplete manifest object '{manifest_key}' in bucket '{self.bucket}': {exc}"
+                ) from exc
+
+        return removed
 
     def _compute_sha256(self, content: Union[str, bytes, bytearray]) -> tuple[str, int]:
         hasher = hashlib.sha256()
@@ -169,7 +243,7 @@ class S3SECArchive(SECArchiveInterface):
         try:
             client.put_object(Bucket=self.bucket, Key=zip_key, Body=zip_bytes)
         except Exception as exc:
-            raise ArchiveError(f"Failed to upload ZIP archive to object storage: {exc}") from exc
+            raise ArchiveError(f"Failed to upload ZIP archive key '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
 
         retrieved_at = datetime.now(timezone.utc).isoformat()
 
@@ -200,7 +274,7 @@ class S3SECArchive(SECArchiveInterface):
         try:
             client.put_object(Bucket=self.bucket, Key=manifest_key, Body=manifest_bytes)
         except Exception as exc:
-            raise ArchiveError(f"Failed to upload manifest to object storage: {exc}") from exc
+            raise ArchiveError(f"Failed to upload manifest key '{manifest_key}' in bucket '{self.bucket}': {exc}") from exc
 
         return final_meta
 
@@ -213,19 +287,21 @@ class S3SECArchive(SECArchiveInterface):
             response = client.get_object(Bucket=self.bucket, Key=zip_key)
             return response["Body"].read()
         except Exception as exc:
-            raise ArchiveNotFoundError(f"Failed to retrieve archive for period '{period}': {exc}") from exc
+            if _is_not_found_exception(exc):
+                raise ArchiveNotFoundError(f"Archive key '{zip_key}' not found in bucket '{self.bucket}'.") from exc
+            raise ArchiveError(f"Failed to retrieve archive key '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
 
     def metadata(self, period: str) -> ArchiveMetadata:
         manifest_key = self._manifest_key(period)
-        if not self._object_exists(manifest_key):
-            raise ArchiveNotFoundError(f"Archive metadata for period '{period}' does not exist.")
         client = self._get_client()
         try:
             response = client.get_object(Bucket=self.bucket, Key=manifest_key)
             data = json.loads(response["Body"].read().decode("utf-8"))
             return ArchiveMetadata.from_dict(data)
         except Exception as exc:
-            raise ArchiveNotFoundError(f"Failed to retrieve metadata for period '{period}': {exc}") from exc
+            if _is_not_found_exception(exc):
+                raise ArchiveNotFoundError(f"Archive metadata key '{manifest_key}' not found in bucket '{self.bucket}'.") from exc
+            raise ArchiveError(f"Failed to retrieve metadata key '{manifest_key}' in bucket '{self.bucket}': {exc}") from exc
 
     def checksum(self, period: str) -> str:
         return self.metadata(period).sha256
@@ -239,14 +315,13 @@ class S3SECArchive(SECArchiveInterface):
                 for obj in page.get("Contents", []):
                     key = obj.get("Key", "")
                     if key.endswith(".json"):
-                        # Extract period name
                         filename = key[len(self.prefix):] if key.startswith(self.prefix) else key
                         if filename.endswith(".json"):
                             p = filename[:-5]
                             if self._object_exists(self._zip_key(p)):
                                 periods.append(p)
         except Exception as exc:
-            raise ArchiveError(f"Failed to list object storage archives: {exc}") from exc
+            raise ArchiveError(f"Failed to list object storage archives in bucket '{self.bucket}': {exc}") from exc
 
         periods.sort()
         return periods

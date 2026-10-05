@@ -160,7 +160,7 @@ def test_s3_archive_cases_a_through_f(tmp_path) -> None:
     class MockS3Client:
         def head_object(self, Bucket: str, Key: str):
             if Key not in store:
-                raise Exception("NotFound")
+                raise Exception("NotFound 404")
             return {}
 
         def put_object(self, Bucket: str, Key: str, Body: bytes):
@@ -169,9 +169,13 @@ def test_s3_archive_cases_a_through_f(tmp_path) -> None:
                 raise ArchiveError("Simulated network failure on manifest upload")
             store[Key] = Body
 
+        def delete_object(self, Bucket: str, Key: str):
+            if Key in store:
+                del store[Key]
+
         def get_object(self, Bucket: str, Key: str):
             if Key not in store:
-                raise Exception("NotFound")
+                raise Exception("NotFound 404")
             return {"Body": MockBody(store[Key])}
 
         def get_paginator(self, operation_name: str):
@@ -230,6 +234,33 @@ def test_s3_archive_cases_a_through_f(tmp_path) -> None:
     fail_manifest_write = False
     with pytest.raises(ArchiveExistsError, match="ZIP archive exists but manifest is missing"):
         s3_backend.put(period_f, str(z1))
+
+    # Test controlled recovery of incomplete archive
+    # Complete archive cannot be recovered/deleted
+    with pytest.raises(ArchiveExistsError, match="Cannot delete or recover complete archive"):
+        s3_backend.delete_incomplete_archive(period_a)
+
+    # Incomplete archive (Case F) can be safely deleted
+    assert s3_backend.delete_incomplete_archive(period_f) is True
+    assert f"sec-archives/{period_f}.zip" not in store
+
+    # Clean upload succeeds after recovery
+    meta_recovered = s3_backend.put(period_f, str(z1))
+    assert meta_recovered.period == period_f
+    assert s3_backend.exists(period_f) is True
+
+
+def test_s3_strict_error_classification(tmp_path) -> None:
+    # Test that 403 / AccessDenied or network errors raise ArchiveError and are NOT converted to missing object
+    class MockErrorS3Client:
+        def head_object(self, Bucket: str, Key: str):
+            raise Exception("403 AccessDenied")
+
+    mock_client = MockErrorS3Client()
+    s3_backend = S3SECArchive(bucket="insider-trade-sec-archive", s3_client=mock_client)
+
+    with pytest.raises(ArchiveError, match="403 AccessDenied"):
+        s3_backend.exists("2006-Q1")
 
 
 def test_s3_archive_configuration_environment_wiring(monkeypatch) -> None:

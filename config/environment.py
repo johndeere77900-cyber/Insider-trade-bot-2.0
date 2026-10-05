@@ -74,6 +74,8 @@ class EnvironmentSettings:
     sec_store_raw_payload: bool
     sec_archive_backend: str
     sec_archive_path: str
+    sec_archive_bucket: str
+    sec_archive_endpoint_url: str
 
     telegram_bot_token: str
     telegram_allowed_user_ids: tuple[str, ...]
@@ -140,6 +142,25 @@ def load_environment(
             "SEC_USER_AGENT is required"
         )
 
+    sec_archive_backend = source.get(
+        "SEC_ARCHIVE_BACKEND",
+        "filesystem",
+    ).strip().lower()
+
+    sec_archive_bucket = source.get("SEC_ARCHIVE_BUCKET", "").strip()
+    sec_archive_endpoint_url = source.get("SEC_ARCHIVE_ENDPOINT_URL", "").strip()
+
+    if sec_archive_backend in {"s3", "r2", "object_storage", "objectstorage", "s3_compat"}:
+        if environment == "production" or source.get("SEC_ARCHIVE_BACKEND") is not None:
+            if not sec_archive_bucket:
+                raise EnvironmentConfigurationError(
+                    "SEC_ARCHIVE_BUCKET is required when SEC_ARCHIVE_BACKEND is 's3'"
+                )
+            if not sec_archive_endpoint_url:
+                raise EnvironmentConfigurationError(
+                    "SEC_ARCHIVE_ENDPOINT_URL is required when SEC_ARCHIVE_BACKEND is 's3'"
+                )
+
     telegram_enabled = _get_bool(
         source,
         "APP_TELEGRAM_ENABLED",
@@ -195,14 +216,13 @@ def load_environment(
             "SEC_STORE_RAW_PAYLOAD",
             False,
         ),
-        sec_archive_backend=source.get(
-            "SEC_ARCHIVE_BACKEND",
-            "filesystem",
-        ).strip().lower(),
+        sec_archive_backend=sec_archive_backend,
         sec_archive_path=source.get(
             "SEC_ARCHIVE_PATH",
             "data/archive",
         ).strip(),
+        sec_archive_bucket=sec_archive_bucket,
+        sec_archive_endpoint_url=sec_archive_endpoint_url,
         telegram_bot_token=telegram_bot_token,
         telegram_allowed_user_ids=allowed_user_ids,
         market_data_api_key=source.get(

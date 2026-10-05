@@ -48,6 +48,40 @@ class FilesystemSECArchive(SECArchiveInterface):
         m_path = self._manifest_path(period)
         return os.path.exists(z_path) and os.path.exists(m_path)
 
+    def delete_incomplete_archive(self, period: str) -> bool:
+        """
+        Safely remove a genuinely incomplete archive for period (ZIP exists without manifest,
+        or manifest exists without ZIP).
+
+        Refuses to delete/recover a complete archive (where both ZIP and manifest exist).
+        Returns True if an incomplete component was removed, False if period was clean.
+        """
+        norm_period = self._normalize_period(period)
+        z_path = self._zip_path(norm_period)
+        m_path = self._manifest_path(norm_period)
+
+        z_exists = os.path.exists(z_path)
+        m_exists = os.path.exists(m_path)
+
+        if z_exists and m_exists:
+            raise ArchiveExistsError(
+                f"Cannot delete or recover complete archive for period '{norm_period}'. "
+                f"Both ZIP ({z_path}) and manifest ({m_path}) exist intact."
+            )
+
+        if not z_exists and not m_exists:
+            return False
+
+        removed = False
+        if z_exists:
+            os.remove(z_path)
+            removed = True
+        if m_exists:
+            os.remove(m_path)
+            removed = True
+
+        return removed
+
     def _compute_sha256(self, content: Union[str, bytes, bytearray]) -> tuple[str, int]:
         hasher = hashlib.sha256()
         size = 0
