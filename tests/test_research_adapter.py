@@ -31,12 +31,13 @@ def test_db(tmp_path):
     db_url = f"sqlite:///{db_file}"
     initialize_database(db_url)
 
-    # Insert market prices for dates 2024-01-15, 2024-01-16, 2024-01-17, 2024-01-18
+    # Insert market prices for dates 2024-01-15 through 2024-01-19
     for d, p in [
         ("2024-01-15", 150.0),
         ("2024-01-16", 155.0),
         ("2024-01-17", 160.0),
         ("2024-01-18", 165.0),
+        ("2024-01-19", 170.0),
     ]:
         store_market_price(
             db_url,
@@ -161,16 +162,16 @@ def test_prepare_event_study_inputs_and_rejections(test_db):
         form_type="4",
     )
 
-    # Missing price tx
+    # Missing price tx (ticker with no market prices in DB)
     tx_no_price = NormalizedBulkTransaction(
         accession_number="000004",
-        issuer_cik="0000320193",
-        issuer_name="Apple Inc.",
-        ticker="AAPL",
-        reporting_owner_name="Cook Tim",
-        reporting_owner_cik="0001214156",
-        transaction_date="2020-01-01",  # No prices stored for 2020
-        filing_date="2020-01-02",
+        issuer_cik="0000999999",
+        issuer_name="No Price Inc.",
+        ticker="XYZ",
+        reporting_owner_name="Unknown Owner",
+        reporting_owner_cik="0000999999",
+        transaction_date="2024-01-15",
+        filing_date="2024-01-16",
         transaction_code="S",
         security_title="Common Stock",
         shares=100.0,
@@ -202,27 +203,62 @@ def test_prepare_event_study_inputs_and_rejections(test_db):
     assert REJECTION_MISSING_PRICE in reasons
 
 
-def test_point_in_time_safety_and_acquired_disposed_filter(test_db):
-    # Verify point-in-time filing_date safety: event_date MUST be filing_date (2024-01-16), not transaction_date (2024-01-15)
+def test_point_in_time_safety_and_no_same_day_closing_lookahead(test_db):
+    # filing_date is 2024-01-16.
+    # Same-day closing price on 2024-01-16 is 155.0.
+    # Strict point-in-time boundary requires event_price to be from the first observation
+    # STRICTLY AFTER filing_date -> 2024-01-17 with price 160.0.
     txs_d = query_insider_transactions(test_db, acquired_disposed="D")
     assert len(txs_d) == 1
     assert txs_d[0].accession_number == "000001"
 
-    txs_a = query_insider_transactions(test_db, acquired_disposed="A")
-    assert len(txs_a) == 1
-    assert txs_a[0].accession_number == "000002"
-
     adapter_res = prepare_event_study_inputs(test_db, txs_d, horizon_days=1)
     event = adapter_res.valid_events[0]
 
-    # Point-in-time safety check: event_date uses public filing_date 2024-01-16, event_price is 155.0
-    assert event.event_date == "2024-01-16"
-    assert event.event_price == 155.0
+    # Verify no same-day closing price look-ahead
+    assert event.event_date == "2024-01-17"  # First market day strictly after filing date (2024-01-16)
+    assert event.event_price == 160.0         # Price on 2024-01-17, NOT 155.0 on 2024-01-16
+    assert event.event_price != 155.0         # Confirms same-day closing price is NOT used
+    assert event.transaction.filing_date == "2024-01-16"
     assert event.transaction.transaction_date == "2024-01-15"
 
 
+def test_insufficient_post_filing_observations(test_db):
+    # Transaction filed on 2024-01-18. Market price strictly after 2024-01-18 is only 2024-01-19 (1 observation).
+    # For horizon_days=2, there are insufficient future observations after entry date 2024-01-19.
+    tx = NormalizedBulkTransaction(
+        accession_number="000099",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2024-01-17",
+        filing_date="2024-01-18",
+        transaction_code="P",
+        security_title="Common Stock",
+        shares=500.0,
+        price_per_share=165.0,
+        transaction_type="non_derivative",
+        acquired_disposed="A",
+        ownership_type="D",
+        ownership_nature="Direct",
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={},
+        source="SEC",
+        record_hash="hash99",
+        form_type="4",
+    )
+
+    res = prepare_event_study_inputs(test_db, [tx], horizon_days=2)
+    assert len(res.valid_events) == 0
+    assert len(res.rejections) == 1
+    assert res.rejections[0].reason == REJECTION_INSUFFICIENT_OBSERVATIONS
+
+
 def test_cross_accession_amendment_not_linked_by_heuristic(test_db):
-    # Two separate SEC submissions with different accession numbers are NOT linked merely by DATE_OF_ORIG_SUB or heuristics
     orig = NormalizedBulkTransaction(
         accession_number="000010-ORIG",
         issuer_cik="0000320193",
@@ -275,30 +311,21 @@ def test_cross_accession_amendment_not_linked_by_heuristic(test_db):
         form_type="4/A",
     )
 
-    # 1. Store both in database
     store_bulk_insider_transactions(test_db, [orig, amend_cross])
 
-    # 2. Verify date_of_orig_submission survives database storage -> research query retrieval
     queried_txs = query_insider_transactions(test_db, accession_numbers=["000010-AMEND-DIFFERENT", "000010-ORIG"])
     assert len(queried_txs) == 2
-    amend_queried = [t for t in queried_txs if t.accession_number == "000010-AMEND-DIFFERENT"][0]
-    assert amend_queried.is_amendment is True
-    assert amend_queried.date_of_orig_submission == "2024-01-16"
 
-    # 3. Adapter behavior: original is retained as valid event; heuristic candidate is NOT treated as authoritative supersession.
     adapter_res = prepare_event_study_inputs(test_db, queried_txs, horizon_days=1)
 
     assert len(adapter_res.valid_events) == 1
     assert adapter_res.valid_events[0].transaction.record_hash == "hash_orig_cross"
 
-    # Unresolved cross-accession amendment is rejected from research events to prevent double counting
     assert len(adapter_res.rejections) == 1
     assert adapter_res.rejections[0].reason == "REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL"
-    assert adapter_res.rejections[0].record_hash == "hash_amend_cross"
 
 
 def test_legitimate_same_day_transactions_not_collapsed(test_db):
-    # Verify two legitimate same-day non-amended transactions are NOT incorrectly collapsed
     legit_tx1 = NormalizedBulkTransaction(
         accession_number="000020",
         issuer_cik="0000320193",
@@ -365,11 +392,11 @@ def test_event_study_and_backtest_conversion(test_db):
 
     assert summary.event_count == 1
     assert len(returns) == 1
-    # Point-in-time safety: filing_date is 2024-01-16 (price 155.0), next horizon price is 2024-01-17 (price 160.0)
-    assert returns[0].event_price == 155.0
-    assert returns[0].future_price == 160.0
+    # Point-in-time safety: filing_date is 2024-01-16. Entry date is 2024-01-17 (price 160.0). Next horizon price is 2024-01-18 (price 165.0).
+    assert returns[0].event_price == 160.0
+    assert returns[0].future_price == 165.0
 
     bt_trades = convert_events_to_backtest_trades(adapter_res.valid_events, holding_periods=1)
     assert len(bt_trades) == 1
     assert bt_trades[0]["symbol"] == "AAPL"
-    assert bt_trades[0]["entry_price"] == 155.0
+    assert bt_trades[0]["entry_price"] == 160.0

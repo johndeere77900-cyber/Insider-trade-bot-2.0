@@ -26,6 +26,9 @@ jobs:
     name: Production SEC Historical Dataset Backfill
     runs-on: ubuntu-latest
 
+    env:
+      SEC_STORE_RAW_PAYLOAD: "false"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,8 +49,13 @@ jobs:
             echo "::error::DATABASE_URL secret is missing or empty. Please set DATABASE_URL secret in repository settings."
             exit 1
           fi
+          if [ -z "${SEC_USER_AGENT}" ]; then
+            echo "::error::SEC_USER_AGENT secret is missing or empty. Please set SEC_USER_AGENT secret in repository settings."
+            exit 1
+          fi
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
 
       - name: Run Historical Ingestion Engine
         run: |
@@ -69,7 +77,8 @@ jobs:
           BATCH_SIZE: ${{ github.event.inputs.batch_size }}
           FORCE: ${{ github.event.inputs.force }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT || 'InsiderTradeBot/2.0 contact@example.com' }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+          SEC_STORE_RAW_PAYLOAD: "false"
 
       - name: Verify Range Ingestion & Output Final Report
         run: |
@@ -78,3 +87,4 @@ jobs:
           START_PERIOD: ${{ github.event.inputs.start_period }}
           END_PERIOD: ${{ github.event.inputs.end_period }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SEC_STORE_RAW_PAYLOAD: "false"

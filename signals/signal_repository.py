@@ -3,13 +3,31 @@ Permanent signal repository for Insider Trade Bot.
 
 This module stores research-derived signal candidates in permanent
 storage. Storing a signal does not place an order or authorize trading.
+
+Supports both SQLite and PostgreSQL backends via database_url abstraction.
 """
 
 from __future__ import annotations
 
+from typing import Any, Mapping
+
 from core.models import Signal
-from database.connection import connect
+from database.connection import connect, initialize_database, is_postgresql_url
 from storage.repository import utc_now
+
+
+def _placeholder(database_url: str) -> str:
+    """Return the backend parameter placeholder."""
+    return "%s" if is_postgresql_url(database_url) else "?"
+
+
+def _row_val(row: Any, key: str, index: int) -> Any:
+    """Safely extract field from mapping or tuple row."""
+    if row is None:
+        return None
+    if isinstance(row, Mapping) or hasattr(row, "keys"):
+        return row[key]
+    return row[index]
 
 
 def store_signal(
@@ -51,36 +69,72 @@ def store_signal(
             "methodology_version cannot be empty."
         )
 
+    initialize_database(database_url)
+    ph = _placeholder(database_url)
+
     with connect(database_url) as connection:
-        cursor = connection.execute(
+        if is_postgresql_url(database_url):
+            query = f"""
+                INSERT INTO signals (
+                    signal_key,
+                    symbol,
+                    signal_date,
+                    signal_type,
+                    score,
+                    rationale,
+                    methodology_version,
+                    created_at
+                )
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+                ON CONFLICT (signal_key) DO NOTHING
             """
-            INSERT OR IGNORE INTO signals (
-                signal_key,
-                symbol,
-                signal_date,
-                signal_type,
-                score,
-                rationale,
-                methodology_version,
-                created_at
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    query,
+                    (
+                        signal.signal_key,
+                        signal.symbol,
+                        signal.signal_date,
+                        signal.signal_type,
+                        signal.score,
+                        signal.rationale,
+                        signal.methodology_version,
+                        utc_now(),
+                    ),
+                )
+                inserted = cursor.rowcount == 1
+        else:
+            query = f"""
+                INSERT OR IGNORE INTO signals (
+                    signal_key,
+                    symbol,
+                    signal_date,
+                    signal_type,
+                    score,
+                    rationale,
+                    methodology_version,
+                    created_at
+                )
+                VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+            """
+            cursor = connection.execute(
+                query,
+                (
+                    signal.signal_key,
+                    signal.symbol,
+                    signal.signal_date,
+                    signal.signal_type,
+                    signal.score,
+                    signal.rationale,
+                    signal.methodology_version,
+                    utc_now(),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                signal.signal_key,
-                signal.symbol,
-                signal.signal_date,
-                signal.signal_type,
-                signal.score,
-                signal.rationale,
-                signal.methodology_version,
-                utc_now(),
-            ),
-        )
+            inserted = cursor.rowcount == 1
 
         connection.commit()
 
-        return cursor.rowcount == 1
+        return inserted
 
 
 def get_signal(
@@ -100,9 +154,12 @@ def get_signal(
             "signal_key cannot be empty."
         )
 
+    initialize_database(database_url)
+    ph = _placeholder(database_url)
+
     with connect(database_url) as connection:
-        row = connection.execute(
-            """
+        cursor = connection.execute(
+            f"""
             SELECT
                 signal_key,
                 symbol,
@@ -112,24 +169,23 @@ def get_signal(
                 rationale,
                 methodology_version
             FROM signals
-            WHERE signal_key = ?
+            WHERE signal_key = {ph}
             """,
             (normalized_key,),
-        ).fetchone()
+        )
+        row = cursor.fetchone()
 
     if row is None:
         return None
 
     return Signal(
-        signal_key=row["signal_key"],
-        symbol=row["symbol"],
-        signal_date=row["signal_date"],
-        signal_type=row["signal_type"],
-        score=row["score"],
-        rationale=row["rationale"],
-        methodology_version=row[
-            "methodology_version"
-        ],
+        signal_key=_row_val(row, "signal_key", 0),
+        symbol=_row_val(row, "symbol", 1),
+        signal_date=_row_val(row, "signal_date", 2),
+        signal_type=_row_val(row, "signal_type", 3),
+        score=_row_val(row, "score", 4),
+        rationale=_row_val(row, "rationale", 5),
+        methodology_version=_row_val(row, "methodology_version", 6),
     )
 
 
@@ -151,6 +207,9 @@ def list_signals(
             "limit must be at least 1."
         )
 
+    initialize_database(database_url)
+    ph = _placeholder(database_url)
+
     query = """
         SELECT
             signal_key,
@@ -167,45 +226,44 @@ def list_signals(
     parameters: list[object] = []
 
     if symbol is not None:
-        query += """
-            AND symbol = ?
+        query += f"""
+            AND symbol = {ph}
         """
         parameters.append(
             symbol.strip()
         )
 
     if signal_type is not None:
-        query += """
-            AND signal_type = ?
+        query += f"""
+            AND signal_type = {ph}
         """
         parameters.append(
             signal_type.strip()
         )
 
-    query += """
+    query += f"""
         ORDER BY signal_date DESC, created_at DESC
-        LIMIT ?
+        LIMIT {ph}
     """
 
     parameters.append(limit)
 
     with connect(database_url) as connection:
-        rows = connection.execute(
+        cursor = connection.execute(
             query,
             parameters,
-        ).fetchall()
+        )
+        rows = cursor.fetchall()
 
     return [
         Signal(
-            signal_key=row["signal_key"],
-            symbol=row["symbol"],
-            signal_date=row["signal_date"],
-            signal_type=row["signal_type"],
-            score=row["score"],
-            rationale=row["rationale"],
-            methodology_version=row[
-                "methodology_version"
-            ],
+            signal_key=_row_val(row, "signal_key", 0),
+            symbol=_row_val(row, "symbol", 1),
+            signal_date=_row_val(row, "signal_date", 2),
+            signal_type=_row_val(row, "signal_type", 3),
+            score=_row_val(row, "score", 4),
+            rationale=_row_val(row, "rationale", 5),
+            methodology_version=_row_val(row, "methodology_version", 6),
         )
         for row in rows
     ]
@@ -218,6 +276,8 @@ def count_signals(
     Return the number of permanently stored signals.
     """
 
+    initialize_database(database_url)
+
     with connect(database_url) as connection:
         row = connection.execute(
             """
@@ -226,6 +286,7 @@ def count_signals(
             """
         ).fetchone()
 
-    return int(
-        row["count"]
-  )
+    if row is None:
+        return 0
+
+    return int(_row_val(row, "count", 0))
