@@ -76,6 +76,7 @@ class EnvironmentSettings:
     sec_archive_path: str
     sec_archive_bucket: str
     sec_archive_endpoint_url: str
+    sec_operational_retention_years: int
 
     telegram_bot_token: str
     telegram_allowed_user_ids: tuple[str, ...]
@@ -149,6 +150,11 @@ def load_environment(
 
     sec_archive_bucket = source.get("SEC_ARCHIVE_BUCKET", "").strip()
     sec_archive_endpoint_url = source.get("SEC_ARCHIVE_ENDPOINT_URL", "").strip()
+    sec_operational_retention_years = _get_int(
+        source,
+        "SEC_OPERATIONAL_RETENTION_YEARS",
+        3,
+    )
 
     if sec_archive_backend in {"s3", "r2", "object_storage", "objectstorage", "s3_compat"}:
         if environment == "production" or source.get("SEC_ARCHIVE_BACKEND") is not None:
@@ -233,6 +239,7 @@ def load_environment(
         ).strip(),
         sec_archive_bucket=sec_archive_bucket,
         sec_archive_endpoint_url=sec_archive_endpoint_url,
+        sec_operational_retention_years=sec_operational_retention_years,
         telegram_bot_token=telegram_bot_token,
         telegram_allowed_user_ids=allowed_user_ids,
         market_data_api_key=source.get(

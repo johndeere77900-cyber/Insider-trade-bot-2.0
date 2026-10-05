@@ -145,6 +145,15 @@ def run_historical_acquisition(
                 validation_status="validated",
             )
 
+            # Determine operational retention status using end_period (or period_range's end) as deterministic reference
+            reference_period = period_range[-1][2]
+            retention_years = getattr(settings, "sec_operational_retention_years", 3)
+            within_retention = AcquisitionStateManager.is_within_operational_retention(
+                period_str,
+                reference_period=reference_period,
+                retention_years=retention_years,
+            )
+
             # Normalized Ingestion
             p_parsed = 0
             p_invalid = 0
@@ -158,11 +167,12 @@ def run_historical_acquisition(
                 val_res = validate_bulk_record(norm_rec)
 
                 if val_res.is_valid:
-                    batch.append(norm_rec)
+                    if within_retention:
+                        batch.append(norm_rec)
                 else:
                     p_invalid += 1
 
-                if len(batch) >= batch_size:
+                if within_retention and len(batch) >= batch_size:
                     b_ins, b_dup = store_bulk_insider_transactions(
                         db_url,
                         batch,
@@ -172,8 +182,8 @@ def run_historical_acquisition(
                     p_duplicates += b_dup
                     batch.clear()
 
-            # Process final remaining batch for period
-            if batch:
+            # Process final remaining batch for period if within retention window
+            if within_retention and batch:
                 b_ins, b_dup = store_bulk_insider_transactions(
                     db_url,
                     batch,
@@ -182,6 +192,9 @@ def run_historical_acquisition(
                 p_inserted += b_ins
                 p_duplicates += b_dup
                 batch.clear()
+
+            if not within_retention:
+                print(f"Period {period_str}: Outside operational retention window ({retention_years} years relative to {reference_period}). Archived in R2, skipped Neon transaction insertion.")
 
             # Mark COMPLETED only after normalized ingestion completes successfully
             state_mgr.record_period_completion(

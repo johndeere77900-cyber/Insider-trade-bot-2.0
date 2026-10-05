@@ -155,3 +155,91 @@ def test_sec_store_raw_payload_false_lean_storage_propagation(tmp_path):
         assert row is not None
         assert row["raw_payload"] is None  # Lean storage requirement: raw_payload NULL
         assert row["record_hash"] == "hash_lean_prop"
+
+
+def test_operational_retention_calculation_and_selective_neon_insertion(tmp_path, monkeypatch):
+    # Test Retention Calculation helper
+    assert AcquisitionStateManager.is_within_operational_retention("2026-Q2", "2026-Q2", retention_years=3) is True
+    assert AcquisitionStateManager.is_within_operational_retention("2023-Q3", "2026-Q2", retention_years=3) is True
+    assert AcquisitionStateManager.is_within_operational_retention("2023-Q2", "2026-Q2", retention_years=3) is False
+    assert AcquisitionStateManager.is_within_operational_retention("2006-Q1", "2026-Q2", retention_years=3) is False
+
+    db_file = tmp_path / "retention_test.db"
+    db_url = f"sqlite:///{db_file}"
+    archive_dir = tmp_path / "archive"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_BACKEND", "filesystem")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(archive_dir))
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+    monkeypatch.setenv("SEC_OPERATIONAL_RETENTION_YEARS", "3")
+
+    archive = FilesystemSECArchive(base_path=str(archive_dir))
+
+    # Create dummy zip files for an old period (2006-Q1) and recent period (2026-Q2)
+    for p in ["2006-Q1", "2026-Q2"]:
+        zfile = tmp_path / f"dummy_{p}.zip"
+        with zipfile.ZipFile(zfile, "w") as zf:
+            zf.writestr("SUBMISSION.tsv", f"ACCESSION_NUMBER\n0000000001-{p}\n")
+        archive.put(p, str(zfile))
+
+    dummy_tx_2006 = NormalizedBulkTransaction(
+        accession_number="0000000001-2006",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2006-01-15",
+        filing_date="2006-01-16",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=100.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature=None,
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={"dummy": "2006"},
+        source="SEC",
+        record_hash="hash_2006",
+        form_type="4",
+    )
+
+    def mock_parse(zip_path, source_url):
+        return [{"raw": "data"}]
+
+    def mock_norm(raw):
+        return dummy_tx_2006
+
+    class MockVal:
+        is_valid = True
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", mock_parse)
+    monkeypatch.setattr("data.sec_dataset_pipeline.normalize_bulk_record", mock_norm)
+    monkeypatch.setattr("data.sec_dataset_pipeline.validate_bulk_record", lambda r: MockVal())
+
+    # Run historical acquisition range from 2006-Q1 to 2026-Q2
+    res_code = run_historical_acquisition("2006-Q1", "2026-Q2")
+    assert res_code == 0
+
+    state_mgr = AcquisitionStateManager(db_url)
+    assert state_mgr.get_period_status("2006-Q1") == "COMPLETED"
+    assert state_mgr.get_period_status("2026-Q2") == "COMPLETED"
+
+    # Verify R2 archive exists for both
+    assert archive.exists("2006-Q1") is True
+    assert archive.exists("2026-Q2") is True
+
+    # Verify Neon (SQLite test DB) received records ONLY for 2026-Q2 (within 3yr window relative to 2026-Q2)
+    # and 2006-Q1 records were skipped in Neon
+    from database.connection import connect
+    with connect(db_url) as conn:
+        cursor = conn.execute("SELECT count(*) FROM insider_transactions")
+        tx_count = cursor.fetchone()[0]
+        # 2006-Q1 skipped insertion, 2026-Q2 inserted 1 row
+        assert tx_count == 1

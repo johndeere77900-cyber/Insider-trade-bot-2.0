@@ -140,6 +140,34 @@ class AcquisitionStateManager:
         return cleaned
 
     @staticmethod
+    def is_within_operational_retention(
+        period: str,
+        reference_period: str,
+        retention_years: int = 3,
+    ) -> bool:
+        """
+        Determine if `period` falls within `retention_years` of `reference_period`.
+
+        Deterministic calculation based on SEC quarter indexes:
+        diff_quarters = (ref_year * 4 + (ref_qtr - 1)) - (period_year * 4 + (period_qtr - 1))
+        Returns True if diff_quarters < retention_years * 4.
+        """
+        if retention_years <= 0:
+            return False
+
+        norm_period = AcquisitionStateManager.normalize_period(period)
+        norm_ref = AcquisitionStateManager.normalize_period(reference_period)
+
+        p_year, p_qtr = int(norm_period[:4]), int(norm_period[-1])
+        r_year, r_qtr = int(norm_ref[:4]), int(norm_ref[-1])
+
+        p_idx = p_year * 4 + (p_qtr - 1)
+        r_idx = r_year * 4 + (r_qtr - 1)
+
+        diff = r_idx - p_idx
+        return diff < retention_years * 4
+
+    @staticmethod
     def parse_period_range(start_period: str, end_period: str) -> List[Tuple[int, int, str]]:
         """
         Generate a list of (year, quarter, period_str) tuples from start_period to end_period inclusive.
