@@ -177,9 +177,23 @@ class FilesystemSECArchive(SECArchiveInterface):
         return final_meta
 
     def get(self, period: str) -> bytes:
+        if not self.exists(period):
+            raise ArchiveNotFoundError(f"Archive for period '{period}' does not exist.")
         zip_file = self._zip_path(period)
+        with open(zip_file, "rb") as f:
+            return f.read()
+
+    def get_incomplete_zip(self, period: str) -> bytes:
+        """
+        Retrieve an orphan ZIP even when its manifest is missing.
+        """
+        zip_file = self._zip_path(period)
+
         if not os.path.exists(zip_file):
-            raise ArchiveNotFoundError(f"Archive ZIP for period '{period}' does not exist.")
+            raise ArchiveNotFoundError(
+                f"Archive ZIP for period '{period}' does not exist."
+            )
+
         with open(zip_file, "rb") as f:
             return f.read()
 

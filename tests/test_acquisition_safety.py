@@ -8,11 +8,170 @@ import os
 import zipfile
 import pytest
 
-from archive import FilesystemSECArchive, get_archive_backend
+from archive import ArchiveError, FilesystemSECArchive, S3SECArchive, get_archive_backend
 from data.acquisition_state import AcquisitionStateManager, get_latest_available_sec_period, get_current_sec_period
 from main import run_historical_acquisition
 from storage.repository import count_records, store_bulk_insider_transactions
 from data.sec_dataset_pipeline import NormalizedBulkTransaction
+
+
+def test_frozen_retention_reference_called_once(tmp_path, monkeypatch):
+    """Test A: Verify retention reference lookup is called ONCE before acquisition loop."""
+    db_file = tmp_path / "frozen_ref_test.db"
+    db_url = f"sqlite:///{db_file}"
+    archive_dir = tmp_path / "archive"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_BACKEND", "filesystem")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(archive_dir))
+
+    state_mgr = AcquisitionStateManager(db_url)
+    state_mgr.record_period_completion("2026-Q1", 10, 10, 0, 0, 0, status="COMPLETED")
+
+    call_count = 0
+
+    def mock_get_latest(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return "2026-Q1"
+
+    monkeypatch.setattr("data.acquisition_state.get_latest_available_sec_period", mock_get_latest)
+
+    # Mock parse/download to succeed
+    zfile = tmp_path / "dummy.zip"
+    with zipfile.ZipFile(zfile, "w") as zf:
+        zf.writestr("test.txt", "data")
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **k: str(zfile))
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", lambda *a, **k: [])
+
+    # Process 3 periods: 2006-Q1, 2006-Q2, 2006-Q3
+    run_historical_acquisition("2006-Q1", "2006-Q3", reference_period=None, force=True)
+
+    # CRITICAL ASSERTION: get_latest_available_sec_period was called EXACTLY ONCE
+    assert call_count == 1
+
+
+def test_invalid_orphan_zip_deleted_and_downloaded(tmp_path, monkeypatch):
+    """Test B: Verify corrupt orphan ZIP is deleted and official dataset is downloaded."""
+    db_file = tmp_path / "corrupt_orphan_test.db"
+    db_url = f"sqlite:///{db_file}"
+    archive_dir = tmp_path / "archive"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_BACKEND", "filesystem")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(archive_dir))
+
+    period = "2006-Q1"
+    archive = FilesystemSECArchive(base_path=str(archive_dir))
+
+    # Create corrupt orphan ZIP (not a valid ZIP)
+    zip_path = archive._zip_path(period)
+    with open(zip_path, "wb") as f:
+        f.write(b"CORRUPT NON ZIP CONTENT")
+
+    assert archive.is_incomplete(period) is True
+
+    download_calls = []
+
+    def mock_download(year, qtr, user_agent, target_path):
+        download_calls.append((year, qtr))
+        # Create valid zip at target_path upon download
+        with zipfile.ZipFile(target_path, "w") as zf:
+            zf.writestr("SUBMISSION.tsv", "ACCESSION_NUMBER\n0000000001-06-000001\n")
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_download)
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", lambda *a, **k: [])
+
+    res_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
+    assert res_code == 0
+
+    # Corrupt orphan ZIP deleted, SEC download performed, archive completed
+    assert len(download_calls) == 1
+    assert archive.exists(period) is True
+
+
+def test_storage_error_not_treated_as_incomplete_no_deletion_no_download(tmp_path, monkeypatch):
+    """Test C: Storage error during is_incomplete raises error without deleting or downloading."""
+    db_file = tmp_path / "storage_error_test.db"
+    db_url = f"sqlite:///{db_file}"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+
+    class ErrorArchive(FilesystemSECArchive):
+        def is_incomplete(self, period: str) -> bool:
+            raise ArchiveError("500 Internal Error from S3 storage")
+
+    error_archive = ErrorArchive(base_path=str(tmp_path / "archive"))
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: error_archive)
+
+    download_calls = []
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **k: download_calls.append(1))
+
+    # Acquisition run fails with ArchiveError
+    res_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
+    assert res_code == 1
+    assert len(download_calls) == 0  # Storage error must NOT trigger SEC download!
+
+
+def test_s3_orphan_zip_recovery_zero_sec_downloads(tmp_path, monkeypatch):
+    """Test D: S3 orphan ZIP recovery with get_incomplete_zip and 0 SEC downloads."""
+    db_file = tmp_path / "s3_orphan_test.db"
+    db_url = f"sqlite:///{db_file}"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+
+    period = "2006-Q1"
+
+    # Create dummy zip bytes
+    z_file = tmp_path / "valid.zip"
+    with zipfile.ZipFile(z_file, "w") as zf:
+        zf.writestr("SUBMISSION.tsv", "ACCESSION_NUMBER\n0000000001-06-000001\n")
+    z_bytes = z_file.read_bytes()
+
+    store = {}
+    store[f"sec-archives/{period}.zip"] = z_bytes
+
+    class MockBody:
+        def __init__(self, content: bytes):
+            self._content = content
+        def read(self) -> bytes:
+            return self._content
+
+    class MockS3Client:
+        def head_object(self, Bucket: str, Key: str):
+            if Key not in store:
+                raise Exception("NotFound 404")
+            return {}
+
+        def put_object(self, Bucket: str, Key: str, Body: bytes):
+            store[Key] = Body
+
+        def get_object(self, Bucket: str, Key: str):
+            if Key not in store:
+                raise Exception("NotFound 404")
+            return {"Body": MockBody(store[Key])}
+
+    mock_client = MockS3Client()
+    s3_backend = S3SECArchive(bucket="test-bucket", prefix="sec-archives", s3_client=mock_client)
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: s3_backend)
+
+    assert s3_backend.is_incomplete(period) is True
+
+    download_calls = []
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **k: download_calls.append(1))
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", lambda *a, **k: [])
+
+    res_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
+    assert res_code == 0
+
+    assert len(download_calls) == 0  # Zero SEC downloads
+    assert s3_backend.is_incomplete(period) is False
+    assert s3_backend.exists(period) is True
 
 
 def test_latest_available_sec_period_detection(tmp_path):

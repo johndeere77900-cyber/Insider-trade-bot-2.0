@@ -337,6 +337,7 @@ def test_historical_acquisition_retry_previously_failed_period(
     res = main.run_historical_acquisition(
         start_period="2006-Q1",
         end_period="2006-Q1",
+        reference_period="2006-Q1",
     )
 
     assert res == 0

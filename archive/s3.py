@@ -307,6 +307,34 @@ class S3SECArchive(SECArchiveInterface):
                 raise ArchiveNotFoundError(f"Archive key '{zip_key}' not found in bucket '{self.bucket}'.") from exc
             raise ArchiveError(f"Failed to retrieve archive key '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
 
+    def get_incomplete_zip(self, period: str) -> bytes:
+        """
+        Retrieve the ZIP component of an incomplete S3/R2 archive.
+
+        Unlike get(), this method intentionally does not require the
+        manifest to exist because it is used for orphan-ZIP recovery.
+        """
+        zip_key = self._zip_key(period)
+        client = self._get_client()
+
+        try:
+            response = client.get_object(
+                Bucket=self.bucket,
+                Key=zip_key,
+            )
+            return response["Body"].read()
+        except Exception as exc:
+            if _is_not_found_exception(exc):
+                raise ArchiveNotFoundError(
+                    f"Archive ZIP key '{zip_key}' not found in bucket "
+                    f"'{self.bucket}'."
+                ) from exc
+
+            raise ArchiveError(
+                f"Failed to retrieve incomplete archive ZIP key "
+                f"'{zip_key}' in bucket '{self.bucket}': {exc}"
+            ) from exc
+
     def metadata(self, period: str) -> ArchiveMetadata:
         manifest_key = self._manifest_key(period)
         client = self._get_client()

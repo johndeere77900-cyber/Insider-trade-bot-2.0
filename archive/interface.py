@@ -98,6 +98,15 @@ class SECArchiveInterface(ABC):
         Raises ArchiveNotFoundError if missing.
         """
 
+    def get_incomplete_zip(self, period: str) -> bytes:
+        """
+        Retrieve the ZIP component of an incomplete archive.
+
+        This method is intentionally separate from get() because get()
+        requires a complete archive with both ZIP and manifest.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def metadata(self, period: str) -> ArchiveMetadata:
         """

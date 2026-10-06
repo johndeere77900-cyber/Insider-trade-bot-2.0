@@ -42,35 +42,43 @@ def resolve_period_storage_location(
     database_url: str,
     archive_backend: Any,
     period: str,
+    reference_period: Optional[str] = None,
+    retention_years: int = 3,
 ) -> str:
     """
     Determine whether a requested SEC quarter is:
-    - 'NEON': period state in ingestion_state is 'COMPLETED'
+    - 'NEON': period state in ingestion_state is 'COMPLETED' AND inside operational retention window
     - 'R2': quarterly source archive exists in R2 / archive backend
     - 'MISSING': missing from both Neon and R2 archive
     """
     norm_period = AcquisitionStateManager.normalize_period(period)
 
-    # A period is operationally available in Neon ONLY if its ingestion state is 'COMPLETED'
-    is_neon_completed = False
+    # Check operational retention window
     try:
+        within_retention = AcquisitionStateManager.is_within_operational_retention(
+            norm_period,
+            reference_period=reference_period,
+            retention_years=retention_years,
+            database_url=database_url,
+            archive_backend=archive_backend,
+        )
+    except RuntimeError:
+        within_retention = False
+
+    is_neon_completed = False
+    if within_retention:
         state_mgr = AcquisitionStateManager(database_url)
         status = state_mgr.get_period_status(norm_period)
         if status == "COMPLETED":
             is_neon_completed = True
-    except Exception:
-        is_neon_completed = False
 
     if is_neon_completed:
         return "NEON"
 
-    # Fallback to R2 / archive backend if Neon is incomplete, failed, or missing
+    # Fallback to R2 / archive backend if Neon is incomplete, failed, missing, or outside retention
     if archive_backend is not None:
-        try:
-            if archive_backend.exists(norm_period):
-                return "R2"
-        except Exception:
-            pass
+        if archive_backend.exists(norm_period):
+            return "R2"
 
     return "MISSING"
 
