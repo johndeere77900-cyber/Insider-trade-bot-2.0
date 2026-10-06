@@ -704,6 +704,53 @@ def test_verify_run1_multi_owner_pass_and_not_testable(tmp_path: Path, monkeypat
     assert data["multi_owner_result"] == "PASS"
 
 
+def test_verify_run1_archive_error_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that verify_run1 propagates ArchiveError when archive access fails in lean storage mode."""
+    from archive import ArchiveError
+    db_path = tmp_path / "test_arch_err_verify.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, raw_payload, record_hash, created_at
+            ) VALUES ('SEC', 'acc1', 'cik1', '2006-01-15', NULL, 'hash1', '2026-01-01')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES ('dataset_period', '2006-Q1', 'SEC', '2006q1_form345.zip', '2026-01-01', 'chk', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES ('2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    class FailingArchive:
+        def exists(self, period):
+            raise ArchiveError("500 Internal Error from S3 storage during verifier check")
+
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: FailingArchive())
+
+    state_file = str(tmp_path / "sec_err_run1_stats.json")
+
+    with pytest.raises(ArchiveError, match="500 Internal Error"):
+        verify_run1("2006-Q1", state_file)
+
+
 def test_verify_run1_lean_neon_mode_null_raw_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that verify_run1 succeeds in lean Neon mode where raw_payload is NULL in database."""
     db_path = tmp_path / "test_lean_verify.db"

@@ -135,7 +135,10 @@ class FilesystemSECArchive(SECArchiveInterface):
                 # Content matches: complete manifest safely
                 pass
             else:
-                self.delete_incomplete_archive(norm_period)
+                raise ArchiveExistsError(
+                    f"Incomplete archive ZIP for period '{norm_period}' exists with different SHA-256 "
+                    f"({existing_sha} vs incoming {calc_sha256}). Conflicting incomplete archives cannot be overwritten."
+                )
         elif manifest_exists and not zip_exists:
             self.delete_incomplete_archive(norm_period)
 

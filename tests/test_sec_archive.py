@@ -83,6 +83,15 @@ def test_archive_idempotency_and_immutability(tmp_path) -> None:
     assert m_completed.period == zip_only_period
     assert archive.exists(zip_only_period) is True
 
+    # 3b. Incomplete ZIP exists with DIFFERENT SHA -> Rejects with ArchiveExistsError (immutability)
+    incomplete_diff_period = "2006-Q4"
+    diff_zip_file = archive_dir / f"{incomplete_diff_period}.zip"
+    diff_zip_file.write_bytes(zip_file1.read_bytes())
+    assert archive.is_incomplete(incomplete_diff_period) is True
+
+    with pytest.raises(ArchiveExistsError, match="Conflicting incomplete archives cannot be overwritten"):
+        archive.put(incomplete_diff_period, str(zip_file2))
+
     # 4. Manifest exists but ZIP missing -> Differing SHA clears orphaned manifest and writes new archive
     manifest_only_period = "2006-Q3"
     m_file = archive_dir / f"{manifest_only_period}.json"

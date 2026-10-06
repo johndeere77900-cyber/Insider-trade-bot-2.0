@@ -295,29 +295,31 @@ def verify_run1(period: str, state_file: str) -> int:
 
         # Check if archive-backed raw details are needed (lean storage mode where raw_payload is NULL in Neon)
         archive_raw_by_hash = {}
+        archive_genuinely_absent = False
         if any(get_field(r, "raw_payload", period_tx_cols) is None for r in period_rows):
-            try:
-                from archive import get_archive_backend
-                from data.sec_dataset_pipeline import parse_dataset_zip
-                settings = load_environment()
-                archive_kwargs = {}
-                if settings.sec_archive_bucket:
-                    archive_kwargs["bucket"] = settings.sec_archive_bucket
-                if settings.sec_archive_endpoint_url:
-                    archive_kwargs["endpoint_url"] = settings.sec_archive_endpoint_url
-                archive_backend = get_archive_backend(
-                    backend_type=settings.sec_archive_backend,
-                    archive_path=settings.sec_archive_path,
-                    **archive_kwargs,
-                )
-                if archive_backend.exists(period):
-                    zip_bytes = archive_backend.get(period)
-                    for rec in parse_dataset_zip(zip_bytes):
-                        h = rec.get("record_hash")
-                        if h:
-                            archive_raw_by_hash[h] = rec.get("raw", {})
-            except Exception:
-                pass
+            from archive import ArchiveError, ArchiveNotFoundError, get_archive_backend
+            from data.sec_dataset_pipeline import parse_dataset_zip
+            settings = load_environment()
+            archive_kwargs = {}
+            if settings.sec_archive_bucket:
+                archive_kwargs["bucket"] = settings.sec_archive_bucket
+            if settings.sec_archive_endpoint_url:
+                archive_kwargs["endpoint_url"] = settings.sec_archive_endpoint_url
+
+            archive_backend = get_archive_backend(
+                backend_type=settings.sec_archive_backend,
+                archive_path=settings.sec_archive_path,
+                **archive_kwargs,
+            )
+
+            if archive_backend.exists(period):
+                zip_bytes = archive_backend.get(period)
+                for rec in parse_dataset_zip(zip_bytes):
+                    h = rec.get("record_hash")
+                    if h:
+                        archive_raw_by_hash[h] = rec.get("raw", {})
+            else:
+                archive_genuinely_absent = True
 
         dq_pass = True
 

@@ -33,12 +33,13 @@ def test_historical_acquisition_requires_explicit_reference_period(tmp_path, mon
             reference_period=None,
         )
 
-    with pytest.raises(ValueError, match="Invalid reference_period"):
-        run_historical_acquisition(
-            "2006-Q1",
-            "2006-Q1",
-            reference_period="INVALID-PERIOD-FORMAT",
-        )
+    for invalid_ref in ["INVALID", "2026-Q0", "2026-Q5", "2026-QX", "ABC-Q1", "2026"]:
+        with pytest.raises(ValueError, match="Invalid reference_period"):
+            run_historical_acquisition(
+                "2006-Q1",
+                "2006-Q1",
+                reference_period=invalid_ref,
+            )
 
     with pytest.raises(ValueError, match="reference_period is required"):
         AcquisitionStateManager.is_within_operational_retention("2006-Q1", reference_period=None)

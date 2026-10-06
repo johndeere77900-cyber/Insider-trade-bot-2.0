@@ -244,7 +244,10 @@ class S3SECArchive(SECArchiveInterface):
             if existing_sha == calc_sha256:
                 pass
             else:
-                self.delete_incomplete_archive(norm_period)
+                raise ArchiveExistsError(
+                    f"Incomplete S3 archive ZIP for period '{norm_period}' exists with different SHA-256 "
+                    f"({existing_sha} vs incoming {calc_sha256}). Conflicting incomplete archives cannot be overwritten."
+                )
         elif manifest_exists and not zip_exists:
             self.delete_incomplete_archive(norm_period)
 
