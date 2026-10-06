@@ -186,15 +186,12 @@ class AcquisitionStateManager:
     @staticmethod
     def is_within_operational_retention(
         period: str,
-        reference_period: Optional[str] = None,
+        reference_period: str,
         retention_years: int = 3,
-        database_url: Optional[str] = None,
-        archive_backend: Any = None,
     ) -> bool:
         """
         Determine if `period` falls within `retention_years` of `reference_period`.
-        If `reference_period` is None, calculates the latest available SEC period via
-        `get_latest_available_sec_period(database_url, archive_backend)`.
+        `reference_period` is required to anchor operational retention.
 
         Deterministic calculation based on SEC quarter indexes:
         diff_quarters = (ref_year * 4 + (ref_qtr - 1)) - (period_year * 4 + (period_qtr - 1))
@@ -203,10 +200,9 @@ class AcquisitionStateManager:
         if retention_years <= 0:
             return False
 
-        if reference_period is None:
-            reference_period = get_latest_available_sec_period(
-                database_url=database_url,
-                archive_backend=archive_backend,
+        if not reference_period:
+            raise ValueError(
+                "reference_period is required for operational retention evaluation"
             )
 
         norm_period = AcquisitionStateManager.normalize_period(period)

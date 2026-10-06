@@ -16,7 +16,7 @@ from data.sec_dataset_pipeline import NormalizedBulkTransaction
 
 
 def test_historical_acquisition_requires_explicit_reference_period(tmp_path, monkeypatch):
-    """TEST A: Verify historical acquisition raises ValueError if reference_period is None and DB/archive empty."""
+    """TEST A: Verify historical acquisition raises ValueError if reference_period is None or empty."""
     db_file = tmp_path / "req_ref_test.db"
     db_url = f"sqlite:///{db_file}"
     archive_dir = tmp_path / "archive"
@@ -32,6 +32,36 @@ def test_historical_acquisition_requires_explicit_reference_period(tmp_path, mon
             "2006-Q1",
             reference_period=None,
         )
+
+    with pytest.raises(ValueError, match="reference_period is required"):
+        AcquisitionStateManager.is_within_operational_retention("2006-Q1", reference_period=None)
+
+
+def test_partial_database_retention_unaffected_by_neon_stored_periods():
+    """TEST B: Partial database in Neon (2006-Q1, 2006-Q2) with reference_period=2026-Q2 strictly evaluates relative to 2026-Q2."""
+    ref = "2026-Q2"
+    assert AcquisitionStateManager.is_within_operational_retention("2006-Q1", reference_period=ref) is False
+    assert AcquisitionStateManager.is_within_operational_retention("2006-Q2", reference_period=ref) is False
+    assert AcquisitionStateManager.is_within_operational_retention("2025-Q1", reference_period=ref) is True
+
+
+def test_fatal_archive_error_propagates_out_of_acquisition(tmp_path, monkeypatch):
+    """TEST D: Fatal R2/S3 archive infrastructure error propagates out rather than marking period FAILED."""
+    db_file = tmp_path / "fatal_arch_test.db"
+    db_url = f"sqlite:///{db_file}"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+
+    class FatalS3Archive(FilesystemSECArchive):
+        def exists(self, period: str) -> bool:
+            raise ArchiveError("403 Access Denied: S3 credentials invalid")
+
+    fatal_backend = FatalS3Archive(base_path=str(tmp_path / "archive"))
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: fatal_backend)
+
+    with pytest.raises(ArchiveError, match="403 Access Denied"):
+        run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2026-Q2")
 
 
 def test_historical_acquisition_uses_explicit_reference_period(tmp_path, monkeypatch):
@@ -174,7 +204,7 @@ def test_invalid_orphan_zip_deleted_and_downloaded(tmp_path, monkeypatch):
 
 
 def test_storage_error_not_treated_as_incomplete_no_deletion_no_download(tmp_path, monkeypatch):
-    """Test C: Storage error during is_incomplete raises error without deleting or downloading."""
+    """Test C: Storage error during is_incomplete raises fatal ArchiveError without deleting or downloading."""
     db_file = tmp_path / "storage_error_test.db"
     db_url = f"sqlite:///{db_file}"
 
@@ -191,9 +221,9 @@ def test_storage_error_not_treated_as_incomplete_no_deletion_no_download(tmp_pat
     download_calls = []
     monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **k: download_calls.append(1))
 
-    # Acquisition run fails with ArchiveError
-    res_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
-    assert res_code == 1
+    # Acquisition run propagates fatal ArchiveError
+    with pytest.raises(ArchiveError, match="500 Internal Error"):
+        run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
     assert len(download_calls) == 0  # Storage error must NOT trigger SEC download!
 
 
@@ -278,12 +308,10 @@ def test_latest_available_sec_period_detection(tmp_path):
     # Returns 2026-Q1 (max of DB and R2)
     assert get_latest_available_sec_period(db_url, archive) == "2026-Q1"
 
-    # 4. Verify historical acquisition end_period="2010-Q4" does NOT become reference_period
-    # when latest available period is 2026-Q1 and no explicit reference_period is passed
+    # 4. Verify historical acquisition end_period="2010-Q4" evaluated relative to 2026-Q1 reference
     assert AcquisitionStateManager.is_within_operational_retention(
         "2010-Q4",
-        database_url=db_url,
-        archive_backend=archive,
+        reference_period="2026-Q1",
         retention_years=3,
     ) is False
 
@@ -396,15 +424,17 @@ def test_archive_survives_ingestion_failure_and_retry_reuses_archive(tmp_path, m
     meta = archive.put(period, str(zip_file))
     assert archive.exists(period) is True
 
-    # 2. Simulate ingestion failure on first run by raising exception in parse_dataset_zip
+    # 2. Simulate recoverable parsing failure on first run by raising SECDatasetError in parse_dataset_zip
+    from data.sec_dataset_pipeline import SECDatasetError
+
     def mock_parse_fail(*args, **kwargs):
-        raise RuntimeError("Simulated DB connection drop during ingestion")
+        raise SECDatasetError("Simulated period dataset parse error")
 
     monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", mock_parse_fail)
 
     state_mgr = AcquisitionStateManager(db_url)
 
-    # Run historical acquisition (should fail and mark FAILED)
+    # Run historical acquisition (should handle recoverable error and mark FAILED)
     res_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
     assert res_code == 1
     assert state_mgr.get_period_status(period) == "FAILED"

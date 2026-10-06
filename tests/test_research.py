@@ -127,10 +127,10 @@ def test_resolve_period_storage_location_and_get_historical_transactions(tmp_pat
         )
 
     archive.put("2006-Q1", str(zfile_2006))
-    assert resolve_period_storage_location(db_url, archive, "2006-Q1") == "R2"
+    assert resolve_period_storage_location(db_url, archive, "2006-Q1", reference_period="2006-Q1") == "R2"
 
     # Fetch 2006-Q1 from R2 fallback
-    txs_r2 = get_historical_transactions(db_url, archive, "2006-Q1", "2006-Q1", tickers="AAPL")
+    txs_r2 = get_historical_transactions(db_url, archive, "2006-Q1", "2006-Q1", tickers="AAPL", reference_period="2006-Q1")
     assert len(txs_r2) == 1
     assert txs_r2[0].ticker == "AAPL"
     assert txs_r2[0].accession_number == "0000000001-06-000001"
@@ -182,14 +182,14 @@ def test_resolve_period_storage_location_and_get_historical_transactions(tmp_pat
     # Without COMPLETED status in ingestion_state, 2006-Q2 falls back to R2 (NOT partial Neon)
     state_mgr = AcquisitionStateManager(db_url)
     state_mgr.record_period_completion("2006-Q2", 1, 1, 0, 0, 1, status="FAILED")
-    assert resolve_period_storage_location(db_url, archive, "2006-Q2") == "R2"
+    assert resolve_period_storage_location(db_url, archive, "2006-Q2", reference_period="2006-Q2") == "R2"
 
     # Mark 2006-Q2 as COMPLETED -> now resolves to NEON
     state_mgr.record_period_completion("2006-Q2", 1, 1, 0, 0, 0, status="COMPLETED")
-    assert resolve_period_storage_location(db_url, archive, "2006-Q2") == "NEON"
+    assert resolve_period_storage_location(db_url, archive, "2006-Q2", reference_period="2006-Q2") == "NEON"
 
     # Query range across both Neon and R2 (2006-Q1 in R2, 2006-Q2 in Neon)
-    txs_combined = get_historical_transactions(db_url, archive, "2006-Q1", "2006-Q2", tickers=["AAPL"])
+    txs_combined = get_historical_transactions(db_url, archive, "2006-Q1", "2006-Q2", tickers=["AAPL"], reference_period="2006-Q2")
     assert len(txs_combined) == 2
     assert txs_combined[0].accession_number == "0000000001-06-000001"  # 2006-Q1 from R2
     assert txs_combined[1].accession_number == "0000000002-06-000002"  # 2006-Q2 from Neon
@@ -316,7 +316,7 @@ def test_r2_fallback_amendment_pit_download_boundary_integration(tmp_path, monke
 
     # Requesting 2018-Q2 when only 2018-Q1 exists MUST raise PeriodNotFoundError (wrong quarter cannot satisfy request)
     with pytest.raises(PeriodNotFoundError, match="2018-Q2"):
-        get_historical_transactions(db_url, archive, "2018-Q2", "2018-Q2")
+        get_historical_transactions(db_url, archive, "2018-Q2", "2018-Q2", reference_period="2026-Q2")
 
     # 2. Put 2018-Q2 archive in R2 containing an original filing and an unresolved amendment
     zfile_2018q2 = tmp_path / "2018Q2.zip"
@@ -336,7 +336,7 @@ def test_r2_fallback_amendment_pit_download_boundary_integration(tmp_path, monke
     archive.put("2018-Q2", str(zfile_2018q2))
 
     # Retrieve historical transactions for 2018-Q2 from R2
-    txs_r2 = get_historical_transactions(db_url, archive, "2018-Q2", "2018-Q2", tickers="MSFT")
+    txs_r2 = get_historical_transactions(db_url, archive, "2018-Q2", "2018-Q2", tickers="MSFT", reference_period="2026-Q2")
     assert len(txs_r2) == 2
     assert txs_r2[0].record_hash is not None
     assert txs_r2[1].record_hash is not None
@@ -358,13 +358,13 @@ def test_r2_fallback_amendment_pit_download_boundary_integration(tmp_path, monke
 
     # 3. Unified retention decision test (Blocker 13)
     # Scenario A: Old period outside retention -> resolves to R2
-    assert resolve_period_storage_location(db_url, archive, "2018-Q2") == "R2"
+    assert resolve_period_storage_location(db_url, archive, "2018-Q2", reference_period="2026-Q2") == "R2"
 
     # Scenario B: Recent period with completed ingestion_state -> resolves to NEON
     state_mgr = AcquisitionStateManager(db_url)
     state_mgr.record_period_completion("2026-Q1", 10, 10, 0, 0, 0, status="COMPLETED")
-    assert resolve_period_storage_location(db_url, archive, "2026-Q1") == "NEON"
+    assert resolve_period_storage_location(db_url, archive, "2026-Q1", reference_period="2026-Q2") == "NEON"
 
     # Scenario C: Partial Neon period (status FAILED/incomplete) + valid R2 -> resolves to R2
     state_mgr.record_period_completion("2018-Q1", 5, 2, 0, 0, 1, status="FAILED")
-    assert resolve_period_storage_location(db_url, archive, "2018-Q1") == "R2"
+    assert resolve_period_storage_location(db_url, archive, "2018-Q1", reference_period="2026-Q2") == "R2"

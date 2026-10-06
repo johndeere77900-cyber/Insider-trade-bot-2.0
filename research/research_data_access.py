@@ -63,8 +63,6 @@ def resolve_period_storage_location(
         norm_period,
         reference_period=reference_period,
         retention_years=retention_years,
-        database_url=database_url,
-        archive_backend=archive_backend,
     )
 
     is_neon_completed = False

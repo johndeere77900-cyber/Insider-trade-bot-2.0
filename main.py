@@ -39,6 +39,7 @@ def run_historical_acquisition(
         normalize_bulk_record,
         parse_dataset_zip,
         validate_bulk_record,
+            SECDatasetError,
         SECDatasetDownloadError,
     )
     from database.connection import connect
@@ -292,15 +293,8 @@ def run_historical_acquisition(
                 f"Duplicates {p_duplicates}, Invalid {p_invalid}"
             )
 
-        except SECDatasetDownloadError as exc:
-            print(f"Period {period_str}: Download failed ({exc}). Marking FAILED.")
-            total_failures += 1
-            state_mgr.record_period_completion(
-                period_str, 0, 0, 0, 0, 1, status="FAILED"
-            )
-
-        except Exception as exc:
-            print(f"Period {period_str}: Ingestion error ({exc}). Marking FAILED.")
+        except (SECDatasetDownloadError, SECDatasetError, zipfile.BadZipFile, ValueError) as exc:
+            print(f"Period {period_str}: Recoverable dataset ingestion error ({exc}). Marking FAILED.")
             total_failures += 1
             state_mgr.record_period_completion(
                 period=period_str,
