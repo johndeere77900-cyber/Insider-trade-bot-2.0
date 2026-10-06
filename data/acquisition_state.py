@@ -224,7 +224,7 @@ class AcquisitionStateManager:
         r_idx = r_year * 4 + (r_qtr - 1)
 
         diff = r_idx - p_idx
-        return diff < retention_years * 4
+        return 0 <= diff < retention_years * 4
 
     @staticmethod
     def parse_period_range(start_period: str, end_period: str) -> List[Tuple[int, int, str]]:

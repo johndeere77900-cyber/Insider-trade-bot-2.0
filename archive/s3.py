@@ -235,8 +235,11 @@ class S3SECArchive(SECArchiveInterface):
                 existing_obj = client.get_object(Bucket=self.bucket, Key=zip_key)
                 existing_bytes = existing_obj["Body"].read()
                 existing_sha, _ = self._compute_sha256(existing_bytes)
-            except Exception:
-                existing_sha = None
+            except Exception as exc:
+                if _is_not_found_exception(exc):
+                    existing_sha = None
+                else:
+                    raise ArchiveError(f"Failed to inspect incomplete ZIP object '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
 
             if existing_sha == calc_sha256:
                 pass
