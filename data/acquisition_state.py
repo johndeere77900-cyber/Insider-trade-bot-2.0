@@ -28,39 +28,34 @@ def get_latest_available_sec_period(
     archive_backend: Any = None,
 ) -> str:
     """
-    Determine the latest available SEC dataset period string ('YYYY-QX').
+    Determine the latest authoritative SEC dataset period.
 
-    Checks:
-    1. Latest completed period in ingestion_state table (if database_url provided).
-    2. Latest period string in archive_backend (if archive_backend provided).
-    Returns the maximum period string found across sources.
-    Falls back to get_current_sec_period() if no completed/archived dataset period is found.
+    Uses only completed ingestion_state periods and complete archive periods.
+    Never falls back to the current calendar quarter.
+    Storage/database/archive errors must propagate instead of being treated
+    as evidence that no data exists.
     """
     candidates: List[str] = []
 
     if database_url:
-        try:
-            state_mgr = AcquisitionStateManager(database_url)
-            completed = state_mgr.get_completed_periods()
-            if completed:
-                candidates.extend(completed)
-        except Exception:
-            pass
+        state_mgr = AcquisitionStateManager(database_url)
+        completed = state_mgr.get_completed_periods()
+        if completed:
+            candidates.extend(completed)
 
     if archive_backend is not None:
-        try:
-            archived = archive_backend.list()
-            if archived:
-                candidates.extend(archived)
-        except Exception:
-            pass
+        archived = archive_backend.list()
+        if archived:
+            candidates.extend(archived)
 
     if candidates:
-        # Period strings 'YYYY-QX' sort lexicographically in chronological order
         candidates.sort()
         return candidates[-1]
 
-    return get_current_sec_period()
+    raise RuntimeError(
+        "No authoritative SEC dataset period is available from completed "
+        "ingestion state or archive backend."
+    )
 
 
 @dataclass

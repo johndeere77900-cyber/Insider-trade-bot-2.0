@@ -21,9 +21,9 @@ def test_latest_available_sec_period_detection(tmp_path):
     archive_dir = tmp_path / "archive"
     archive = FilesystemSECArchive(base_path=str(archive_dir))
 
-    # 1. Uninitialized state -> falls back to current SEC period
-    curr_period = get_current_sec_period()
-    assert get_latest_available_sec_period(db_url, archive) == curr_period
+    # 1. Uninitialized state (no completed DB period, no archived period) -> raises RuntimeError
+    with pytest.raises(RuntimeError, match="No authoritative SEC dataset period is available"):
+        get_latest_available_sec_period(db_url, archive)
 
     # 2. Add completed period in DB (2025-Q3)
     state_mgr = AcquisitionStateManager(db_url)

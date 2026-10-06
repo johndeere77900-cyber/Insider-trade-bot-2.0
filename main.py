@@ -30,7 +30,7 @@ def run_historical_acquisition(
     import os
     import tempfile
     import zipfile
-    from archive import ArchiveMetadata, get_archive_backend
+    from archive import ArchiveError, ArchiveMetadata, get_archive_backend
     from config.environment import load_environment
     from data.acquisition_state import AcquisitionStateManager, get_latest_available_sec_period
     from data.sec_dataset_pipeline import (
@@ -68,6 +68,19 @@ def run_historical_acquisition(
 
     state_mgr = AcquisitionStateManager(db_url)
     period_range = state_mgr.parse_period_range(start_period, end_period)
+
+    retention_years = getattr(settings, "sec_operational_retention_years", 3)
+    try:
+        retention_ref = (
+            reference_period
+            if reference_period
+            else get_latest_available_sec_period(
+                database_url=db_url,
+                archive_backend=archive_backend,
+            )
+        )
+    except Exception:
+        retention_ref = reference_period or end_period
 
     periods_processed = 0
     periods_downloaded = 0
@@ -111,9 +124,31 @@ def run_historical_acquisition(
                         zip_bytes = archive_backend.get(period_str)
                         with open(temp_zip_path, "wb") as f:
                             f.write(zip_bytes)
-                        if not zipfile.is_zipfile(temp_zip_path):
-                            raise ValueError("Incomplete archive ZIP is invalid.")
-                    except Exception:
+                        if zipfile.is_zipfile(temp_zip_path):
+                            hasher = hashlib.sha256()
+                            file_size = os.path.getsize(temp_zip_path)
+                            with open(temp_zip_path, "rb") as f:
+                                while chunk := f.read(1024 * 1024):
+                                    hasher.update(chunk)
+                            zip_checksum = hasher.hexdigest()
+                            archive_meta = ArchiveMetadata(
+                                period=period_str,
+                                source="SEC",
+                                source_url=dataset_url,
+                                sha256=zip_checksum,
+                                validation_status="validated",
+                                file_size_bytes=file_size,
+                            )
+                            saved_meta = archive_backend.put(
+                                period=period_str,
+                                content=temp_zip_path,
+                                metadata=archive_meta,
+                            )
+                        else:
+                            archive_backend.delete_incomplete_archive(period_str)
+                    except ArchiveError:
+                        raise
+                    except (zipfile.BadZipFile, ValueError):
                         archive_backend.delete_incomplete_archive(period_str)
 
                 # Download from SEC if temp ZIP is not available or not valid
