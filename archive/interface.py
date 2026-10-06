@@ -67,6 +67,14 @@ class SECArchiveInterface(ABC):
         """Return True if an archived ZIP exists for the given period."""
 
     @abstractmethod
+    def is_incomplete(self, period: str) -> bool:
+        """Return True if a partial/incomplete archive state exists for the given period."""
+
+    @abstractmethod
+    def delete_incomplete_archive(self, period: str) -> bool:
+        """Safely remove partial archive state for period."""
+
+    @abstractmethod
     def put(
         self,
         period: str,

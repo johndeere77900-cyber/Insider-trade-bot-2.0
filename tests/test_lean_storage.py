@@ -338,7 +338,7 @@ def test_historical_acquisition_configuration_propagation(tmp_path, monkeypatch)
     monkeypatch.setenv("SEC_ARCHIVE_PATH", str(tmp_path / "archive"))
 
     import main
-    main.run_historical_acquisition("2006-Q1", "2006-Q1", batch_size=5000, force=True)
+    main.run_historical_acquisition("2006-Q1", "2006-Q1", batch_size=5000, force=True, reference_period="2006-Q1")
 
     assert len(captured_calls) > 0
     for _, passed_store_raw in captured_calls:

@@ -8,10 +8,19 @@ and enables idempotent, resumable execution across runs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from database.connection import connect, initialize_database, is_postgresql_url
 from storage.repository import _placeholder, _row_value, utc_now
+
+
+def get_current_sec_period(reference_date: Optional[datetime] = None) -> str:
+    """Return the SEC dataset period string ('YYYY-QX') corresponding to reference_date (or current UTC date)."""
+    if reference_date is None:
+        reference_date = datetime.now(timezone.utc)
+    qtr = (reference_date.month - 1) // 3 + 1
+    return f"{reference_date.year}-Q{qtr}"
 
 
 @dataclass
@@ -142,18 +151,22 @@ class AcquisitionStateManager:
     @staticmethod
     def is_within_operational_retention(
         period: str,
-        reference_period: str,
+        reference_period: Optional[str] = None,
         retention_years: int = 3,
     ) -> bool:
         """
         Determine if `period` falls within `retention_years` of `reference_period`.
+        If `reference_period` is None, defaults to `get_current_sec_period()`.
 
         Deterministic calculation based on SEC quarter indexes:
         diff_quarters = (ref_year * 4 + (ref_qtr - 1)) - (period_year * 4 + (period_qtr - 1))
-        Returns True if diff_quarters < retention_years * 4.
+        Returns True if 0 <= diff_quarters < retention_years * 4.
         """
         if retention_years <= 0:
             return False
+
+        if reference_period is None:
+            reference_period = get_current_sec_period()
 
         norm_period = AcquisitionStateManager.normalize_period(period)
         norm_ref = AcquisitionStateManager.normalize_period(reference_period)
@@ -165,7 +178,7 @@ class AcquisitionStateManager:
         r_idx = r_year * 4 + (r_qtr - 1)
 
         diff = r_idx - p_idx
-        return diff < retention_years * 4
+        return 0 <= diff < retention_years * 4
 
     @staticmethod
     def parse_period_range(start_period: str, end_period: str) -> List[Tuple[int, int, str]]:

@@ -48,6 +48,12 @@ class FilesystemSECArchive(SECArchiveInterface):
         m_path = self._manifest_path(period)
         return os.path.exists(z_path) and os.path.exists(m_path)
 
+    def is_incomplete(self, period: str) -> bool:
+        norm_p = self._normalize_period(period)
+        z_exists = os.path.exists(self._zip_path(norm_p))
+        m_exists = os.path.exists(self._manifest_path(norm_p))
+        return (z_exists and not m_exists) or (m_exists and not z_exists)
+
     def delete_incomplete_archive(self, period: str) -> bool:
         """
         Safely remove a genuinely incomplete archive for period (ZIP exists without manifest,
@@ -124,15 +130,14 @@ class FilesystemSECArchive(SECArchiveInterface):
                     f"({existing_meta.sha256} vs incoming {calc_sha256}). Immutable archives cannot be overwritten."
                 )
         elif zip_exists and not manifest_exists:
-            raise ArchiveExistsError(
-                f"Incomplete archive state for period '{norm_period}': ZIP archive exists but manifest is missing. "
-                f"Overwriting incomplete archives is forbidden."
-            )
+            existing_sha, _ = self._compute_sha256(zip_file)
+            if existing_sha == calc_sha256:
+                # Content matches: complete manifest safely
+                pass
+            else:
+                self.delete_incomplete_archive(norm_period)
         elif manifest_exists and not zip_exists:
-            raise ArchiveExistsError(
-                f"Incomplete archive state for period '{norm_period}': Manifest exists but ZIP archive is missing. "
-                f"Recreating incomplete archives is forbidden."
-            )
+            self.delete_incomplete_archive(norm_period)
 
         # Write ZIP content
         if isinstance(content, str):
@@ -172,9 +177,9 @@ class FilesystemSECArchive(SECArchiveInterface):
         return final_meta
 
     def get(self, period: str) -> bytes:
-        if not self.exists(period):
-            raise ArchiveNotFoundError(f"Archive for period '{period}' does not exist.")
         zip_file = self._zip_path(period)
+        if not os.path.exists(zip_file):
+            raise ArchiveNotFoundError(f"Archive ZIP for period '{period}' does not exist.")
         with open(zip_file, "rb") as f:
             return f.read()
 

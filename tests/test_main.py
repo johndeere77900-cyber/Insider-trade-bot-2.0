@@ -53,7 +53,7 @@ def test_main_rejects_invalid_environment(
 def test_main_historical_cli_args(monkeypatch) -> None:
     called_args = {}
 
-    def mock_run_historical(start, end, batch_size=5000, force=False):
+    def mock_run_historical(start, end, batch_size=5000, force=False, **kwargs):
         called_args["start"] = start
         called_args["end"] = end
         called_args["batch_size"] = batch_size

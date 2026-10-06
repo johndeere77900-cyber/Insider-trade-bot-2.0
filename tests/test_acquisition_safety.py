@@ -158,11 +158,22 @@ def test_sec_store_raw_payload_false_lean_storage_propagation(tmp_path):
 
 
 def test_operational_retention_calculation_and_selective_neon_insertion(tmp_path, monkeypatch):
-    # Test Retention Calculation helper
-    assert AcquisitionStateManager.is_within_operational_retention("2026-Q2", "2026-Q2", retention_years=3) is True
-    assert AcquisitionStateManager.is_within_operational_retention("2023-Q3", "2026-Q2", retention_years=3) is True
-    assert AcquisitionStateManager.is_within_operational_retention("2023-Q2", "2026-Q2", retention_years=3) is False
-    assert AcquisitionStateManager.is_within_operational_retention("2006-Q1", "2026-Q2", retention_years=3) is False
+    # Test Retention Calculation helper across boundaries relative to reference period "2026-Q2"
+    ref = "2026-Q2"
+    # Same quarter: diff = 0 -> inside
+    assert AcquisitionStateManager.is_within_operational_retention("2026-Q2", ref, retention_years=3) is True
+    # Exactly inside boundary: 11 quarters back (2023-Q3 to 2026-Q2 = 11 quarters)
+    assert AcquisitionStateManager.is_within_operational_retention("2023-Q3", ref, retention_years=3) is True
+    # Exactly outside boundary: 12 quarters back (2023-Q2 to 2026-Q2 = 12 quarters)
+    assert AcquisitionStateManager.is_within_operational_retention("2023-Q2", ref, retention_years=3) is False
+    # Far outside boundary
+    assert AcquisitionStateManager.is_within_operational_retention("2006-Q1", ref, retention_years=3) is False
+
+    # Explicit reference period override test
+    ref_override = "2020-Q4"
+    assert AcquisitionStateManager.is_within_operational_retention("2020-Q4", ref_override, retention_years=3) is True
+    assert AcquisitionStateManager.is_within_operational_retention("2018-Q1", ref_override, retention_years=3) is True # diff 11 quarters
+    assert AcquisitionStateManager.is_within_operational_retention("2017-Q4", ref_override, retention_years=3) is False # diff 12 quarters
 
     db_file = tmp_path / "retention_test.db"
     db_url = f"sqlite:///{db_file}"
@@ -223,8 +234,8 @@ def test_operational_retention_calculation_and_selective_neon_insertion(tmp_path
     monkeypatch.setattr("data.sec_dataset_pipeline.normalize_bulk_record", mock_norm)
     monkeypatch.setattr("data.sec_dataset_pipeline.validate_bulk_record", lambda r: MockVal())
 
-    # Run historical acquisition range from 2006-Q1 to 2026-Q2
-    res_code = run_historical_acquisition("2006-Q1", "2026-Q2")
+    # Run historical acquisition range from 2006-Q1 to 2026-Q2 with explicit reference_period="2026-Q2"
+    res_code = run_historical_acquisition("2006-Q1", "2026-Q2", reference_period="2026-Q2")
     assert res_code == 0
 
     state_mgr = AcquisitionStateManager(db_url)
