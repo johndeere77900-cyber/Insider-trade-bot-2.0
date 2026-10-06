@@ -45,31 +45,26 @@ def resolve_period_storage_location(
 ) -> str:
     """
     Determine whether a requested SEC quarter is:
-    - 'NEON': operational transaction records are available in Neon database
+    - 'NEON': period state in ingestion_state is 'COMPLETED'
     - 'R2': quarterly source archive exists in R2 / archive backend
     - 'MISSING': missing from both Neon and R2 archive
     """
     norm_period = AcquisitionStateManager.normalize_period(period)
-    f_start, f_end = _quarter_date_range(norm_period)
 
-    is_pg = is_postgresql_url(database_url)
-    placeholder = "%s" if is_pg else "?"
-
-    has_neon_data = False
+    # A period is operationally available in Neon ONLY if its ingestion state is 'COMPLETED'
+    is_neon_completed = False
     try:
-        with connect(database_url) as conn:
-            cursor = conn.execute(
-                f"SELECT 1 FROM insider_transactions WHERE filing_date >= {placeholder} AND filing_date <= {placeholder} LIMIT 1",
-                (f_start, f_end),
-            )
-            if cursor.fetchone() is not None:
-                has_neon_data = True
+        state_mgr = AcquisitionStateManager(database_url)
+        status = state_mgr.get_period_status(norm_period)
+        if status == "COMPLETED":
+            is_neon_completed = True
     except Exception:
-        has_neon_data = False
+        is_neon_completed = False
 
-    if has_neon_data:
+    if is_neon_completed:
         return "NEON"
 
+    # Fallback to R2 / archive backend if Neon is incomplete, failed, or missing
     if archive_backend is not None:
         try:
             if archive_backend.exists(norm_period):

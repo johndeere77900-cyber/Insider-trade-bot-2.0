@@ -32,7 +32,7 @@ def run_historical_acquisition(
     import zipfile
     from archive import ArchiveMetadata, get_archive_backend
     from config.environment import load_environment
-    from data.acquisition_state import AcquisitionStateManager, get_current_sec_period
+    from data.acquisition_state import AcquisitionStateManager, get_latest_available_sec_period
     from data.sec_dataset_pipeline import (
         build_dataset_url,
         download_dataset_zip_to_file,
@@ -160,8 +160,11 @@ def run_historical_acquisition(
             )
 
             # Determine operational retention reference period:
-            # Explicit reference_period if provided; otherwise current calendar SEC period
-            retention_ref = reference_period if reference_period else get_current_sec_period()
+            # Explicit reference_period if provided; otherwise latest available SEC period
+            retention_ref = reference_period if reference_period else get_latest_available_sec_period(
+                database_url=db_url,
+                archive_backend=archive_backend,
+            )
             retention_years = getattr(settings, "sec_operational_retention_years", 3)
             within_retention = AcquisitionStateManager.is_within_operational_retention(
                 period_str,

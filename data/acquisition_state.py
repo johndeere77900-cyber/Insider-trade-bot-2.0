@@ -23,6 +23,46 @@ def get_current_sec_period(reference_date: Optional[datetime] = None) -> str:
     return f"{reference_date.year}-Q{qtr}"
 
 
+def get_latest_available_sec_period(
+    database_url: Optional[str] = None,
+    archive_backend: Any = None,
+) -> str:
+    """
+    Determine the latest available SEC dataset period string ('YYYY-QX').
+
+    Checks:
+    1. Latest completed period in ingestion_state table (if database_url provided).
+    2. Latest period string in archive_backend (if archive_backend provided).
+    Returns the maximum period string found across sources.
+    Falls back to get_current_sec_period() if no completed/archived dataset period is found.
+    """
+    candidates: List[str] = []
+
+    if database_url:
+        try:
+            state_mgr = AcquisitionStateManager(database_url)
+            completed = state_mgr.get_completed_periods()
+            if completed:
+                candidates.extend(completed)
+        except Exception:
+            pass
+
+    if archive_backend is not None:
+        try:
+            archived = archive_backend.list()
+            if archived:
+                candidates.extend(archived)
+        except Exception:
+            pass
+
+    if candidates:
+        # Period strings 'YYYY-QX' sort lexicographically in chronological order
+        candidates.sort()
+        return candidates[-1]
+
+    return get_current_sec_period()
+
+
 @dataclass
 class PeriodStats:
     period: str
@@ -153,10 +193,13 @@ class AcquisitionStateManager:
         period: str,
         reference_period: Optional[str] = None,
         retention_years: int = 3,
+        database_url: Optional[str] = None,
+        archive_backend: Any = None,
     ) -> bool:
         """
         Determine if `period` falls within `retention_years` of `reference_period`.
-        If `reference_period` is None, defaults to `get_current_sec_period()`.
+        If `reference_period` is None, calculates the latest available SEC period via
+        `get_latest_available_sec_period(database_url, archive_backend)`.
 
         Deterministic calculation based on SEC quarter indexes:
         diff_quarters = (ref_year * 4 + (ref_qtr - 1)) - (period_year * 4 + (period_qtr - 1))
@@ -166,7 +209,10 @@ class AcquisitionStateManager:
             return False
 
         if reference_period is None:
-            reference_period = get_current_sec_period()
+            reference_period = get_latest_available_sec_period(
+                database_url=database_url,
+                archive_backend=archive_backend,
+            )
 
         norm_period = AcquisitionStateManager.normalize_period(period)
         norm_ref = AcquisitionStateManager.normalize_period(reference_period)
@@ -178,7 +224,7 @@ class AcquisitionStateManager:
         r_idx = r_year * 4 + (r_qtr - 1)
 
         diff = r_idx - p_idx
-        return 0 <= diff < retention_years * 4
+        return diff < retention_years * 4
 
     @staticmethod
     def parse_period_range(start_period: str, end_period: str) -> List[Tuple[int, int, str]]:

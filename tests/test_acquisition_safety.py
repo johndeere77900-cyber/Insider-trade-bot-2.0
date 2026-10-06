@@ -9,10 +9,125 @@ import zipfile
 import pytest
 
 from archive import FilesystemSECArchive, get_archive_backend
-from data.acquisition_state import AcquisitionStateManager
+from data.acquisition_state import AcquisitionStateManager, get_latest_available_sec_period, get_current_sec_period
 from main import run_historical_acquisition
 from storage.repository import count_records, store_bulk_insider_transactions
 from data.sec_dataset_pipeline import NormalizedBulkTransaction
+
+
+def test_latest_available_sec_period_detection(tmp_path):
+    db_file = tmp_path / "latest_period_test.db"
+    db_url = f"sqlite:///{db_file}"
+    archive_dir = tmp_path / "archive"
+    archive = FilesystemSECArchive(base_path=str(archive_dir))
+
+    # 1. Uninitialized state -> falls back to current SEC period
+    curr_period = get_current_sec_period()
+    assert get_latest_available_sec_period(db_url, archive) == curr_period
+
+    # 2. Add completed period in DB (2025-Q3)
+    state_mgr = AcquisitionStateManager(db_url)
+    state_mgr.record_period_completion("2025-Q3", 100, 100, 0, 0, 0, status="COMPLETED")
+    assert get_latest_available_sec_period(db_url, archive) == "2025-Q3"
+
+    # 3. Add newer archive in R2 (2026-Q1)
+    zfile = tmp_path / "2026Q1.zip"
+    with zipfile.ZipFile(zfile, "w") as zf:
+        zf.writestr("test.txt", "content")
+    archive.put("2026-Q1", str(zfile))
+
+    # Returns 2026-Q1 (max of DB and R2)
+    assert get_latest_available_sec_period(db_url, archive) == "2026-Q1"
+
+    # 4. Verify historical acquisition end_period="2010-Q4" does NOT become reference_period
+    # when latest available period is 2026-Q1 and no explicit reference_period is passed
+    assert AcquisitionStateManager.is_within_operational_retention(
+        "2010-Q4",
+        database_url=db_url,
+        archive_backend=archive,
+        retention_years=3,
+    ) is False
+
+
+def test_incomplete_archive_recovery_zero_sec_downloads(tmp_path, monkeypatch):
+    db_file = tmp_path / "incomplete_test.db"
+    db_url = f"sqlite:///{db_file}"
+    archive_dir = tmp_path / "archive"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_BACKEND", "filesystem")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(archive_dir))
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    period = "2006-Q1"
+    archive = FilesystemSECArchive(base_path=str(archive_dir))
+
+    # Create orphaned ZIP file without manifest (simulating manifest upload failure)
+    zip_file = archive._zip_path(period)
+    with zipfile.ZipFile(zip_file, "w") as zf:
+        zf.writestr(
+            "SUBMISSION.tsv",
+            "ACCESSION_NUMBER\tISSUER_CIK\tISSUER_NAME\tFILING_DATE\n"
+            "0000000001-06-000001\t0000320193\tApple Inc.\t2006-01-15\n",
+        )
+
+    assert archive.is_incomplete(period) is True
+    assert archive.exists(period) is False
+
+    # Track SEC download calls during acquisition run
+    download_calls = []
+
+    def mock_download(year, qtr, user_agent, target_path):
+        download_calls.append((year, qtr))
+        raise RuntimeError("Download should NOT be called because valid incomplete ZIP exists!")
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_download)
+
+    dummy_tx = NormalizedBulkTransaction(
+        accession_number="0000000001-06-000001",
+        issuer_cik="0000320193",
+        issuer_name="Apple Inc.",
+        ticker="AAPL",
+        reporting_owner_name="Cook Tim",
+        reporting_owner_cik="0001214156",
+        transaction_date="2006-01-15",
+        filing_date="2006-01-16",
+        transaction_code="S",
+        security_title="Common Stock",
+        shares=100.0,
+        price_per_share=150.0,
+        transaction_type="non_derivative",
+        acquired_disposed="D",
+        ownership_type="D",
+        ownership_nature=None,
+        source_url="https://sec.gov",
+        is_amendment=False,
+        date_of_orig_submission=None,
+        raw_payload={"test": "payload"},
+        source="SEC",
+        record_hash="hash_incomplete_rec",
+        form_type="4",
+    )
+
+    def mock_parse_success(*args, **kwargs):
+        return [{"dummy": "record"}]
+
+    class MockVal:
+        is_valid = True
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", mock_parse_success)
+    monkeypatch.setattr("data.sec_dataset_pipeline.normalize_bulk_record", lambda r: dummy_tx)
+    monkeypatch.setattr("data.sec_dataset_pipeline.validate_bulk_record", lambda r: MockVal())
+
+    # Execute acquisition: should detect incomplete ZIP, reconcile/write manifest, with ZERO SEC downloads
+    res_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
+    assert res_code == 0
+
+    # CRITICAL ASSERTIONS:
+    assert len(download_calls) == 0  # Proves zero SEC downloads performed
+    assert archive.is_incomplete(period) is False  # Archive is now complete
+    assert archive.exists(period) is True
 
 
 def test_archive_survives_ingestion_failure_and_retry_reuses_archive(tmp_path, monkeypatch):
