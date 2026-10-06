@@ -53,17 +53,19 @@ def resolve_period_storage_location(
     """
     norm_period = AcquisitionStateManager.normalize_period(period)
 
-    # Check operational retention window
-    try:
-        within_retention = AcquisitionStateManager.is_within_operational_retention(
-            norm_period,
-            reference_period=reference_period,
-            retention_years=retention_years,
-            database_url=database_url,
-            archive_backend=archive_backend,
-        )
-    except RuntimeError:
-        within_retention = False
+    # Check operational retention window.
+    #
+    # Infrastructure/configuration failures and absence of an authoritative
+    # retention reference MUST propagate. They must never be converted into
+    # "outside retention", because doing so can silently route a valid request
+    # to the wrong storage state.
+    within_retention = AcquisitionStateManager.is_within_operational_retention(
+        norm_period,
+        reference_period=reference_period,
+        retention_years=retention_years,
+        database_url=database_url,
+        archive_backend=archive_backend,
+    )
 
     is_neon_completed = False
     if within_retention:
@@ -265,6 +267,8 @@ def get_historical_transactions(
     acquired_disposed: Optional[str] = None,
     ownership_types: Optional[Union[str, List[str]]] = None,
     limit: Optional[int] = None,
+    reference_period: Optional[str] = None,
+    retention_years: int = 3,
 ) -> List[NormalizedBulkTransaction]:
     """
     Retrieve historical SEC transactions across a range of periods [start_period, end_period].
@@ -283,7 +287,13 @@ def get_historical_transactions(
     location_map = {}
     missing_periods = []
     for period in periods:
-        loc = resolve_period_storage_location(database_url, archive_backend, period)
+        loc = resolve_period_storage_location(
+            database_url,
+            archive_backend,
+            period,
+            reference_period=reference_period,
+            retention_years=retention_years,
+        )
         location_map[period] = loc
         if loc == "MISSING":
             missing_periods.append(period)

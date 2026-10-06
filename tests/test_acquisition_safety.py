@@ -15,8 +15,91 @@ from storage.repository import count_records, store_bulk_insider_transactions
 from data.sec_dataset_pipeline import NormalizedBulkTransaction
 
 
+def test_historical_acquisition_requires_explicit_reference_period(tmp_path, monkeypatch):
+    """TEST A: Verify historical acquisition raises ValueError if reference_period is None and DB/archive empty."""
+    db_file = tmp_path / "req_ref_test.db"
+    db_url = f"sqlite:///{db_file}"
+    archive_dir = tmp_path / "archive"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_BACKEND", "filesystem")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(archive_dir))
+
+    with pytest.raises(ValueError, match="reference_period is required"):
+        run_historical_acquisition(
+            "2006-Q1",
+            "2006-Q1",
+            reference_period=None,
+        )
+
+
+def test_historical_acquisition_uses_explicit_reference_period(tmp_path, monkeypatch):
+    """TEST B: Verify historical acquisition uses normalized explicit reference_period."""
+    db_file = tmp_path / "explicit_ref_test.db"
+    db_url = f"sqlite:///{db_file}"
+    archive_dir = tmp_path / "archive"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_BACKEND", "filesystem")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(archive_dir))
+
+    captured = []
+
+    def fake_retention(period, reference_period=None, retention_years=3, **kwargs):
+        captured.append(reference_period)
+        return False
+
+    monkeypatch.setattr(
+        "data.acquisition_state.AcquisitionStateManager.is_within_operational_retention",
+        fake_retention,
+    )
+
+    def mock_download(year, qtr, user_agent, target_path):
+        with zipfile.ZipFile(target_path, "w") as zf:
+            zf.writestr("test.txt", "data")
+        return target_path
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_download)
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", lambda *a, **k: [])
+
+    run_historical_acquisition("2006-Q1", "2006-Q2", reference_period="2026-Q2", force=True)
+
+    assert captured
+    assert all(value == "2026-Q2" for value in captured)
+
+
+def test_explicit_reference_period_prevents_latest_period_lookup(tmp_path, monkeypatch):
+    """TEST C: Verify passing explicit reference_period prevents get_latest_available_sec_period lookup."""
+    db_file = tmp_path / "no_latest_lookup.db"
+    db_url = f"sqlite:///{db_file}"
+    archive_dir = tmp_path / "archive"
+
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "TestBot/1.0 test@example.com")
+    monkeypatch.setenv("SEC_ARCHIVE_BACKEND", "filesystem")
+    monkeypatch.setenv("SEC_ARCHIVE_PATH", str(archive_dir))
+
+    def fail_latest_lookup(*args, **kwargs):
+        raise AssertionError("latest-period discovery must not be used when reference_period is explicit")
+
+    monkeypatch.setattr("data.acquisition_state.get_latest_available_sec_period", fail_latest_lookup)
+
+    def mock_download(year, qtr, user_agent, target_path):
+        with zipfile.ZipFile(target_path, "w") as zf:
+            zf.writestr("test.txt", "data")
+        return target_path
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_download)
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", lambda *a, **k: [])
+
+    res = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2026-Q2", force=True)
+    assert res == 0
+
+
 def test_frozen_retention_reference_called_once(tmp_path, monkeypatch):
-    """Test A: Verify retention reference lookup is called ONCE before acquisition loop."""
+    """Test A: Verify retention reference is normalized once before loop and passed to is_within_operational_retention for each period."""
     db_file = tmp_path / "frozen_ref_test.db"
     db_url = f"sqlite:///{db_file}"
     archive_dir = tmp_path / "archive"
@@ -26,31 +109,28 @@ def test_frozen_retention_reference_called_once(tmp_path, monkeypatch):
     monkeypatch.setenv("SEC_ARCHIVE_BACKEND", "filesystem")
     monkeypatch.setenv("SEC_ARCHIVE_PATH", str(archive_dir))
 
-    state_mgr = AcquisitionStateManager(db_url)
-    state_mgr.record_period_completion("2026-Q1", 10, 10, 0, 0, 0, status="COMPLETED")
+    captured_refs = []
 
-    call_count = 0
+    def mock_retention(period, reference_period=None, retention_years=3, **kwargs):
+        captured_refs.append(reference_period)
+        return False
 
-    def mock_get_latest(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return "2026-Q1"
+    monkeypatch.setattr("data.acquisition_state.AcquisitionStateManager.is_within_operational_retention", mock_retention)
 
-    monkeypatch.setattr("data.acquisition_state.get_latest_available_sec_period", mock_get_latest)
+    def mock_download(year, qtr, user_agent, target_path):
+        with zipfile.ZipFile(target_path, "w") as zf:
+            zf.writestr("test.txt", "data")
+        return target_path
 
-    # Mock parse/download to succeed
-    zfile = tmp_path / "dummy.zip"
-    with zipfile.ZipFile(zfile, "w") as zf:
-        zf.writestr("test.txt", "data")
-
-    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **k: str(zfile))
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_download)
     monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", lambda *a, **k: [])
 
     # Process 3 periods: 2006-Q1, 2006-Q2, 2006-Q3
-    run_historical_acquisition("2006-Q1", "2006-Q3", reference_period=None, force=True)
+    run_historical_acquisition("2006-Q1", "2006-Q3", reference_period="2026-Q2", force=True)
 
-    # CRITICAL ASSERTION: get_latest_available_sec_period was called EXACTLY ONCE
-    assert call_count == 1
+    # Retention check was called for all 3 periods with the frozen reference_period "2026-Q2"
+    assert len(captured_refs) == 3
+    assert all(r == "2026-Q2" for r in captured_refs)
 
 
 def test_invalid_orphan_zip_deleted_and_downloaded(tmp_path, monkeypatch):
@@ -325,7 +405,7 @@ def test_archive_survives_ingestion_failure_and_retry_reuses_archive(tmp_path, m
     state_mgr = AcquisitionStateManager(db_url)
 
     # Run historical acquisition (should fail and mark FAILED)
-    res_code = run_historical_acquisition("2006-Q1", "2006-Q1")
+    res_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
     assert res_code == 1
     assert state_mgr.get_period_status(period) == "FAILED"
 
@@ -382,7 +462,7 @@ def test_archive_survives_ingestion_failure_and_retry_reuses_archive(tmp_path, m
     monkeypatch.setattr("data.sec_dataset_pipeline.validate_bulk_record", lambda r: MockVal())
 
     # Retry acquisition (force=False because period is FAILED)
-    retry_code = run_historical_acquisition("2006-Q1", "2006-Q1")
+    retry_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1")
     assert retry_code == 0
     assert len(download_calls) == 0  # Proves intact archive was reused without re-downloading
     assert state_mgr.get_period_status(period) == "COMPLETED"

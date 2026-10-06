@@ -71,16 +71,19 @@ jobs:
               --start "${START_PERIOD}" \
               --end "${END_PERIOD}" \
               --batch-size "${BATCH_SIZE}" \
+              --reference-period "${REFERENCE_PERIOD}" \
               --force
           else
             python main.py historical \
               --start "${START_PERIOD}" \
               --end "${END_PERIOD}" \
-              --batch-size "${BATCH_SIZE}"
+              --batch-size "${BATCH_SIZE}" \
+              --reference-period "${REFERENCE_PERIOD}"
           fi
         env:
           START_PERIOD: ${{ github.event.inputs.start_period }}
           END_PERIOD: ${{ github.event.inputs.end_period }}
+          REFERENCE_PERIOD: ${{ github.event.inputs.end_period }}
           BATCH_SIZE: ${{ github.event.inputs.batch_size }}
           FORCE: ${{ github.event.inputs.force }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

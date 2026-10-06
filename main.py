@@ -71,14 +71,24 @@ def run_historical_acquisition(
 
     retention_years = getattr(settings, "sec_operational_retention_years", 3)
 
-    retention_ref = (
-        reference_period
-        if reference_period
-        else get_latest_available_sec_period(
-            database_url=db_url,
-            archive_backend=archive_backend,
+    # The retention reference must be explicit for a historical acquisition.
+    #
+    # Do NOT derive it from the current contents of Neon/R2 here.
+    # A fresh database/archive may legitimately contain no authoritative
+    # period yet, and deriving the reference from partially populated
+    # historical data could incorrectly make an old quarter the retention
+    # anchor.
+    #
+    # The caller/workflow must explicitly provide the authoritative SEC
+    # reference period for the acquisition window.
+    if not reference_period:
+        raise ValueError(
+            "reference_period is required for historical acquisition. "
+            "Pass --reference-period using the authoritative SEC dataset "
+            "period that should anchor the operational retention window."
         )
-    )
+
+    retention_ref = AcquisitionStateManager.normalize_period(reference_period)
 
     periods_processed = 0
     periods_downloaded = 0
@@ -380,7 +390,15 @@ def main() -> int:
         parser.add_argument("--end", default="2026-Q2", help="End period (e.g. 2026-Q2)")
         parser.add_argument("--batch-size", type=int, default=5000, help="Batch size for database insertion")
         parser.add_argument("--force", action="store_true", help="Force re-processing of completed periods")
-        parser.add_argument("--reference-period", default=None, help="Explicit operational reference period for retention calculation (defaults to current SEC period)")
+        parser.add_argument(
+            "--reference-period",
+            default=None,
+            help=(
+                "Authoritative SEC dataset period used as the operational "
+                "retention reference (required for historical acquisition). "
+                "Example: 2026-Q2"
+            ),
+        )
         args = parser.parse_args()
         return run_historical_acquisition(args.start, args.end, batch_size=args.batch_size, force=args.force, reference_period=args.reference_period)
 

@@ -42,7 +42,7 @@ def test_event_study_handles_single_price() -> None:
 
 import zipfile
 import pytest
-from archive import FilesystemSECArchive
+from archive import ArchiveError, FilesystemSECArchive
 from data.sec_dataset_pipeline import NormalizedBulkTransaction
 from data.acquisition_state import AcquisitionStateManager
 from research.research_data_access import (
@@ -54,6 +54,50 @@ from research.insider_adapter import prepare_event_study_inputs
 from storage.repository import store_bulk_insider_transactions
 
 
+def test_research_archive_storage_error_propagates(tmp_path):
+    db_file = tmp_path / "archive_error.db"
+    db_url = f"sqlite:///{db_file}"
+
+    class FailingArchive:
+        def exists(self, period):
+            raise ArchiveError("R2 storage unavailable")
+
+    with pytest.raises(ArchiveError, match="R2 storage unavailable"):
+        resolve_period_storage_location(
+            db_url,
+            FailingArchive(),
+            "2020-Q1",
+            reference_period="2020-Q1",
+        )
+
+
+def test_research_retention_runtime_error_propagates(tmp_path, monkeypatch):
+    db_file = tmp_path / "research_retention_error.db"
+    db_url = f"sqlite:///{db_file}"
+
+    class FailingArchive:
+        def exists(self, period):
+            raise AssertionError("archive.exists must not be reached")
+
+    def fail_retention(*args, **kwargs):
+        raise RuntimeError("authoritative retention reference unavailable")
+
+    monkeypatch.setattr(
+        "research.research_data_access.AcquisitionStateManager.is_within_operational_retention",
+        fail_retention,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="authoritative retention reference unavailable",
+    ):
+        resolve_period_storage_location(
+            db_url,
+            FailingArchive(),
+            "2020-Q1",
+        )
+
+
 def test_resolve_period_storage_location_and_get_historical_transactions(tmp_path):
     db_file = tmp_path / "res_test.db"
     db_url = f"sqlite:///{db_file}"
@@ -62,10 +106,10 @@ def test_resolve_period_storage_location_and_get_historical_transactions(tmp_pat
     archive = FilesystemSECArchive(base_path=str(archive_dir))
 
     # 1. Period missing from both
-    assert resolve_period_storage_location(db_url, archive, "2006-Q1") == "MISSING"
+    assert resolve_period_storage_location(db_url, archive, "2006-Q1", reference_period="2006-Q1") == "MISSING"
 
     with pytest.raises(PeriodNotFoundError) as exc_info:
-        get_historical_transactions(db_url, archive, "2006-Q1", "2006-Q1")
+        get_historical_transactions(db_url, archive, "2006-Q1", "2006-Q1", reference_period="2006-Q1")
     assert "2006-Q1" in str(exc_info.value)
 
     # 2. Add archive for 2006-Q1 to R2

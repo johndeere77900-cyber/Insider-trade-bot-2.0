@@ -113,6 +113,23 @@ def test_archive_metadata_and_list(tmp_path) -> None:
     assert meta1.period == "2006-Q1"
 
 
+def test_filesystem_get_incomplete_zip(tmp_path):
+    archive_dir = tmp_path / "archive"
+    archive = FilesystemSECArchive(base_path=str(archive_dir))
+
+    zip_file = tmp_path / "orphan.zip"
+    create_dummy_zip(
+        str(zip_file),
+        {"SUBMISSION.tsv": "ORPHAN"},
+    )
+
+    orphan_path = archive_dir / "2006-Q1.zip"
+    orphan_path.write_bytes(zip_file.read_bytes())
+
+    assert archive.is_incomplete("2006-Q1") is True
+    assert archive.get_incomplete_zip("2006-Q1") == zip_file.read_bytes()
+
+
 def test_archive_missing_handling(tmp_path) -> None:
     archive_dir = tmp_path / "archive"
     archive = FilesystemSECArchive(base_path=str(archive_dir))
@@ -121,6 +138,9 @@ def test_archive_missing_handling(tmp_path) -> None:
 
     with pytest.raises(ArchiveNotFoundError):
         archive.get("2099-Q4")
+
+    with pytest.raises(ArchiveNotFoundError):
+        archive.get_incomplete_zip("2099-Q4")
 
     with pytest.raises(ArchiveNotFoundError):
         archive.metadata("2099-Q4")
@@ -216,9 +236,14 @@ def test_s3_archive_cases_a_through_f(tmp_path) -> None:
     period_d = "2006-Q2"
     store[f"sec-archives/{period_d}.zip"] = z1.read_bytes()
     assert s3_backend.is_incomplete(period_d) is True
+    assert s3_backend.get_incomplete_zip(period_d) == z1.read_bytes()
     meta_d = s3_backend.put(period_d, str(z1))
     assert meta_d.period == period_d
     assert s3_backend.exists(period_d) is True
+
+    # Test missing ZIP raises ArchiveNotFoundError in get_incomplete_zip
+    with pytest.raises(ArchiveNotFoundError):
+        s3_backend.get_incomplete_zip("2099-Q4")
 
     # CASE E: Metadata exists but ZIP does not -> clears orphaned manifest and recreates
     period_e = "2006-Q3"

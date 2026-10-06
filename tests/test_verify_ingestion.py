@@ -212,7 +212,7 @@ def test_main_historical_force_reprocessing(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(pipeline, "download_dataset_zip_to_file", mock_download)
     monkeypatch.setattr(pipeline, "parse_dataset_zip", lambda zip_path, source_url="": [])
 
-    ret = main.run_historical_acquisition("2006-Q1", "2006-Q1", force=True)
+    ret = main.run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1", force=True)
     assert ret == 0
 
 

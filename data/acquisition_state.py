@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from database.connection import connect, initialize_database, is_postgresql_url
 from storage.repository import _placeholder, _row_value, utc_now
