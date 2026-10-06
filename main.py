@@ -82,14 +82,22 @@ def run_historical_acquisition(
     #
     # The caller/workflow must explicitly provide the authoritative SEC
     # reference period for the acquisition window.
-    if not reference_period:
+    if not reference_period or not str(reference_period).strip():
         raise ValueError(
             "reference_period is required for historical acquisition. "
             "Pass --reference-period using the authoritative SEC dataset "
             "period that should anchor the operational retention window."
         )
 
-    retention_ref = AcquisitionStateManager.normalize_period(reference_period)
+    try:
+        ref_parsed = state_mgr.parse_period_range(reference_period, reference_period)
+        if not ref_parsed or ref_parsed[0][1] not in (1, 2, 3, 4):
+            raise ValueError(f"Invalid reference_period format or quarter: '{reference_period}'")
+        retention_ref = ref_parsed[0][2]
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid reference_period '{reference_period}': {exc}"
+        ) from exc
 
     periods_processed = 0
     periods_downloaded = 0

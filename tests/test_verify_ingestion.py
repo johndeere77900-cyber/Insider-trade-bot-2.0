@@ -704,6 +704,70 @@ def test_verify_run1_multi_owner_pass_and_not_testable(tmp_path: Path, monkeypat
     assert data["multi_owner_result"] == "PASS"
 
 
+def test_verify_run1_lean_neon_mode_null_raw_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that verify_run1 succeeds in lean Neon mode where raw_payload is NULL in database."""
+    db_path = tmp_path / "test_lean_verify.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, issuer_name, ticker,
+                insider_name, insider_cik, transaction_date, filing_date,
+                form_type, transaction_code, security_title, shares, price,
+                transaction_type, acquired_disposed, ownership_type, source_url,
+                raw_payload, record_hash, created_at
+            ) VALUES (
+                'SEC', '0000000000-06-000001', '0000001234', 'ACME CORP', 'ACME',
+                'DOE JANE', '0000005678', '2006-01-15', '2006-01-16',
+                '4', 'P', 'Common Stock', 100.0, 10.5,
+                'non_derivative', 'A', 'D', 'https://example.com',
+                NULL, 'hash_lean_verify_1', '2026-01-01T00:00:00Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference,
+                retrieved_at, checksum, validation_status
+            ) VALUES (
+                'dataset_period', '2006-Q1', 'SEC',
+                'https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/2006q1_form345.zip',
+                '2026-01-01T00:00:00Z', 'abc123checksum', 'validated'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted,
+                duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES (
+                '2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01T00:00:00Z'
+            )
+            """
+        )
+        conn.commit()
+
+    state_file = str(tmp_path / "sec_lean_run1_stats.json")
+
+    res = verify_run1("2006-Q1", state_file)
+    assert res == 0
+
+    with open(state_file, "r") as f:
+        saved = json.load(f)
+
+    assert saved["status"] == "COMPLETED"
+    assert saved["period_tx_count"] == 1
+
+
 def test_verify_run1_amendment_fail_on_missing_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test amendment FAIL when amendment record hash is corrupt or unlisted."""
     db_path = tmp_path / "test_amend_fail.db"

@@ -279,7 +279,11 @@ def verify_run1(period: str, state_file: str) -> int:
             sys.exit(1)
 
         # Strict Period-Scoped Data Quality: Multi-Owner and Amendment checks
-        period_tx_cols = ["accession_number", "issuer_cik", "record_hash", "source", "insider_name", "insider_cik", "form_type", "filing_date", "raw_payload"]
+        period_tx_cols = [
+            "accession_number", "issuer_cik", "record_hash", "source",
+            "insider_name", "insider_cik", "form_type", "filing_date",
+            "is_amendment", "date_of_orig_submission", "raw_payload"
+        ]
         period_sql = (
             f"SELECT {', '.join(period_tx_cols)} "
             "FROM insider_transactions WHERE filing_date >= %s AND filing_date <= %s"
@@ -288,6 +292,32 @@ def verify_run1(period: str, state_file: str) -> int:
             "FROM insider_transactions WHERE filing_date >= ? AND filing_date <= ?"
         )
         period_rows = query_all(conn, db_url, period_sql, (start_date, end_date))
+
+        # Check if archive-backed raw details are needed (lean storage mode where raw_payload is NULL in Neon)
+        archive_raw_by_hash = {}
+        if any(get_field(r, "raw_payload", period_tx_cols) is None for r in period_rows):
+            try:
+                from archive import get_archive_backend
+                from data.sec_dataset_pipeline import parse_dataset_zip
+                settings = load_environment()
+                archive_kwargs = {}
+                if settings.sec_archive_bucket:
+                    archive_kwargs["bucket"] = settings.sec_archive_bucket
+                if settings.sec_archive_endpoint_url:
+                    archive_kwargs["endpoint_url"] = settings.sec_archive_endpoint_url
+                archive_backend = get_archive_backend(
+                    backend_type=settings.sec_archive_backend,
+                    archive_path=settings.sec_archive_path,
+                    **archive_kwargs,
+                )
+                if archive_backend.exists(period):
+                    zip_bytes = archive_backend.get(period)
+                    for rec in parse_dataset_zip(zip_bytes):
+                        h = rec.get("record_hash")
+                        if h:
+                            archive_raw_by_hash[h] = rec.get("raw", {})
+            except Exception:
+                pass
 
         dq_pass = True
 
@@ -305,38 +335,50 @@ def verify_run1(period: str, state_file: str) -> int:
             source = get_field(r, "source", period_tx_cols)
             raw_str = get_field(r, "raw_payload", period_tx_cols)
 
-            if not acc or not cik or not rec_hash or source != "SEC" or not raw_str:
+            if not acc or not cik or not rec_hash or source != "SEC":
                 print(f"ERROR: Record failed required field check: acc={acc}, cik={cik}, hash={rec_hash}, source={source}", file=sys.stderr)
                 dq_pass = False
                 break
 
             all_period_hashes.add(rec_hash)
 
-            try:
-                raw_obj = json.loads(raw_str) if isinstance(raw_str, str) else raw_str
-            except Exception:
-                print(f"ERROR: Raw payload JSON unparseable for record {acc}", file=sys.stderr)
-                dq_pass = False
-                break
+            raw_obj = None
+            if raw_str is not None:
+                try:
+                    raw_obj = json.loads(raw_str) if isinstance(raw_str, str) else raw_str
+                except Exception:
+                    print(f"ERROR: Raw payload JSON unparseable for record {acc}", file=sys.stderr)
+                    dq_pass = False
+                    break
+            else:
+                raw_obj = archive_raw_by_hash.get(rec_hash)
 
             # Multi-owner evaluation
-            all_owners = raw_obj.get("all_owners", []) if isinstance(raw_obj, dict) else []
             insider_name = get_field(r, "insider_name", period_tx_cols)
             insider_cik = get_field(r, "insider_cik", period_tx_cols)
 
-            if len(all_owners) > 1:
-                multi_owner_found = True
-                if insider_name is not None or insider_cik is not None:
-                    print(f"ERROR: Multi-owner filing {acc} incorrectly assigned top-level insider_name={insider_name}, insider_cik={insider_cik}", file=sys.stderr)
-                    multi_owner_valid = False
+            if raw_obj is not None:
+                all_owners = raw_obj.get("all_owners", []) if isinstance(raw_obj, dict) else []
+                if len(all_owners) > 1:
+                    multi_owner_found = True
+                    if insider_name is not None or insider_cik is not None:
+                        print(f"ERROR: Multi-owner filing {acc} incorrectly assigned top-level insider_name={insider_name}, insider_cik={insider_cik}", file=sys.stderr)
+                        multi_owner_valid = False
 
             # Amendment evaluation
-            sub_info = raw_obj.get("submission", {}) if isinstance(raw_obj, dict) else {}
-            doc_type = str(sub_info.get("DOCUMENT_TYPE", ""))
-            date_orig = str(sub_info.get("DATE_OF_ORIG_SUB", ""))
             form_t = str(get_field(r, "form_type", period_tx_cols) or "")
+            is_amend_db = get_field(r, "is_amendment", period_tx_cols)
+            date_orig_db = get_field(r, "date_of_orig_submission", period_tx_cols)
 
-            is_amend = doc_type.endswith("/A") or form_t.endswith("/A") or bool(date_orig and date_orig.strip())
+            doc_type = ""
+            date_orig = date_orig_db or ""
+            if raw_obj is not None:
+                sub_info = raw_obj.get("submission", {}) if isinstance(raw_obj, dict) else {}
+                doc_type = str(sub_info.get("DOCUMENT_TYPE", ""))
+                if not date_orig:
+                    date_orig = str(sub_info.get("DATE_OF_ORIG_SUB", ""))
+
+            is_amend = bool(is_amend_db) or doc_type.endswith("/A") or form_t.endswith("/A") or bool(date_orig and str(date_orig).strip())
 
             if is_amend:
                 amendment_rows.append((acc, rec_hash, date_orig, doc_type, raw_obj))

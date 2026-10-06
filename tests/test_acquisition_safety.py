@@ -16,7 +16,7 @@ from data.sec_dataset_pipeline import NormalizedBulkTransaction
 
 
 def test_historical_acquisition_requires_explicit_reference_period(tmp_path, monkeypatch):
-    """TEST A: Verify historical acquisition raises ValueError if reference_period is None or empty."""
+    """TEST A: Verify historical acquisition raises ValueError if reference_period is None, empty, or malformed."""
     db_file = tmp_path / "req_ref_test.db"
     db_url = f"sqlite:///{db_file}"
     archive_dir = tmp_path / "archive"
@@ -31,6 +31,13 @@ def test_historical_acquisition_requires_explicit_reference_period(tmp_path, mon
             "2006-Q1",
             "2006-Q1",
             reference_period=None,
+        )
+
+    with pytest.raises(ValueError, match="Invalid reference_period"):
+        run_historical_acquisition(
+            "2006-Q1",
+            "2006-Q1",
+            reference_period="INVALID-PERIOD-FORMAT",
         )
 
     with pytest.raises(ValueError, match="reference_period is required"):
