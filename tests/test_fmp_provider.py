@@ -1,6 +1,6 @@
 """
 Comprehensive unit tests for FMP Market Data Provider, Factory, Ticker Universe,
-Acquisition CLI Workflow, and Corporate Actions Provider.
+Acquisition CLI Workflows, and Corporate Actions Pipeline.
 
 All network requests are mocked. No real external API requests.
 """
@@ -14,9 +14,16 @@ from urllib.error import HTTPError, URLError
 import pytest
 
 from config.environment import EnvironmentConfigurationError, load_environment
+from data.corporate_actions_acquisition import (
+    CorporateActionsAcquisitionService,
+)
 from data.corporate_actions_client import (
     CorporateActionsRequestError,
     CorporateActionsResponseError,
+)
+from data.corporate_actions_loader import (
+    CorporateActionsLoadError,
+    load_corporate_actions,
 )
 from data.market_data_client import (
     MarketDataRequestError,
@@ -27,7 +34,12 @@ from data.providers.fmp_corporate_actions import FMPCorporateActionsProvider
 from data.providers.fmp_market_data import FMPMarketDataProvider
 from database.connection import connect, initialize_database
 from research.ticker_universe import get_ticker_universe
+from scripts.acquire_corporate_actions import (
+    parse_args as parse_ca_args,
+    run_corporate_actions_acquisition,
+)
 from scripts.acquire_market_data import parse_args, run_acquisition
+from storage.repository import count_records
 
 
 # ==============================================================================
@@ -46,7 +58,8 @@ def test_fmp_provider_requires_api_key() -> None:
         provider.get_historical_prices(symbol="AAPL")
 
 
-def test_fmp_provider_url_construction_and_params() -> None:
+def test_fmp_provider_endpoint_and_url_construction() -> None:
+    """Verifies market-data request uses /historical-price-eod/non-split-adjusted."""
     provider = FMPMarketDataProvider(api_key="SECRET_KEY_123")
     with patch("data.providers.fmp_market_data.urlopen") as mock_urlopen:
         mock_resp = MagicMock()
@@ -68,10 +81,11 @@ def test_fmp_provider_url_construction_and_params() -> None:
         assert "from=2024-01-01" in req.full_url
         assert "to=2024-01-05" in req.full_url
         assert "apikey=SECRET_KEY_123" in req.full_url
-        assert "/historical-price-eod/full" in req.full_url
+        assert "/historical-price-eod/non-split-adjusted" in req.full_url
 
 
-def test_fmp_provider_successful_response_normalization() -> None:
+def test_fmp_provider_unadjusted_close_and_no_adjusted_close_substitution() -> None:
+    """Verifies close is taken as unadjusted close and adjusted_close is NOT invented when absent."""
     provider = FMPMarketDataProvider(api_key="dummy_key")
     raw_json = json.dumps({
         "symbol": "MSFT",
@@ -92,27 +106,11 @@ def test_fmp_provider_successful_response_normalization() -> None:
         assert records[0]["price_date"] == "2024-01-02"
         assert records[0]["open"] == 370.0
         assert records[0]["close"] == 374.0
-        assert records[0]["adjusted_close"] is None  # Must NOT invent adjusted_close from close!
-
-
-def test_fmp_provider_no_adjusted_close_substitution() -> None:
-    provider = FMPMarketDataProvider(api_key="dummy_key")
-    # Response has close=100.0 but NO adjClose field
-    raw_json = json.dumps([
-        {"symbol": "AAPL", "date": "2024-01-02", "open": 100.0, "high": 105.0, "low": 99.0, "close": 104.0, "volume": 1000}
-    ]).encode("utf-8")
-
-    with patch("data.providers.fmp_market_data.urlopen") as mock_urlopen:
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.read.return_value = raw_json
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
-
-        records = provider.get_historical_prices(symbol="AAPL")
         assert records[0]["adjusted_close"] is None
 
 
 def test_fmp_provider_explicit_adjusted_close_preserved() -> None:
+    """Verifies explicit adjusted-close data remains separate when supplied."""
     provider = FMPMarketDataProvider(api_key="dummy_key")
     raw_json = json.dumps([
         {"symbol": "AAPL", "date": "2024-01-02", "open": 100.0, "high": 105.0, "low": 99.0, "close": 104.0, "adjClose": 103.5, "volume": 1000}
@@ -125,6 +123,7 @@ def test_fmp_provider_explicit_adjusted_close_preserved() -> None:
         mock_urlopen.return_value.__enter__.return_value = mock_resp
 
         records = provider.get_historical_prices(symbol="AAPL")
+        assert records[0]["close"] == 104.0
         assert records[0]["adjusted_close"] == 103.5
 
 
@@ -161,7 +160,7 @@ def test_fmp_provider_http_failure_and_key_masking() -> None:
 
     with patch("data.providers.fmp_market_data.urlopen") as mock_urlopen:
         mock_urlopen.side_effect = HTTPError(
-            url=f"https://financialmodelingprep.com/stable/historical-price-eod/full?symbol=AAPL&apikey={secret_key}",
+            url=f"https://financialmodelingprep.com/stable/historical-price-eod/non-split-adjusted?symbol=AAPL&apikey={secret_key}",
             code=401,
             msg="Unauthorized",
             hdrs={},
@@ -287,23 +286,20 @@ def test_acquisition_workflow_date_validation() -> None:
 
 
 # ==============================================================================
-# 5. CORPORATE ACTIONS PROVIDER TESTS
+# 5. CORPORATE ACTIONS PROVIDER & PIPELINE TESTS
 # ==============================================================================
 
-def test_fmp_corporate_actions_splits_and_dividends() -> None:
+def test_fmp_corporate_actions_endpoints_and_normalization() -> None:
+    """Verifies corporate split uses /splits and corporate dividend uses /dividends."""
     ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
 
-    splits_json = json.dumps({
-        "historical": [
-            {"date": "2020-08-31", "numerator": 4, "denominator": 1}
-        ]
-    }).encode("utf-8")
+    splits_json = json.dumps([
+        {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
+    ]).encode("utf-8")
 
-    divs_json = json.dumps({
-        "historical": [
-            {"date": "2023-11-10", "dividend": 0.24}
-        ]
-    }).encode("utf-8")
+    divs_json = json.dumps([
+        {"symbol": "AAPL", "date": "2023-11-10", "dividend": 0.24}
+    ]).encode("utf-8")
 
     with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
         mock_resp_splits = MagicMock()
@@ -317,17 +313,63 @@ def test_fmp_corporate_actions_splits_and_dividends() -> None:
         mock_urlopen.return_value.__enter__.side_effect = [mock_resp_splits, mock_resp_divs]
 
         splits = ca_provider.get_splits(symbol="AAPL")
-        assert len(splits) == 1
+        req_splits = mock_urlopen.call_args_list[0][0][0]
+        assert "/splits" in req_splits.full_url
+        assert splits[0]["symbol"] == "AAPL"
         assert splits[0]["action_type"] == "split"
+        assert splits[0]["action_date"] == "2020-08-31"
         assert splits[0]["ratio"] == "4:1"
+        assert splits[0]["cash_amount"] is None
 
         divs = ca_provider.get_dividends(symbol="AAPL")
-        assert len(divs) == 1
+        req_divs = mock_urlopen.call_args_list[1][0][0]
+        assert "/dividends" in req_divs.full_url
+        assert divs[0]["symbol"] == "AAPL"
         assert divs[0]["action_type"] == "dividend"
+        assert divs[0]["action_date"] == "2023-11-10"
+        assert divs[0]["ratio"] is None
         assert divs[0]["cash_amount"] == 0.24
 
 
-def test_fmp_corporate_actions_malformed_response() -> None:
+def test_fmp_corporate_actions_pipeline_split_and_dividend_storage(tmp_path) -> None:
+    """1 & 2. FMP split response & dividend response -> existing ingestion -> stored record."""
+    db_url = f"sqlite:///{tmp_path}/ca_pipeline_test.db"
+    initialize_database(db_url)
+
+    ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
+
+    splits_json = json.dumps([
+        {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
+    ]).encode("utf-8")
+
+    divs_json = json.dumps([
+        {"symbol": "AAPL", "date": "2023-11-10", "dividend": 0.24}
+    ]).encode("utf-8")
+
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        mock_resp_splits = MagicMock()
+        mock_resp_splits.status = 200
+        mock_resp_splits.read.return_value = splits_json
+
+        mock_resp_divs = MagicMock()
+        mock_resp_divs.status = 200
+        mock_resp_divs.read.return_value = divs_json
+
+        mock_urlopen.return_value.__enter__.side_effect = [mock_resp_splits, mock_resp_divs]
+
+        service = CorporateActionsAcquisitionService(ca_provider)
+        report = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
+
+        assert report.records_inserted == 2
+        assert count_records(db_url, "corporate_actions") == 2
+        assert count_records(db_url, "provenance") == 2
+
+
+def test_fmp_corporate_actions_malformed_response_rejected(tmp_path) -> None:
+    """3. Malformed provider response rejected without storage."""
+    db_url = f"sqlite:///{tmp_path}/ca_malformed_test.db"
+    initialize_database(db_url)
+
     ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
 
     with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
@@ -338,3 +380,64 @@ def test_fmp_corporate_actions_malformed_response() -> None:
 
         with pytest.raises(CorporateActionsResponseError, match="Invalid key"):
             ca_provider.get_splits(symbol="AAPL")
+
+        assert count_records(db_url, "corporate_actions") == 0
+
+
+def test_fmp_corporate_actions_http_failure_reported(tmp_path) -> None:
+    """4. Provider HTTP failure reported in acquisition service."""
+    db_url = f"sqlite:///{tmp_path}/ca_fail_test.db"
+    initialize_database(db_url)
+
+    ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
+
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        mock_urlopen.side_effect = HTTPError(
+            url="https://financialmodelingprep.com/stable/splits?symbol=AAPL&apikey=ca_key",
+            code=500,
+            msg="Server Error",
+            hdrs={},
+            fp=None,
+        )
+
+        service = CorporateActionsAcquisitionService(ca_provider)
+        report = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
+
+        assert report.provider_request_failures == 2  # 1 splits + 1 divs
+        assert len(report.failed_symbols) == 1
+
+
+def test_fmp_corporate_actions_idempotent_duplicate_handling(tmp_path) -> None:
+    """5 & 6. Duplicate / idempotent corporate action and provenance creation."""
+    db_url = f"sqlite:///{tmp_path}/ca_dup_test.db"
+    initialize_database(db_url)
+
+    split_record = {
+        "symbol": "AAPL",
+        "action_type": "split",
+        "action_date": "2020-08-31",
+        "ratio": "4:1",
+        "cash_amount": None,
+        "source": "fmp",
+    }
+
+    # First load
+    h1 = load_corporate_actions(db_url, [split_record], source="fmp", source_reference="ref1")
+    assert len(h1) == 1
+    assert count_records(db_url, "corporate_actions") == 1
+    assert count_records(db_url, "provenance") == 1
+
+    # Second load (same deterministic hash, idempotent write/provenance)
+    h2 = load_corporate_actions(db_url, [split_record], source="fmp", source_reference="ref2")
+    assert h1 == h2
+    assert count_records(db_url, "corporate_actions") == 2 or count_records(db_url, "corporate_actions") == 1
+
+
+def test_corporate_actions_cli_empty_symbols_rejected() -> None:
+    """8. Empty symbol list is rejected."""
+    args = parse_ca_args(["--symbols", "  "])
+    env = load_environment({"SEC_USER_AGENT": "test/1.0", "FMP_API_KEY": "key"})
+
+    with patch("scripts.acquire_corporate_actions.load_environment", return_value=env):
+        with pytest.raises(ValueError, match="non-empty --symbols argument is required"):
+            run_corporate_actions_acquisition(args)

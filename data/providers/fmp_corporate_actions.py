@@ -1,8 +1,8 @@
 """
 Financial Modeling Prep (FMP) Corporate Actions Provider for Insider Trade Bot.
 
-Retrieves historical stock splits and dividends from FMP API without modifying
-stored raw OHLCV market prices.
+Retrieves historical stock splits and dividends from FMP stable API (/splits, /dividends)
+without modifying stored raw OHLCV market prices.
 """
 
 from __future__ import annotations
@@ -23,6 +23,10 @@ from data.corporate_actions_client import (
 class FMPCorporateActionsProvider:
     """
     Corporate-actions adapter for Financial Modeling Prep (FMP).
+
+    Endpoints:
+        - Stock Splits: /splits
+        - Dividends: /dividends
     """
 
     def __init__(
@@ -143,6 +147,8 @@ class FMPCorporateActionsProvider:
     ) -> list[dict[str, Any]]:
         """
         Retrieve historical stock splits for a symbol.
+
+        Target Endpoint: /splits
         """
         norm_symbol = str(symbol).strip().upper()
         if not norm_symbol:
@@ -160,7 +166,7 @@ class FMPCorporateActionsProvider:
                 raise ValueError("end_date cannot be empty.")
             params["to"] = norm_end
 
-        raw_payload = self._request_json("historical-price-eod/splits", params)
+        raw_payload = self._request_json("splits", params)
         return self._process_splits_payload(raw_payload, norm_symbol)
 
     def get_dividends(
@@ -172,6 +178,8 @@ class FMPCorporateActionsProvider:
     ) -> list[dict[str, Any]]:
         """
         Retrieve historical dividends for a symbol.
+
+        Target Endpoint: /dividends
         """
         norm_symbol = str(symbol).strip().upper()
         if not norm_symbol:
@@ -189,7 +197,7 @@ class FMPCorporateActionsProvider:
                 raise ValueError("end_date cannot be empty.")
             params["to"] = norm_end
 
-        raw_payload = self._request_json("historical-price-eod/dividends", params)
+        raw_payload = self._request_json("dividends", params)
         return self._process_dividends_payload(raw_payload, norm_symbol)
 
     def _process_splits_payload(

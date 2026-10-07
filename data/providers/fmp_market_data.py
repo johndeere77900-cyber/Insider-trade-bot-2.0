@@ -2,6 +2,8 @@
 Financial Modeling Prep (FMP) Market Data Provider for Insider Trade Bot.
 
 Implements the provider-neutral MarketDataProvider contract for FMP stable API.
+Uses FMP's /historical-price-eod/non-split-adjusted endpoint to retrieve
+canonical as-traded historical OHLCV data without split or dividend adjustments.
 """
 
 from __future__ import annotations
@@ -22,6 +24,9 @@ from data.market_data_client import (
 class FMPMarketDataProvider:
     """
     Adapter implementing the MarketDataProvider contract for Financial Modeling Prep (FMP).
+
+    Target Endpoint: /historical-price-eod/non-split-adjusted
+    Retrieves canonical as-traded historical OHLCV prices.
     """
 
     def __init__(
@@ -95,9 +100,9 @@ class FMPMarketDataProvider:
         end_date: str | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Retrieve historical EOD market data for a single symbol from FMP.
+        Retrieve historical as-traded (non-split-adjusted) EOD market data for a single symbol from FMP.
 
-        Target Endpoint: /historical-price-eod/full
+        Target Endpoint: /historical-price-eod/non-split-adjusted
         Query Parameters: symbol, from (start_date), to (end_date), apikey
         """
         normalized_symbol = str(symbol).strip().upper()
@@ -123,7 +128,7 @@ class FMPMarketDataProvider:
                 raise ValueError("end_date cannot be empty.")
             params["to"] = norm_end
 
-        url = self._build_url("historical-price-eod/full", params)
+        url = self._build_url("historical-price-eod/non-split-adjusted", params)
 
         request = Request(
             url=url,
@@ -205,7 +210,6 @@ class FMPMarketDataProvider:
             if "historical" in payload:
                 raw_records = payload["historical"]
             else:
-                # Valid empty dictionary or non-historical container
                 raw_records = []
 
         elif isinstance(payload, list):
@@ -231,7 +235,7 @@ class FMPMarketDataProvider:
             item_symbol = str(item.get("symbol") or requested_symbol).strip().upper()
             price_date = item.get("date") or item.get("price_date") or item.get("priceDate")
 
-            # Extract OHLCV
+            # Extract unadjusted as-traded OHLCV
             open_price = item.get("open") if "open" in item else item.get("open_price")
             high_price = item.get("high") if "high" in item else item.get("high_price")
             low_price = item.get("low") if "low" in item else item.get("low_price")
