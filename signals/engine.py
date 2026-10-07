@@ -7,7 +7,8 @@ This module is strictly isolated from live execution and cannot place trades or 
 
 from __future__ import annotations
 
-import uuid
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -65,7 +66,11 @@ class SignalEngine:
             score = 0.0
             confidence = 0.0
 
-        signal_id = f"sig_{features.symbol}_{features.event_date}_{uuid.uuid4().hex[:8]}"
+        # Deterministic signal ID generated using SHA-256 digest of stable inputs
+        norm_snapshot = {k: round(v, 6) for k, v in sorted(feats.items())}
+        raw_identity_str = f"{features.symbol}:{features.event_date}:{direction}:{json.dumps(norm_snapshot, sort_keys=True)}"
+        digest = hashlib.sha256(raw_identity_str.encode("utf-8")).hexdigest()[:12]
+        signal_id = f"sig_{features.symbol}_{features.event_date}_{digest}"
 
         return SignalCandidate(
             signal_id=signal_id,

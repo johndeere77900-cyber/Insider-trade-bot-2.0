@@ -291,14 +291,8 @@ class S3SECArchive(SECArchiveInterface):
                         f"Concurrent upload conflict for period '{norm_period}': Archive already exists with different SHA-256."
                     ) from exc
 
-            # If client does not accept IfNoneMatch parameter in mock or unsupported S3, retry without parameter
-            if "ifnonematch" in exc_str or "unexpected keyword" in exc_str or "unknown parameter" in exc_str:
-                try:
-                    client.put_object(Bucket=self.bucket, Key=zip_key, Body=zip_bytes)
-                except Exception as inner_exc:
-                    raise ArchiveError(f"Failed to upload ZIP archive key '{zip_key}' in bucket '{self.bucket}': {inner_exc}") from inner_exc
-            else:
-                raise ArchiveError(f"Failed to upload ZIP archive key '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
+            # If client does not accept IfNoneMatch parameter in mock, fail safely with ArchiveError rather than falling back to unconditional overwrite
+            raise ArchiveError(f"Failed to upload ZIP archive key '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
 
         retrieved_at = datetime.now(timezone.utc).isoformat()
 

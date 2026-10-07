@@ -46,7 +46,10 @@ class FeatureEngine:
             raise ValueError("Event must contain a valid event_date.")
 
         # Extract insider transactions if present in context or event
-        history = ctx.get("historical_transactions") or event.get("historical_transactions") or [event]
+        has_history = ("historical_transactions" in ctx) or ("historical_transactions" in event)
+        history = ctx.get("historical_transactions") if "historical_transactions" in ctx else event.get("historical_transactions")
+        if not has_history:
+            history = [event]
 
         insider_tx_count = 0.0
         insider_buy_count = 0.0
@@ -63,9 +66,9 @@ class FeatureEngine:
                 if tx_symbol and tx_symbol != symbol:
                     continue
 
-                tx_date = str(tx.get("filing_date") or tx.get("transaction_date") or "").strip()
-                if not tx_date or tx_date > event_date:
-                    # Enforce strict point-in-time: no future data
+                # Enforce strict point-in-time: information availability is governed by filing_date <= event_date
+                tx_filing_date = str(tx.get("filing_date") or "").strip()
+                if not tx_filing_date or tx_filing_date > event_date:
                     continue
 
                 insider_tx_count += 1.0
@@ -83,8 +86,8 @@ class FeatureEngine:
                 if shares > 0 and price > 0:
                     total_tx_value += shares * price
 
-                if tx_date < event_date:
-                    prior_event_dates.append(tx_date)
+                if tx_filing_date < event_date:
+                    prior_event_dates.append(tx_filing_date)
 
         days_since_prior = -1.0
         if prior_event_dates:

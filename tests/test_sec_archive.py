@@ -210,7 +210,7 @@ def test_s3_archive_cases_a_through_f(tmp_path) -> None:
                 raise Exception("NotFound 404")
             return {}
 
-        def put_object(self, Bucket: str, Key: str, Body: bytes):
+        def put_object(self, Bucket: str, Key: str, Body: bytes, **kwargs):
             nonlocal fail_manifest_write
             if fail_manifest_write and Key.endswith(".json"):
                 raise ArchiveError("Simulated network failure on manifest upload")
