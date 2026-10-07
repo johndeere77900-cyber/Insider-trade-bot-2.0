@@ -31,7 +31,7 @@ from validation.records import validate_market_price
 
 
 class MarketDataLoadError(Exception):
-    """Raised when market-data loading fails abruptly."""
+    """Raised when market-data loading fails abruptly due to response envelope errors."""
 
 
 @dataclass(frozen=True)
@@ -48,21 +48,24 @@ class RecordLoadOutcome:
 
 def _extract_records(
     payload: Any,
-) -> list[Mapping[str, Any]]:
+) -> list[Any]:
     """
-    Extract market-price records from a provider response.
+    Extract market-price record elements from a provider response envelope.
 
     Supported response shapes:
 
         1. A direct list of records.
         2. A mapping containing a list under:
            data, results, prices, historical, or records.
+
+    Only invalid response envelopes raise MarketDataLoadError.
+    Individual element typing (e.g. non-Mapping) is deferred to record-level processing.
     """
 
     if isinstance(payload, list):
-        records = payload
+        return payload
 
-    elif isinstance(payload, Mapping):
+    if isinstance(payload, Mapping):
         records = None
 
         for key in (
@@ -84,23 +87,11 @@ def _extract_records(
                 "a supported record list."
             )
 
-    else:
-        raise MarketDataLoadError(
-            "Market-data response must be a list or mapping."
-        )
+        return records
 
-    normalized: list[Mapping[str, Any]] = []
-
-    for index, record in enumerate(records):
-        if not isinstance(record, Mapping):
-            raise MarketDataLoadError(
-                f"Market-price record {index} "
-                "is not an object."
-            )
-
-        normalized.append(record)
-
-    return normalized
+    raise MarketDataLoadError(
+        "Market-data response must be a list or mapping."
+    )
 
 
 def load_market_prices_detailed(
@@ -114,7 +105,7 @@ def load_market_prices_detailed(
     Normalize, validate, store, and provenance-track market-price records record-by-record.
 
     Returns:
-        Tuple of RecordLoadOutcome for every record in the response payload.
+        Tuple of RecordLoadOutcome for every record element in the response payload.
     """
 
     normalized_source = str(source).strip()
@@ -124,13 +115,27 @@ def load_market_prices_detailed(
             "source cannot be empty."
         )
 
-    records = _extract_records(payload)
+    raw_records = _extract_records(payload)
     outcomes: list[RecordLoadOutcome] = []
 
-    for index, raw_record in enumerate(records):
-        # Extract potential symbol for diagnostic reporting before full normalization
+    for index, raw_record in enumerate(raw_records):
+        if not isinstance(raw_record, Mapping):
+            outcomes.append(
+                RecordLoadOutcome(
+                    index=index,
+                    symbol=None,
+                    price_date=None,
+                    outcome="REJECTED",
+                    reason="Record is not an object/mapping.",
+                )
+            )
+            continue
+
+        # Extract potential symbol/date for diagnostic reporting before full normalization
         candidate_symbol = raw_record.get("symbol") or raw_record.get("ticker")
         sym_str = str(candidate_symbol).strip().upper() if candidate_symbol else None
+        candidate_date = raw_record.get("price_date") or raw_record.get("date")
+        date_str = str(candidate_date).strip() if candidate_date else None
 
         # 1. Normalization
         try:
@@ -143,7 +148,7 @@ def load_market_prices_detailed(
                 RecordLoadOutcome(
                     index=index,
                     symbol=sym_str,
-                    price_date=str(raw_record.get("price_date") or raw_record.get("date") or ""),
+                    price_date=date_str,
                     outcome="REJECTED",
                     reason=f"Normalization failed: {exc}",
                 )

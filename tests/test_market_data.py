@@ -356,6 +356,7 @@ def test_acquisition_single_and_multisymbol_accounting(tmp_path) -> None:
     assert report.records_rejected == 0
     assert report.records_failed == 0
     assert report.conflicts == 0
+    assert report.provider_request_failures == 0
     assert count_records(db_url, "market_prices") == 2
 
     # Deterministic Retry -> DUPLICATES
@@ -391,7 +392,6 @@ def test_acquisition_batch_supported_and_fallback(tmp_path) -> None:
     assert report.records_received == 2
     assert report.records_inserted == 2
     assert len(report.symbol_results) == 2
-    # Check per-symbol results
     aapl_res = next(r for r in report.symbol_results if r.symbol == "AAPL")
     assert aapl_res.records_received == 1
     assert aapl_res.records_inserted == 1
@@ -425,5 +425,154 @@ def test_acquisition_provider_failure_and_symbol_mismatch(tmp_path) -> None:
     service = MarketDataAcquisitionService(mock_provider)
     report = service.acquire_historical_data(db_url, symbols=["AAPL"])
 
-    assert report.records_failed == 1
+    assert report.records_received == 0
+    assert report.records_failed == 0
+    assert report.provider_request_failures == 1
     assert len(report.provider_failures) == 1
+
+
+# ==========================================
+# G. NEW SPECIFIC REGRESSION TESTS (A - E)
+# ==========================================
+
+def test_regression_a_malformed_record_isolation(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/malformed_iso_test.db"
+    initialize_database(db_url)
+
+    payload = [
+        {"symbol": "AAPL", "price_date": "2023-01-01", "close": 100.0},
+        {"symbol": "AAPL", "price_date": "2023-01-02", "close": 101.0},
+        "THIS IS NOT A RECORD",
+        {"symbol": "AAPL", "price_date": "2023-01-03", "close": 102.0},
+    ]
+
+    outcomes = load_market_prices_detailed(db_url, payload, source="src_iso")
+    assert len(outcomes) == 4
+    assert outcomes[0].outcome == "INSERTED"
+    assert outcomes[1].outcome == "INSERTED"
+    assert outcomes[2].outcome == "REJECTED"
+    assert outcomes[2].reason == "Record is not an object/mapping."
+    assert outcomes[3].outcome == "INSERTED"
+
+    assert count_records(db_url, "market_prices") == 3
+
+
+def test_regression_b_provider_failure_is_not_record_failure(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/prov_fail_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "failing_vendor"
+    mock_provider.supports_batch = False
+    mock_provider.get_historical_prices.side_effect = MarketDataRequestError("API Down")
+
+    service = MarketDataAcquisitionService(mock_provider)
+    report = service.acquire_historical_data(db_url, symbols=["AAPL"])
+
+    assert report.records_received == 0
+    assert report.records_inserted == 0
+    assert report.records_duplicate == 0
+    assert report.records_rejected == 0
+    assert report.conflicts == 0
+    assert report.records_failed == 0
+    assert report.provider_request_failures == 1
+
+    assert report.records_received == (
+        report.records_inserted
+        + report.records_duplicate
+        + report.records_rejected
+        + report.conflicts
+        + report.records_failed
+    )
+
+
+def test_regression_c_batch_failure_falls_back_to_individual_requests(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/batch_fallback_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "fallback_vendor"
+    mock_provider.supports_batch = True
+    mock_provider.get_historical_prices_batch.side_effect = MarketDataRequestError("Batch Endpoint Down")
+    mock_provider.get_historical_prices.side_effect = lambda symbol, **kwargs: [
+        {"symbol": symbol, "date": "2023-01-01", "close": 100.0}
+    ]
+
+    service = MarketDataAcquisitionService(mock_provider)
+    report = service.acquire_historical_data(db_url, symbols=["AAPL", "MSFT"])
+
+    assert mock_provider.get_historical_prices_batch.call_count == 1
+    assert mock_provider.get_historical_prices.call_count == 2
+
+    assert report.records_received == 2
+    assert report.records_inserted == 2
+    assert report.records_failed == 0
+    assert report.provider_request_failures == 1  # batch failure recorded
+    assert len(report.provider_failures) == 1
+
+
+def test_regression_d_one_individual_fallback_request_fails(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/partial_fallback_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "partial_vendor"
+    mock_provider.supports_batch = True
+    mock_provider.get_historical_prices_batch.side_effect = MarketDataRequestError("Batch Down")
+
+    def mock_get_single(symbol, **kwargs):
+        if symbol == "AAPL":
+            return [{"symbol": "AAPL", "date": "2023-01-01", "close": 150.0}]
+        raise MarketDataRequestError("MSFT Down")
+
+    mock_provider.get_historical_prices.side_effect = mock_get_single
+
+    service = MarketDataAcquisitionService(mock_provider)
+    report = service.acquire_historical_data(db_url, symbols=["AAPL", "MSFT"])
+
+    aapl_res = next(r for r in report.symbol_results if r.symbol == "AAPL")
+    assert aapl_res.records_received == 1
+    assert aapl_res.records_inserted == 1
+    assert aapl_res.record_failures == 0
+    assert aapl_res.provider_request_failures == 0
+
+    msft_res = next(r for r in report.symbol_results if r.symbol == "MSFT")
+    assert msft_res.records_received == 0
+    assert msft_res.record_failures == 0
+    assert msft_res.provider_request_failures == 1
+
+    assert report.records_received == 1
+    assert report.records_inserted == 1
+    assert report.records_failed == 0
+    assert report.provider_request_failures == 2  # 1 batch + 1 MSFT
+
+
+def test_regression_e_mixed_valid_malformed_batch_payload(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/mixed_batch_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "mixed_vendor"
+    mock_provider.supports_batch = True
+    mock_provider.get_historical_prices_batch.return_value = [
+        {"symbol": "AAPL", "date": "2023-01-01", "close": 150.0},
+        "bad record",
+        {"symbol": "MSFT", "date": "2023-01-01", "close": 250.0},
+    ]
+
+    service = MarketDataAcquisitionService(mock_provider)
+    report = service.acquire_historical_data(db_url, symbols=["AAPL", "MSFT"])
+
+    assert report.records_received == 3
+    assert report.records_inserted == 2
+    assert report.records_rejected == 1
+    assert report.conflicts == 0
+    assert report.records_failed == 0
+
+    assert report.records_received == (
+        report.records_inserted
+        + report.records_duplicate
+        + report.records_rejected
+        + report.conflicts
+        + report.records_failed
+    )
