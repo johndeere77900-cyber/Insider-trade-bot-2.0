@@ -506,24 +506,32 @@ def initialize_database(database_url: str) -> Any:
                     """
                     SELECT
                         i.relname AS index_name,
-                        ARRAY_AGG(a.attname::text) AS columns
+                        ARRAY(
+                            SELECT a.attname::text
+                            FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ord)
+                            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+                            ORDER BY k.ord
+                        ) AS columns
                     FROM pg_index x
                     JOIN pg_class t ON t.oid = x.indrelid
                     JOIN pg_class i ON i.oid = x.indexrelid
                     JOIN pg_namespace n ON t.relnamespace = n.oid
-                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(x.indkey)
                     LEFT JOIN pg_constraint c ON c.conindid = i.oid
                     WHERE n.nspname = 'public'
                       AND t.relname = 'corporate_actions'
                       AND x.indisunique = true
                       AND c.oid IS NULL
-                    GROUP BY i.relname;
+                      AND x.indpred IS NULL
+                      AND x.indexprs IS NULL
+                      AND x.indnkeyatts = 4
+                      AND x.indnatts = 4;
                     """
                 )
                 existing_idx_rows = cursor.fetchall()
-                existing_indexes = {row[0]: set(row[1]) for row in existing_idx_rows}
+                existing_indexes = {row[0]: list(row[1]) for row in existing_idx_rows}
 
                 target_cols = {"symbol", "action_type", "action_date", "source"}
+                target_ordered_cols = ["symbol", "action_type", "action_date", "source"]
 
                 identity_key_exists = (
                     "corporate_actions_identity_key" in existing_constraints
@@ -539,7 +547,7 @@ def initialize_database(database_url: str) -> Any:
 
                 matching_idx_name = None
                 for idx_name, idx_cols in existing_indexes.items():
-                    if idx_cols == target_cols:
+                    if list(idx_cols) == target_ordered_cols:
                         matching_idx_name = idx_name
                         break
 

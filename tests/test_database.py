@@ -358,3 +358,95 @@ def test_postgres_migration_test_e_enforces_uniqueness() -> None:
 
         assert exc_info.value.diag.constraint_name == "corporate_actions_identity_key"
         assert exc_info.value.diag.table_name == "corporate_actions"
+
+
+def test_postgres_migration_partial_unique_index_survives() -> None:
+    """
+    Regression test: A partial unique index on (symbol, action_type, action_date, source)
+    with a WHERE clause MUST NOT be deleted by migration.
+    """
+    import os
+    import pytest
+    from database.connection import connect, initialize_database, is_postgresql_url
+
+    pg_url = os.getenv("POSTGRES_TEST_URL") or os.getenv("DATABASE_URL", "")
+    if not is_postgresql_url(pg_url):
+        pytest.skip("PostgreSQL test database not available for migration testing.")
+
+    with connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS corporate_actions CASCADE;")
+            cur.execute(
+                """
+                CREATE TABLE corporate_actions (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    action_date TEXT NOT NULL,
+                    ratio TEXT,
+                    cash_amount DOUBLE PRECISION,
+                    source TEXT NOT NULL,
+                    raw_payload TEXT,
+                    record_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX partial_ca_idx
+                ON corporate_actions (symbol, action_type, action_date, source)
+                WHERE cash_amount IS NOT NULL;
+                """
+            )
+        conn.commit()
+
+    initialize_database(pg_url)
+
+    indexes = get_postgres_indexes(pg_url, "corporate_actions")
+    constraints = get_postgres_unique_constraints(pg_url, "corporate_actions")
+
+    assert "partial_ca_idx" in indexes
+    assert "corporate_actions_identity_key" in constraints
+
+
+def test_postgres_migration_included_columns_unique_index_survives() -> None:
+    """
+    Regression test: A unique index with key columns plus included non-key columns
+    MUST NOT be classified as the legacy identity index and MUST survive.
+    """
+    import os
+    import pytest
+    from database.connection import connect, initialize_database, is_postgresql_url
+
+    pg_url = os.getenv("POSTGRES_TEST_URL") or os.getenv("DATABASE_URL", "")
+    if not is_postgresql_url(pg_url):
+        pytest.skip("PostgreSQL test database not available for migration testing.")
+
+    with connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS corporate_actions CASCADE;")
+            cur.execute(
+                """
+                CREATE TABLE corporate_actions (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    action_date TEXT NOT NULL,
+                    ratio TEXT,
+                    cash_amount DOUBLE PRECISION,
+                    source TEXT NOT NULL,
+                    raw_payload TEXT,
+                    record_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX extended_ca_idx
+                ON corporate_actions (symbol, action_type, action_date, source)
+                INCLUDE (cash_amount);
+                """
+            )
+        conn.commit()
+
+    initialize_database(pg_url)
+
+    indexes = get_postgres_indexes(pg_url, "corporate_actions")
+    constraints = get_postgres_unique_constraints(pg_url, "corporate_actions")
+
+    assert "extended_ca_idx" in indexes
+    assert "corporate_actions_identity_key" in constraints

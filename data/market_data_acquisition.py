@@ -16,12 +16,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Sequence
+from urllib.error import HTTPError, URLError
 
-from data.market_data_client import MarketDataProvider
+from data.market_data_client import MarketDataClientError, MarketDataProvider
 from data.market_data_loader import (
     MarketDataLoadError,
     RecordLoadOutcome,
     load_market_prices_detailed,
+)
+
+PROVIDER_FETCH_EXCEPTIONS = (
+    MarketDataClientError,
+    TimeoutError,
+    URLError,
+    HTTPError,
+    OSError,
 )
 
 
@@ -158,7 +167,7 @@ class MarketDataAcquisitionService:
                     start_date=start_date,
                     end_date=end_date,
                 )
-            except Exception as exc:
+            except PROVIDER_FETCH_EXCEPTIONS as exc:
                 err_msg = str(exc)
                 total_provider_request_failures += 1
                 provider_failures.append({"type": "batch", "symbols": requested_symbols, "error": err_msg})
@@ -199,7 +208,7 @@ class MarketDataAcquisitionService:
                             start_date=start_date,
                             end_date=end_date,
                         )
-                    except Exception as exc:
+                    except PROVIDER_FETCH_EXCEPTIONS as exc:
                         err_msg = str(exc)
                         total_provider_request_failures += 1
                         symbol_counts[sym]["provider_request_failures"] += 1
@@ -235,7 +244,7 @@ class MarketDataAcquisitionService:
                         start_date=start_date,
                         end_date=end_date,
                     )
-                except Exception as exc:
+                except PROVIDER_FETCH_EXCEPTIONS as exc:
                     err_msg = str(exc)
                     total_provider_request_failures += 1
                     symbol_counts[sym]["provider_request_failures"] += 1
