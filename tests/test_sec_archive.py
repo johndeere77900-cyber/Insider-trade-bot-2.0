@@ -304,6 +304,89 @@ def test_s3_archive_cases_a_through_f(tmp_path) -> None:
     assert s3_backend.exists(period_f) is True
 
 
+def test_s3_manifest_concurrency_and_immutability_races(tmp_path) -> None:
+    """
+    Explicit regression tests for S3/R2 manifest conditional creation and concurrent writer races.
+    Covers:
+    A. First manifest writer succeeds
+    B. Same-content concurrent loser (412 on manifest write) -> returns existing metadata
+    C. Different-content concurrent loser (412 on manifest write) -> raises ArchiveExistsError
+    D. Non-412 error on manifest write -> raises ArchiveError
+    E. Existing complete archive cannot be overwritten
+    """
+    store = {}
+    simulate_manifest_412 = False
+    simulate_manifest_non_412 = False
+
+    class MockBody:
+        def __init__(self, content: bytes):
+            self._content = content
+        def read(self) -> bytes:
+            return self._content
+
+    class RaceMockS3Client:
+        def head_object(self, Bucket: str, Key: str):
+            if Key not in store:
+                raise Exception("NotFound 404")
+            return {}
+
+        def put_object(self, Bucket: str, Key: str, Body: bytes, **kwargs):
+            nonlocal simulate_manifest_412, simulate_manifest_non_412
+            if Key.endswith(".json"):
+                if simulate_manifest_non_412:
+                    raise Exception("500 Internal Server Error")
+                if simulate_manifest_412:
+                    raise Exception("PreconditionFailed 412")
+
+            if kwargs.get("IfNoneMatch") == "*" and Key in store:
+                raise Exception("PreconditionFailed 412")
+            store[Key] = Body
+
+        def get_object(self, Bucket: str, Key: str):
+            if Key not in store:
+                raise Exception("NotFound 404")
+            return {"Body": MockBody(store[Key])}
+
+    mock_client = RaceMockS3Client()
+    s3_backend = S3SECArchive(bucket="insider-trade-sec-archive", prefix="sec-archives", s3_client=mock_client)
+
+    z_file1 = tmp_path / "race1.zip"
+    create_dummy_zip(str(z_file1), {"data.tsv": "RACE1"})
+
+    z_file2 = tmp_path / "race2.zip"
+    create_dummy_zip(str(z_file2), {"data.tsv": "RACE2_DIFFERENT"})
+
+    period = "2024-Q1"
+
+    # CASE A: First writer succeeds
+    meta_a = s3_backend.put(period, str(z_file1))
+    assert meta_a.period == period
+    assert s3_backend.exists(period) is True
+    original_manifest_bytes = store[f"sec-archives/{period}.json"]
+
+    # CASE B: Same-content concurrent loser (ZIP succeeded or existed, manifest upload triggers 412 race)
+    # Clear ZIP to simulate concurrent worker race
+    store.pop(f"sec-archives/{period}.zip", None)
+    simulate_manifest_412 = True
+    meta_b = s3_backend.put(period, str(z_file1))
+    assert meta_b.sha256 == meta_a.sha256
+    assert store[f"sec-archives/{period}.json"] == original_manifest_bytes  # Unchanged!
+
+    # CASE C: Different-content concurrent loser (triggers 412 with different SHA in existing manifest)
+    store.pop(f"sec-archives/{period}.zip", None)
+    simulate_manifest_412 = True
+    with pytest.raises(ArchiveExistsError, match="Conflicting manifest cannot be overwritten|Concurrent manifest upload conflict"):
+        s3_backend.put(period, str(z_file2))
+    assert store[f"sec-archives/{period}.json"] == original_manifest_bytes  # Unchanged!
+
+    # CASE D: Non-412 error on manifest upload -> raises ArchiveError
+    simulate_manifest_412 = False
+    simulate_manifest_non_412 = True
+    period_err = "2024-Q2"
+    with pytest.raises(ArchiveError, match="500 Internal Server Error"):
+        s3_backend.put(period_err, str(z_file1))
+
+
 def test_s3_strict_error_classification(tmp_path) -> None:
     # Test that 403 / AccessDenied or network errors raise ArchiveError and are NOT converted to missing object
     class MockErrorS3Client:

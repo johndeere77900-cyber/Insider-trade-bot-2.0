@@ -65,15 +65,19 @@ def verify_dataset_coverage(
     database_url: str,
     dataset_type: str,
     period: str,
+    expected_records: Optional[int] = None,
+    has_independent_coverage_contract: bool = False,
 ) -> DatasetCoverage:
     """
     Verify actual rows and metadata in storage for the requested dataset and period.
 
-    Uses parameterized SQL and compares:
-    - ingestion_state status
-    - expected record count
-    - actual record count
-    - first date and last date
+    Non-Circular Completeness Contract:
+    - records_inserted/parsed from ingestion_state are recorded as metadata only.
+    - They do NOT independently prove dataset completeness.
+    - Dataset is complete ONLY when status == 'COMPLETED', actual rows exist within
+      the requested quarter boundaries, AND an independent expected coverage contract exists
+      and is satisfied by actual records.
+    - If no independent coverage contract exists, complete = False.
 
     Raises DatasetIntegrityError if dataset storage contract is violated.
     """
@@ -142,14 +146,9 @@ def verify_dataset_coverage(
         status == "COMPLETED"
         and actual_records > 0
         and has_valid_dates
+        and has_independent_coverage_contract
         and (expected_records is None or actual_records >= expected_records)
     )
-
-    if not is_complete:
-        raise DatasetIntegrityError(
-            f"Dataset coverage verification failed for {norm_type} period '{norm_period}': "
-            f"status='{status}', expected={expected_records}, actual={actual_records}."
-        )
 
     return DatasetCoverage(
         dataset_type=norm_type,
@@ -158,7 +157,7 @@ def verify_dataset_coverage(
         actual_records=actual_records,
         first_date=first_date,
         last_date=last_date,
-        complete=True,
+        complete=is_complete,
     )
 
 
