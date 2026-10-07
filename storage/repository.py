@@ -713,18 +713,48 @@ def store_corporate_action(
             connection.commit()
             return record_hash, "INSERTED"
 
-        except INTEGRITY_ERRORS:
+        except INTEGRITY_ERRORS as exc:
             connection.rollback()
-            cursor = connection.execute(
-                select_sql,
-                (norm_symbol, norm_action_type, norm_action_date, norm_source),
-            )
-            race_existing = cursor.fetchone()
-            if race_existing is not None:
-                race_hash = _row_value(race_existing, "record_hash", index=0)
-                if race_hash == record_hash:
-                    return record_hash, "DUPLICATE"
-                return record_hash, "CONFLICT"
+
+            is_expected_unique_race = False
+
+            if PSYCOPG_INTEGRITY_ERRORS and isinstance(exc, PSYCOPG_INTEGRITY_ERRORS):
+                pgcode = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+                if pgcode == "23505" or (
+                    hasattr(psycopg.errors, "UniqueViolation")
+                    and isinstance(exc, psycopg.errors.UniqueViolation)
+                ):
+                    diag_table = getattr(getattr(exc, "diag", None), "table_name", "") or ""
+                    diag_constraint = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+                    exc_str = str(exc).lower()
+                    if (
+                        not diag_table
+                        and not diag_constraint
+                    ) or (
+                        "corporate_actions" in diag_table
+                        or "corporate_actions" in diag_constraint
+                        or "corporate_actions" in exc_str
+                    ):
+                        is_expected_unique_race = True
+            elif isinstance(exc, sqlite3.IntegrityError):
+                msg = str(exc).lower()
+                if "unique" in msg and not any(
+                    k in msg for k in ("foreign key", "not null", "check constraint")
+                ):
+                    is_expected_unique_race = True
+
+            if is_expected_unique_race:
+                cursor = connection.execute(
+                    select_sql,
+                    (norm_symbol, norm_action_type, norm_action_date, norm_source),
+                )
+                race_existing = cursor.fetchone()
+                if race_existing is not None:
+                    race_hash = _row_value(race_existing, "record_hash", index=0)
+                    if race_hash == record_hash:
+                        return record_hash, "DUPLICATE"
+                    return record_hash, "CONFLICT"
+
             raise
 
 

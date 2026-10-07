@@ -321,6 +321,44 @@ class MockConnectionWrapper:
         return self._conn.__exit__(exc_type, exc_val, exc_tb)
 
 
+class MockRaceConnectionWrapper:
+    """Simulates a race condition where initial SELECT sees nothing, but INSERT raises an error."""
+
+    def __init__(self, real_conn, err_to_raise):
+        self._conn = real_conn
+        self._err = err_to_raise
+        self._select_count = 0
+
+    def execute(self, sql, params=()):
+        if "SELECT record_hash" in sql and "FROM corporate_actions" in sql:
+            self._select_count += 1
+            if self._select_count == 1:
+                class EmptyCursor:
+                    def fetchone(self):
+                        return None
+                return EmptyCursor()
+
+        if "INSERT INTO corporate_actions" in sql:
+            raise self._err
+
+        return self._conn.execute(sql, params)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._conn.__exit__(exc_type, exc_val, exc_tb)
+
+
 def test_store_corporate_action_outcomes(tmp_path) -> None:
     """Storage-level tests for store_corporate_action (INSERTED, DUPLICATE, CONFLICT)."""
     db_url = f"sqlite:///{tmp_path}/ca_storage_test.db"
@@ -402,7 +440,7 @@ def test_store_corporate_action_unique_constraint_race_cases(tmp_path) -> None:
     integrity_err = sqlite3.IntegrityError("UNIQUE constraint failed: corporate_actions.symbol, corporate_actions.action_type, corporate_actions.action_date, corporate_actions.source")
 
     def mock_connect_a(url):
-        return MockConnectionWrapper(real_connect(url), err_to_raise=integrity_err)
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=integrity_err)
 
     with patch("storage.repository.connect", side_effect=mock_connect_a):
         hash_res_a, outcome_a = store_corporate_action(
@@ -423,7 +461,7 @@ def test_store_corporate_action_unique_constraint_race_cases(tmp_path) -> None:
     raw_diff = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "10:1", "source": "fmp"}
 
     def mock_connect_b(url):
-        return MockConnectionWrapper(real_connect(url), err_to_raise=sqlite3.IntegrityError("UNIQUE constraint failed"))
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=sqlite3.IntegrityError("UNIQUE constraint failed"))
 
     with patch("storage.repository.connect", side_effect=mock_connect_b):
         hash_res_b, outcome_b = store_corporate_action(
@@ -468,6 +506,61 @@ def test_unrelated_integrity_error_propagates(tmp_path) -> None:
                 source="fmp",
                 raw_payload=raw,
             )
+
+
+def test_unrelated_integrity_error_does_not_mask_existing_identity(tmp_path) -> None:
+    """
+    Regression test proving that when a corporate-action identity ALREADY EXISTS,
+    an unrelated IntegrityError (e.g., FOREIGN KEY failure) on a second write attempt
+    is re-raised and NOT converted into DUPLICATE or CONFLICT.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_unrelated_integrity_mask_test.db"
+    initialize_database(db_url)
+
+    raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
+
+    # 1. Insert a valid corporate action first
+    h1, o1 = store_corporate_action(
+        db_url,
+        symbol="AAPL",
+        action_type="split",
+        action_date="2020-08-31",
+        ratio="4:1",
+        cash_amount=None,
+        source="fmp",
+        raw_payload=raw1,
+    )
+    assert o1 == "INSERTED"
+    assert count_records(db_url, "corporate_actions") == 1
+
+    # 2. Simulate an unrelated IntegrityError on second write during race
+    real_connect = connect
+    foreign_key_err = sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+
+    def mock_connect_fk(url):
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=foreign_key_err)
+
+    with patch("storage.repository.connect", side_effect=mock_connect_fk):
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+            store_corporate_action(
+                db_url,
+                symbol="AAPL",
+                action_type="split",
+                action_date="2020-08-31",
+                ratio="4:1",
+                cash_amount=None,
+                source="fmp",
+                raw_payload=raw1,
+            )
+
+    # 3. Assert existing row remains unchanged
+    with connect(db_url) as conn:
+        cursor = conn.execute("SELECT ratio FROM corporate_actions WHERE symbol = 'AAPL' AND action_date = '2020-08-31'")
+        row = cursor.fetchone()
+        assert row is not None
+        assert row[0] == "4:1"
+
+    assert count_records(db_url, "corporate_actions") == 1
 
 
 def test_store_corporate_action_non_integrity_failure_propagates(tmp_path) -> None:
