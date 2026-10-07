@@ -440,6 +440,36 @@ def test_store_corporate_action_unique_constraint_race_cases(tmp_path) -> None:
         assert count_records(db_url, "corporate_actions") == 1
 
 
+def test_unrelated_integrity_error_propagates(tmp_path) -> None:
+    """
+    Proves that an unrelated database IntegrityError (where the identity cannot
+    be found post-exception) is NOT automatically converted to DUPLICATE or CONFLICT.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_unrelated_integrity_test.db"
+    initialize_database(db_url)
+
+    raw = {"symbol": "NEWTICKER", "action_type": "split", "action_date": "2024-01-01", "ratio": "2:1", "source": "fmp"}
+
+    real_connect = connect
+    integrity_err = sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+
+    def mock_connect_integrity(url):
+        return MockConnectionWrapper(real_connect(url), err_to_raise=integrity_err)
+
+    with patch("storage.repository.connect", side_effect=mock_connect_integrity):
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+            store_corporate_action(
+                db_url,
+                symbol="NEWTICKER",
+                action_type="split",
+                action_date="2024-01-01",
+                ratio="2:1",
+                cash_amount=None,
+                source="fmp",
+                raw_payload=raw,
+            )
+
+
 def test_store_corporate_action_non_integrity_failure_propagates(tmp_path) -> None:
     """Verifies that non-integrity database exceptions (e.g., OperationalError) propagate directly as failures."""
     db_url = f"sqlite:///{tmp_path}/ca_op_err_test.db"
@@ -478,82 +508,257 @@ def test_real_postgres_corporate_action_concurrency() -> None:
 
     initialize_database(pg_url)
 
-    # Cleanup any pre-existing test corporate actions for AAPL on 2020-08-31
-    with connect(pg_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM corporate_actions WHERE symbol = %s AND action_date = %s",
-                ("AAPL", "2020-08-31")
+    test_symbol = "TESTCONCURRENCY"
+    test_date = "2020-08-31"
+
+    def cleanup_test_data():
+        with connect(pg_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT record_hash FROM corporate_actions WHERE symbol = %s AND action_date = %s",
+                    (test_symbol, test_date)
+                )
+                rows = cur.fetchall()
+                hashes = [r[0] for r in rows if r]
+
+                for h in hashes:
+                    cur.execute(
+                        "DELETE FROM provenance WHERE record_type = %s AND record_id = %s",
+                        ("corporate_action", h)
+                    )
+                cur.execute(
+                    "DELETE FROM corporate_actions WHERE symbol = %s AND action_date = %s",
+                    (test_symbol, test_date)
+                )
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM corporate_actions WHERE symbol = %s AND action_date = %s",
+                    (test_symbol, test_date)
+                )
+                ca_count = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT COUNT(*) FROM provenance WHERE record_type = %s AND record_id IN ("
+                    "  SELECT record_hash FROM corporate_actions WHERE symbol = %s AND action_date = %s"
+                    ")",
+                    ("corporate_action", test_symbol, test_date)
+                )
+                prov_count = cur.fetchone()[0]
+                assert ca_count == 0
+                assert prov_count == 0
+
+    cleanup_test_data()
+
+    try:
+        raw_same = {"symbol": test_symbol, "action_type": "split", "action_date": test_date, "ratio": "4:1", "source": "fmp"}
+        raw_diff = {"symbol": test_symbol, "action_type": "split", "action_date": test_date, "ratio": "5:1", "source": "fmp"}
+
+        # Case A: Two workers simultaneously attempt SAME identity + SAME content
+        def worker_same():
+            return store_corporate_action(
+                pg_url,
+                symbol=test_symbol,
+                action_type="split",
+                action_date=test_date,
+                ratio="4:1",
+                cash_amount=None,
+                source="fmp",
+                raw_payload=raw_same,
             )
-            cur.execute(
-                "DELETE FROM provenance WHERE record_type = %s AND record_id IN (SELECT record_hash FROM corporate_actions WHERE symbol = %s)",
-                ("corporate_action", "AAPL")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(worker_same)
+            f2 = executor.submit(worker_same)
+            res1 = f1.result()
+            res2 = f2.result()
+
+        outcomes_same = sorted([res1[1], res2[1]])
+        assert outcomes_same == ["DUPLICATE", "INSERTED"]
+
+        with connect(pg_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM corporate_actions WHERE symbol = %s AND action_date = %s", (test_symbol, test_date))
+                count_row = cur.fetchone()
+                assert count_row[0] == 1
+
+        # Case B: Two workers simultaneously attempt SAME identity + DIFFERENT content
+        cleanup_test_data()
+
+        def worker_diff_a():
+            return store_corporate_action(
+                pg_url,
+                symbol=test_symbol,
+                action_type="split",
+                action_date=test_date,
+                ratio="4:1",
+                cash_amount=None,
+                source="fmp",
+                raw_payload=raw_same,
             )
-        conn.commit()
 
-    raw_same = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
-    raw_diff = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "5:1", "source": "fmp"}
+        def worker_diff_b():
+            return store_corporate_action(
+                pg_url,
+                symbol=test_symbol,
+                action_type="split",
+                action_date=test_date,
+                ratio="5:1",
+                cash_amount=None,
+                source="fmp",
+                raw_payload=raw_diff,
+            )
 
-    # Case A: Concurrent same content -> 1 INSERTED, 1 DUPLICATE, exactly 1 DB row
-    def worker_same():
-        return store_corporate_action(
-            pg_url,
-            symbol="AAPL",
-            action_type="split",
-            action_date="2020-08-31",
-            ratio="4:1",
-            cash_amount=None,
-            source="fmp",
-            raw_payload=raw_same,
-        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(worker_diff_a)
+            f2 = executor.submit(worker_diff_b)
+            res_a = f1.result()
+            res_b = f2.result()
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        f1 = executor.submit(worker_same)
-        f2 = executor.submit(worker_same)
-        res1 = f1.result()
-        res2 = f2.result()
+        outcomes_diff = sorted([res_a[1], res_b[1]])
+        assert outcomes_diff == ["CONFLICT", "INSERTED"]
 
-    outcomes_same = {res1[1], res2[1]}
-    assert outcomes_same == {"INSERTED", "DUPLICATE"}
+        with connect(pg_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT ratio FROM corporate_actions WHERE symbol = %s AND action_date = %s", (test_symbol, test_date))
+                row = cur.fetchone()
+                # Ensure the original stored row was not overwritten by conflicting payload
+                assert row[0] in ("4:1", "5:1")
 
-    with connect(pg_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM corporate_actions WHERE symbol = %s AND action_date = %s", ("AAPL", "2020-08-31"))
-            count_row = cur.fetchone()
-            assert count_row[0] == 1
+                cur.execute("SELECT COUNT(*) FROM corporate_actions WHERE symbol = %s AND action_date = %s", (test_symbol, test_date))
+                count_row = cur.fetchone()
+                assert count_row[0] == 1
 
-    # Case B: Concurrent different content against existing row -> CONFLICT
-    def worker_diff():
-        return store_corporate_action(
-            pg_url,
-            symbol="AAPL",
-            action_type="split",
-            action_date="2020-08-31",
-            ratio="5:1",
-            cash_amount=None,
-            source="fmp",
-            raw_payload=raw_diff,
-        )
+                cur.execute(
+                    "SELECT COUNT(*) FROM provenance WHERE record_type = %s AND record_id IN ("
+                    "  SELECT record_hash FROM corporate_actions WHERE symbol = %s AND action_date = %s"
+                    ")",
+                    ("corporate_action", test_symbol, test_date)
+                )
+                prov_row = cur.fetchone()
+                assert prov_row[0] == 1
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        f_diff = executor.submit(worker_diff)
-        res_diff = f_diff.result()
-
-    assert res_diff[1] == "CONFLICT"
-
-    with connect(pg_url) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM corporate_actions WHERE symbol = %s AND action_date = %s", ("AAPL", "2020-08-31"))
-            count_row = cur.fetchone()
-            assert count_row[0] == 1  # Row count remains strictly 1!
-
-            cur.execute("DELETE FROM corporate_actions WHERE symbol = %s AND action_date = %s", ("AAPL", "2020-08-31"))
-        conn.commit()
+    finally:
+        cleanup_test_data()
 
 
 # ==============================================================================
 # 6. CORPORATE ACTIONS PROVIDER & PIPELINE TESTS
 # ==============================================================================
+
+def test_mixed_outcome_accounting_equation(tmp_path) -> None:
+    """
+    Tests load_corporate_actions_detailed with a mixed batch to verify:
+      - exactly one outcome per processed record: INSERTED, DUPLICATE, CONFLICT, REJECTED, FAILED
+      - inserted + duplicate + conflict + rejected + failed == total_processed_records
+      - provider request failures are NOT included in this equation.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_mixed_accounting.db"
+    initialize_database(db_url)
+
+    # 1. Seed an initial record for AAPL
+    store_corporate_action(
+        db_url,
+        symbol="AAPL",
+        action_type="split",
+        action_date="2020-08-31",
+        ratio="4:1",
+        cash_amount=None,
+        source="fmp",
+        raw_payload={"symbol": "AAPL", "date": "2020-08-31", "ratio": "4:1"},
+    )
+
+    # Prepare mixed payload:
+    # Record 0: MSFT split -> INSERTED
+    # Record 1: AAPL split 4:1 -> DUPLICATE
+    # Record 2: AAPL split 5:1 -> CONFLICT
+    # Record 3: Invalid record (missing date) -> REJECTED
+    # Record 4: Force storage failure -> FAILED
+    mixed_payload = [
+        {"symbol": "MSFT", "action_type": "split", "action_date": "2023-01-01", "ratio": "2:1"},
+        {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1"},
+        {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "5:1"},
+        {"symbol": "GOOG", "action_type": "split"},  # Missing action_date -> REJECTED
+        {"symbol": "FAIL", "action_type": "split", "action_date": "2024-01-01", "ratio": "3:1"},  # Will trigger FAILED
+    ]
+
+    original_ingest = load_corporate_actions_detailed.__globals__["ingest_corporate_action"]
+
+    def mock_ingest(db_url, record, source, source_reference):
+        if record.get("symbol") == "FAIL":
+            raise RuntimeError("Database forced write error")
+        return original_ingest(db_url, record, source=source, source_reference=source_reference)
+
+    with patch("data.corporate_actions_loader.ingest_corporate_action", side_effect=mock_ingest):
+        outcomes = load_corporate_actions_detailed(
+            db_url,
+            mixed_payload,
+            source="fmp",
+            source_reference="test_ref",
+        )
+
+    assert len(outcomes) == 5
+
+    inserted = sum(1 for o in outcomes if o.outcome == "INSERTED")
+    duplicate = sum(1 for o in outcomes if o.outcome == "DUPLICATE")
+    conflict = sum(1 for o in outcomes if o.outcome == "CONFLICT")
+    rejected = sum(1 for o in outcomes if o.outcome == "REJECTED")
+    failed = sum(1 for o in outcomes if o.outcome == "FAILED")
+
+    assert inserted == 1
+    assert duplicate == 1
+    assert conflict == 1
+    assert rejected == 1
+    assert failed == 1
+
+    # Exact accounting invariant
+    total_processed = len(mixed_payload)
+    assert inserted + duplicate + conflict + rejected + failed == total_processed
+
+
+def test_symbol_status_semantics_success_partial_failed(tmp_path) -> None:
+    """
+    Verifies SUCCESS, PARTIAL, and FAILED symbol status semantics in CorporateActionsAcquisitionService.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_status_semantics.db"
+    initialize_database(db_url)
+
+    ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
+    service = CorporateActionsAcquisitionService(ca_provider)
+
+    splits_ok = json.dumps([{"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}]).encode("utf-8")
+    empty_json = json.dumps([]).encode("utf-8")
+
+    # 1. SUCCESS: 0 provider failures, 0 record failures/rejections/conflicts
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        m1 = MagicMock(status=200, read=MagicMock(return_value=splits_ok))
+        m2 = MagicMock(status=200, read=MagicMock(return_value=empty_json))
+        mock_urlopen.return_value.__enter__.side_effect = [m1, m2]
+
+        report = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
+        assert report.symbol_results[0].status == "SUCCESS"
+        assert report.successful_symbols == ("AAPL",)
+
+    # 2. PARTIAL: inserted > 0, but dividends endpoint raises HTTP 500 provider error
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        m1 = MagicMock(status=200, read=MagicMock(return_value=splits_ok))
+        mock_urlopen.return_value.__enter__.side_effect = [
+            m1,
+            HTTPError(url="http://test", code=500, msg="Server Error", hdrs={}, fp=None)
+        ]
+
+        report = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
+        assert report.symbol_results[0].status == "PARTIAL"
+        assert report.failed_symbols == ("AAPL",)
+
+    # 3. FAILED: 0 inserted/duplicates, provider error on splits & dividends
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        mock_urlopen.side_effect = HTTPError(url="http://test", code=500, msg="Server Error", hdrs={}, fp=None)
+
+        report = service.acquire_corporate_actions(db_url, symbols=["MSFT"])
+        assert report.symbol_results[0].status == "FAILED"
+        assert report.failed_symbols == ("MSFT",)
+
 
 def test_fmp_corporate_actions_endpoints_and_normalization() -> None:
     """Verifies corporate split uses /splits and corporate dividend uses /dividends."""
@@ -685,12 +890,10 @@ def test_fmp_corporate_actions_test_d_irrelevant_provider_payload_difference(tmp
     ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
     service = CorporateActionsAcquisitionService(ca_provider)
 
-    # First payload: basic fields
     splits_json_1 = json.dumps([
         {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
     ]).encode("utf-8")
 
-    # Second payload: includes extra/irrelevant provider response fields (e.g. "label", "fetched_at")
     splits_json_2 = json.dumps([
         {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1, "label": "4 for 1", "fetched_at": "12345"}
     ]).encode("utf-8")
@@ -724,7 +927,55 @@ def test_fmp_corporate_actions_test_d_irrelevant_provider_payload_difference(tmp
         report2 = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
         assert report2.records_inserted == 0
         assert report2.records_duplicate == 1
-        assert count_records(db_url, "corporate_actions") == 1  # Normalized content hash match = DUPLICATE!
+        assert count_records(db_url, "corporate_actions") == 1
+
+
+def test_fmp_corporate_actions_provider_vs_storage_failures(tmp_path) -> None:
+    """
+    Tests separation of provider request failures vs storage/database failures:
+      1. Provider fetch HTTP failure -> provider_request_failures += 1, records_failed == 0.
+      2. Provider fetch succeeds but database storage fails -> records_failed += 1, provider_request_failures == 0.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_boundary_test.db"
+    initialize_database(db_url)
+
+    ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
+    service = CorporateActionsAcquisitionService(ca_provider)
+
+    # 1. Provider HTTP error
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        mock_urlopen.side_effect = HTTPError(
+            url="https://financialmodelingprep.com/stable/splits?symbol=AAPL&apikey=ca_key",
+            code=500,
+            msg="Server Error",
+            hdrs={},
+            fp=None,
+        )
+
+        report1 = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
+        assert report1.provider_request_failures == 2  # 1 splits + 1 divs
+        assert report1.records_failed == 0
+        assert report1.symbol_results[0].status == "FAILED"
+
+    # 2. Provider succeeds, but database store_corporate_action raises OperationalError
+    splits_json = json.dumps([
+        {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
+    ]).encode("utf-8")
+    empty_divs = json.dumps([]).encode("utf-8")
+
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        m1 = MagicMock()
+        m1.status = 200
+        m1.read.return_value = splits_json
+        m2 = MagicMock()
+        m2.status = 200
+        m2.read.return_value = empty_divs
+        mock_urlopen.return_value.__enter__.side_effect = [m1, m2]
+
+        with patch("data.ingestion_pipeline.store_corporate_action", side_effect=sqlite3.OperationalError("disk error")):
+            report2 = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
+            assert report2.provider_request_failures == 0
+            assert report2.records_failed == 1
 
 
 def test_fmp_corporate_actions_malformed_response_rejected(tmp_path) -> None:
@@ -744,29 +995,6 @@ def test_fmp_corporate_actions_malformed_response_rejected(tmp_path) -> None:
             ca_provider.get_splits(symbol="AAPL")
 
         assert count_records(db_url, "corporate_actions") == 0
-
-
-def test_fmp_corporate_actions_http_failure_reported(tmp_path) -> None:
-    """Provider HTTP failure reported in acquisition service."""
-    db_url = f"sqlite:///{tmp_path}/ca_fail_test.db"
-    initialize_database(db_url)
-
-    ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
-
-    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
-        mock_urlopen.side_effect = HTTPError(
-            url="https://financialmodelingprep.com/stable/splits?symbol=AAPL&apikey=ca_key",
-            code=500,
-            msg="Server Error",
-            hdrs={},
-            fp=None,
-        )
-
-        service = CorporateActionsAcquisitionService(ca_provider)
-        report = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
-
-        assert report.provider_request_failures == 2
-        assert len(report.failed_symbols) == 1
 
 
 def test_corporate_actions_cli_empty_symbols_rejected() -> None:

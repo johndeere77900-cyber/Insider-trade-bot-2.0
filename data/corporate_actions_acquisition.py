@@ -128,15 +128,31 @@ class CorporateActionsAcquisitionService:
 
             source_ref = f"fmp_corporate_actions:{sym}:{start_date or 'ALL'}:{end_date or 'ALL'}"
 
-            # 1. Fetch & ingest splits
+            # 1. Fetch splits (provider errors ONLY)
+            split_records: list[dict[str, Any]] | None = None
             try:
                 split_records = self.provider.get_splits(
                     symbol=sym,
                     start_date=start_date,
                     end_date=end_date,
                 )
-                sym_splits = len(split_records)
-                if split_records:
+                sym_splits = len(split_records) if split_records else 0
+            except Exception as exc:
+                err_msg = f"Splits provider error: {exc}"
+                sym_errors.append(err_msg)
+                sym_provider_fail += 1
+                provider_failures_list.append(
+                    {
+                        "symbol": sym,
+                        "action": "splits",
+                        "error": str(exc),
+                    }
+                )
+                split_records = None
+
+            # Ingest splits (storage/processing errors MUST NOT become provider failures)
+            if split_records:
+                try:
                     outcomes = load_corporate_actions_detailed(
                         database_url,
                         split_records,
@@ -154,22 +170,35 @@ class CorporateActionsAcquisitionService:
                             sym_rejected += 1
                         elif o.outcome == "FAILED":
                             sym_failed += 1
+                except Exception as exc:
+                    sym_failed += len(split_records)
+                    sym_errors.append(f"Splits ingestion error: {exc}")
 
-            except Exception as exc:
-                err_msg = f"Splits fetch/ingest error: {exc}"
-                sym_errors.append(err_msg)
-                sym_provider_fail += 1
-                provider_failures_list.append({"symbol": sym, "action": "splits", "error": str(exc)})
-
-            # 2. Fetch & ingest dividends
+            # 2. Fetch dividends (provider errors ONLY)
+            div_records: list[dict[str, Any]] | None = None
             try:
                 div_records = self.provider.get_dividends(
                     symbol=sym,
                     start_date=start_date,
                     end_date=end_date,
                 )
-                sym_dividends = len(div_records)
-                if div_records:
+                sym_dividends = len(div_records) if div_records else 0
+            except Exception as exc:
+                err_msg = f"Dividends provider error: {exc}"
+                sym_errors.append(err_msg)
+                sym_provider_fail += 1
+                provider_failures_list.append(
+                    {
+                        "symbol": sym,
+                        "action": "dividends",
+                        "error": str(exc),
+                    }
+                )
+                div_records = None
+
+            # Ingest dividends (storage/processing errors MUST NOT become provider failures)
+            if div_records:
+                try:
                     outcomes = load_corporate_actions_detailed(
                         database_url,
                         div_records,
@@ -187,14 +216,13 @@ class CorporateActionsAcquisitionService:
                             sym_rejected += 1
                         elif o.outcome == "FAILED":
                             sym_failed += 1
+                except Exception as exc:
+                    sym_failed += len(div_records)
+                    sym_errors.append(f"Dividends ingestion error: {exc}")
 
-            except Exception as exc:
-                err_msg = f"Dividends fetch/ingest error: {exc}"
-                sym_errors.append(err_msg)
-                sym_provider_fail += 1
-                provider_failures_list.append({"symbol": sym, "action": "dividends", "error": str(exc)})
-
-            has_rec_failures = sym_rejected > 0 or sym_failed > 0 or sym_conflict > 0
+            has_rec_failures = (
+                sym_rejected > 0 or sym_failed > 0 or sym_conflict > 0
+            )
             if sym_provider_fail == 0 and not has_rec_failures:
                 status = "SUCCESS"
                 successful_symbols.append(sym)
