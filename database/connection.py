@@ -208,7 +208,7 @@ def _postgres_schema() -> str:
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        UNIQUE (
+        CONSTRAINT corporate_actions_identity_key UNIQUE (
             symbol,
             action_type,
             action_date,
@@ -480,9 +480,57 @@ def initialize_database(database_url: str) -> Any:
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
                 )
+
+                # Migration for corporate_actions constraint canonicalization:
+                # Query existing UNIQUE constraints and their column sets from PostgreSQL catalog
                 cursor.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_corp_actions_identity ON corporate_actions (symbol, action_type, action_date, source);"
+                    """
+                    SELECT
+                        c.conname AS constraint_name,
+                        ARRAY_AGG(a.attname::text) AS columns
+                    FROM pg_constraint c
+                    JOIN pg_class t ON c.conrelid = t.oid
+                    JOIN pg_namespace n ON t.relnamespace = n.oid
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+                    WHERE n.nspname = 'public'
+                      AND t.relname = 'corporate_actions'
+                      AND c.contype = 'u'
+                    GROUP BY c.conname;
+                    """
                 )
+                existing_con_rows = cursor.fetchall()
+                existing_constraints = {row[0]: set(row[1]) for row in existing_con_rows}
+
+                target_cols = {"symbol", "action_type", "action_date", "source"}
+
+                if "corporate_actions_identity_key" not in existing_constraints:
+                    matching_constraint = None
+                    for con_name, con_cols in existing_constraints.items():
+                        if con_cols == target_cols:
+                            matching_constraint = con_name
+                            break
+
+                    if matching_constraint is not None:
+                        try:
+                            from psycopg.sql import SQL, Identifier
+                            query = SQL("ALTER TABLE corporate_actions RENAME CONSTRAINT {} TO corporate_actions_identity_key").format(
+                                Identifier(matching_constraint)
+                            )
+                            cursor.execute(query)
+                        except ImportError:
+                            quoted = '"' + matching_constraint.replace('"', '""') + '"'
+                            cursor.execute(f"ALTER TABLE corporate_actions RENAME CONSTRAINT {quoted} TO corporate_actions_identity_key")
+                    else:
+                        cursor.execute(
+                            """
+                            ALTER TABLE corporate_actions
+                            ADD CONSTRAINT corporate_actions_identity_key
+                            UNIQUE (symbol, action_type, action_date, source);
+                            """
+                        )
+
+                # Drop legacy separate duplicate unique index if present
+                cursor.execute("DROP INDEX IF EXISTS idx_corp_actions_identity;")
 
             connection.commit()
 

@@ -176,11 +176,17 @@ class MarketDataAcquisitionService:
                     self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts)
                 except Exception as exc:
                     err_msg = f"Batch ingestion storage error: {exc}"
-                    rec_cnt = len(batch_response) if isinstance(batch_response, list) else 1
-                    # Attribute unmapped batch storage failure to requested symbols evenly or unmapped
-                    symbol_counts[unmapped_key]["received"] += rec_cnt
-                    symbol_counts[unmapped_key]["record_failures"] += rec_cnt
-                    symbol_counts[unmapped_key]["errors"].append(err_msg)
+                    if isinstance(batch_response, list):
+                        for item in batch_response:
+                            sym = item.get("symbol") if isinstance(item, dict) else None
+                            target = sym if (sym and sym in symbol_counts) else unmapped_key
+                            symbol_counts[target]["received"] += 1
+                            symbol_counts[target]["record_failures"] += 1
+                            symbol_counts[target]["errors"].append(err_msg)
+                    else:
+                        symbol_counts[unmapped_key]["received"] += 1
+                        symbol_counts[unmapped_key]["record_failures"] += 1
+                        symbol_counts[unmapped_key]["errors"].append(err_msg)
             else:
                 # Fallback to individual requests per symbol ONLY when batch provider fetch failed
                 for sym in requested_symbols:
