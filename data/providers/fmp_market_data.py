@@ -235,33 +235,17 @@ class FMPMarketDataProvider:
             item_symbol = str(item.get("symbol") or requested_symbol).strip().upper()
             price_date = item.get("date") or item.get("price_date") or item.get("priceDate")
 
-            # Priority-based unadjusted OHLC retrieval
-            open_price = item.get("open") if "open" in item else item.get("open_price")
-            if open_price is None and "adjOpen" in item:
-                open_price = item.get("adjOpen")
-
-            high_price = item.get("high") if "high" in item else item.get("high_price")
-            if high_price is None and "adjHigh" in item:
-                high_price = item.get("adjHigh")
-
-            low_price = item.get("low") if "low" in item else item.get("low_price")
-            if low_price is None and "adjLow" in item:
-                low_price = item.get("adjLow")
-
-            close_price = item.get("close") if "close" in item else item.get("close_price")
-            if close_price is None and "adjClose" in item:
-                close_price = item.get("adjClose")
+            # Priority-based unadjusted OHLC retrieval: prefer canonical "open"/"high"/"low"/"close", falling back to "adjOpen"/"adjHigh"/"adjLow"/"adjClose"
+            open_price = item["open"] if "open" in item and item["open"] is not None else item.get("adjOpen")
+            high_price = item["high"] if "high" in item and item["high"] is not None else item.get("adjHigh")
+            low_price = item["low"] if "low" in item and item["low"] is not None else item.get("adjLow")
+            close_price = item["close"] if "close" in item and item["close"] is not None else item.get("adjClose")
 
             volume = item.get("volume")
 
-            # adjusted_close rule: For /historical-price-eod/non-split-adjusted,
-            # FMP returns unadjusted historical prices as adjOpen/adjHigh/adjLow/adjClose.
-            # Thus adjusted_close remains None unless FMP explicitly provides a SEPARATE adjusted_close field.
-            adj_close = None
-            if "adjustedClose" in item and item["adjustedClose"] is not None:
-                adj_close = item["adjustedClose"]
-            elif "adjusted_close" in item and item["adjusted_close"] is not None:
-                adj_close = item["adjusted_close"]
+            # adjusted_close rule: Do NOT copy adjClose into adjusted_close for non-split-adjusted endpoint.
+            # adjusted_close remains None unless FMP explicitly supplies a separate genuinely adjusted field.
+            adj_close = item.get("adjusted_close") if "adjusted_close" in item else item.get("adjustedClose")
 
             rec: dict[str, Any] = {
                 "symbol": item_symbol,

@@ -8,6 +8,7 @@ from config.environment import (
     validate_fmp_config,
 )
 from config.environment_validator import EnvironmentValidator
+from data.market_data_provider_factory import get_market_data_provider
 
 
 def base_environment() -> dict[str, str]:
@@ -89,6 +90,17 @@ def test_fmp_config_validation_fails_when_base_url_blank() -> None:
     settings = load_environment(values)
     with pytest.raises(EnvironmentConfigurationError, match="FMP_BASE_URL is required"):
         validate_fmp_config(settings)
+
+
+def test_factory_level_fmp_request_validates_resolved_configuration() -> None:
+    values = base_environment()
+    settings = load_environment(values)
+
+    with pytest.raises(EnvironmentConfigurationError, match="FMP_API_KEY is required"):
+        get_market_data_provider("fmp", settings=settings)
+
+    provider = get_market_data_provider("fmp", settings=settings, api_key="explicit_override_key")
+    assert provider.api_key == "explicit_override_key"
 
 
 def test_telegram_requires_bot_token() -> None:

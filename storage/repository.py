@@ -725,18 +725,17 @@ def store_corporate_action(
                     hasattr(psycopg.errors, "UniqueViolation")
                     and isinstance(exc, psycopg.errors.UniqueViolation)
                 ):
-                    diag_table = getattr(getattr(exc, "diag", None), "table_name", "") or ""
-                    diag_constraint = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
-                    if diag_table or diag_constraint:
-                        if (
-                            (diag_table and diag_table == "corporate_actions")
-                            or (diag_constraint and ("corporate_actions" in diag_constraint or "idx_ca_uniq" in diag_constraint))
-                        ):
+                    diag = getattr(exc, "diag", None)
+                    diag_table = getattr(diag, "table_name", None) or ""
+                    diag_constraint = getattr(diag, "constraint_name", None) or ""
+
+                    # Must have structured diagnostics identifying corporate_actions and the identity constraint
+                    if diag_table == "corporate_actions":
+                        if diag_constraint and ("corporate_actions" in diag_constraint or "idx_corp_actions_identity" in diag_constraint or "idx_ca_uniq" in diag_constraint):
                             is_expected_unique_race = True
+
             elif isinstance(exc, sqlite3.IntegrityError):
                 msg = str(exc)
-                # Check for explicit SQLite UNIQUE constraint matching corporate_actions identity columns
-                # E.g. "UNIQUE constraint failed: corporate_actions.symbol, corporate_actions.action_type, corporate_actions.action_date, corporate_actions.source"
                 if "UNIQUE constraint failed:" in msg:
                     match = re.search(r"UNIQUE constraint failed:\s*(.+)$", msg, re.IGNORECASE)
                     if match:

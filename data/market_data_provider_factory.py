@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from config.environment import EnvironmentSettings, load_environment, validate_fmp_config
+from config.environment import EnvironmentConfigurationError, EnvironmentSettings, load_environment
 from data.market_data_client import MarketDataProvider
 from data.providers.fmp_market_data import FMPMarketDataProvider
 
@@ -28,7 +28,7 @@ def get_market_data_provider(
         - "fmp": Financial Modeling Prep provider adapter.
 
     Raises:
-        ValueError: If provider_name is unknown or empty.
+        ValueError / EnvironmentConfigurationError: If provider_name is unknown or configuration is invalid.
     """
     normalized_name = str(provider_name).strip().lower()
 
@@ -44,12 +44,17 @@ def get_market_data_provider(
         if not key:
             key = os.getenv("FMP_API_KEY", "").strip()
 
-        # Validate FMP configuration prior to provider instantiation
-        validate_fmp_config(resolved_settings)
+        final_key = str(key).strip()
+        final_url = str(url).strip()
+
+        if not final_key:
+            raise EnvironmentConfigurationError("FMP_API_KEY is required when FMP market-data acquisition is requested.")
+        if not final_url:
+            raise EnvironmentConfigurationError("FMP_BASE_URL is required when FMP market-data acquisition is requested.")
 
         return FMPMarketDataProvider(
-            api_key=key,
-            base_url=url,
+            api_key=final_key,
+            base_url=final_url,
             timeout=timeout,
         )
 
