@@ -96,6 +96,19 @@ class EnvironmentSettings:
     secret_key: str
 
 
+def validate_market_data_config(settings: EnvironmentSettings) -> None:
+    """
+    Validate that required configuration for market-data acquisition is present.
+
+    Must be called when the market-data acquisition path is requested, without
+    failing application startup when market data acquisition is not being used.
+    """
+    if not settings.market_data_base_url or not settings.market_data_base_url.strip():
+        raise EnvironmentConfigurationError(
+            "MARKET_DATA_BASE_URL is required when market-data acquisition is requested."
+        )
+
+
 def load_environment(
     values: Mapping[str, str] | None = None,
 ) -> EnvironmentSettings:
@@ -279,4 +292,4 @@ def load_environment(
             "SECRET_KEY",
             "",
         ).strip(),
-  )
+    )

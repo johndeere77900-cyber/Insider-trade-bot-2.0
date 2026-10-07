@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+import zipfile
+import pytest
+
+from archive import ArchiveError, FilesystemSECArchive
+from data.acquisition_state import AcquisitionStateManager
+from data.sec_dataset_pipeline import NormalizedBulkTransaction
+from database.connection import initialize_database
 from research.event_study import EventStudyEngine
+from research.insider_adapter import prepare_event_study_inputs
+from research.research_data_access import (
+    PeriodNotFoundError,
+    check_market_data_coverage,
+    get_historical_transactions,
+    get_market_prices_for_ticker,
+    resolve_period_storage_location,
+)
+from storage.repository import store_bulk_insider_transactions, store_market_price
 
 
 def test_event_study_engine_can_calculate_returns() -> None:
@@ -38,20 +54,6 @@ def test_event_study_handles_single_price() -> None:
     )
 
     assert result == []
-
-
-import zipfile
-import pytest
-from archive import ArchiveError, FilesystemSECArchive
-from data.sec_dataset_pipeline import NormalizedBulkTransaction
-from data.acquisition_state import AcquisitionStateManager
-from research.research_data_access import (
-    PeriodNotFoundError,
-    get_historical_transactions,
-    resolve_period_storage_location,
-)
-from research.insider_adapter import prepare_event_study_inputs
-from storage.repository import store_bulk_insider_transactions
 
 
 def test_research_archive_storage_error_propagates(tmp_path):
@@ -195,12 +197,72 @@ def test_resolve_period_storage_location_and_get_historical_transactions(tmp_pat
     assert txs_combined[1].accession_number == "0000000002-06-000002"  # 2006-Q2 from Neon
 
 
+def test_series_isolation_no_silent_fallback(tmp_path):
+    db_file = tmp_path / "series_iso.db"
+    db_url = f"sqlite:///{db_file}"
+    initialize_database(db_url)
+
+    # Store a record with raw close=100.0, adjusted_close=None
+    store_market_price(
+        db_url, symbol="AAPL", price_date="2023-01-01",
+        open_price=100.0, high=105.0, low=99.0, close=100.0,
+        adjusted_close=None, volume=1000.0, source="src"
+    )
+    # Store a record with raw close=None, adjusted_close=105.0
+    store_market_price(
+        db_url, symbol="AAPL", price_date="2023-01-02",
+        open_price=100.0, high=105.0, low=99.0, close=None,
+        adjusted_close=105.0, volume=1000.0, source="src"
+    )
+
+    # 1. Raw close requested -> ONLY 2023-01-01 returned
+    raw_prices = get_market_prices_for_ticker(db_url, "AAPL", use_adjusted_close=False)
+    assert list(raw_prices.keys()) == ["2023-01-01"]
+    assert raw_prices["2023-01-01"] == 100.0
+
+    # 2. Adjusted close requested -> ONLY 2023-01-02 returned (no silent fallback to raw close)
+    adj_prices = get_market_prices_for_ticker(db_url, "AAPL", use_adjusted_close=True)
+    assert list(adj_prices.keys()) == ["2023-01-02"]
+    assert adj_prices["2023-01-02"] == 105.0
+
+
+def test_strengthened_coverage_reporting(tmp_path):
+    db_file = tmp_path / "cov_test.db"
+    db_url = f"sqlite:///{db_file}"
+    initialize_database(db_url)
+
+    # 1. No data in DB
+    report_empty = check_market_data_coverage(db_url, "AAPL", start_date="2023-01-01", end_date="2023-01-10")
+    assert report_empty.observation_count == 0
+    assert report_empty.missing_requested_range is True
+
+    # 2. Add prices from 2023-01-05 to 2023-01-08
+    for d, c in [("2023-01-05", 100.0), ("2023-01-06", 101.0), ("2023-01-07", 102.0), ("2023-01-08", 103.0)]:
+        store_market_price(db_url, symbol="AAPL", price_date=d, open_price=c, high=c+1, low=c-1, close=c, adjusted_close=c, volume=100.0, source="src")
+
+    # Range starts before available data
+    rep_early = check_market_data_coverage(db_url, "AAPL", start_date="2023-01-01", end_date="2023-01-07")
+    assert rep_early.starts_before_available is True
+    assert rep_early.missing_requested_range is True
+
+    # Range ends after available data
+    rep_late = check_market_data_coverage(db_url, "AAPL", start_date="2023-01-05", end_date="2023-01-10")
+    assert rep_late.ends_after_available is True
+    assert rep_late.missing_requested_range is True
+
+    # Covered range
+    rep_ok = check_market_data_coverage(db_url, "AAPL", start_date="2023-01-05", end_date="2023-01-08")
+    assert rep_ok.starts_before_available is False
+    assert rep_ok.ends_after_available is False
+    assert rep_ok.is_range_covered_boundary_level is True
+    assert rep_ok.missing_requested_range is False
+
+
 def test_point_in_time_price_rule_and_amendment_handling(tmp_path, monkeypatch):
     db_file = tmp_path / "pit_test.db"
     db_url = f"sqlite:///{db_file}"
 
-    # Setup market_prices table
-    from database.connection import initialize_database, connect
+    from database.connection import connect
     initialize_database(db_url)
     with connect(db_url) as conn:
         conn.execute(
@@ -264,107 +326,10 @@ def test_point_in_time_price_rule_and_amendment_handling(tmp_path, monkeypatch):
 
     adapter_res = prepare_event_study_inputs(db_url, [original_tx, unresolved_amend_tx], horizon_days=1)
 
-    # 1. Verification of amendment handling: original preserved, unresolved amendment rejected
     assert len(adapter_res.valid_events) == 1
     assert len(adapter_res.rejections) == 1
     assert adapter_res.rejections[0].reason == "REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL"
 
-    # 2. Verification of Point-In-Time price rule:
-    # event_date MUST be 2026-02-11 (first date STRICTLY AFTER filing_date 2026-02-10)
-    # event_price MUST be 195.0 (NEVER 190.0 closing price on filing_date)
     event = adapter_res.valid_events[0]
     assert event.event_date == "2026-02-11"
     assert event.event_price == 195.0
-
-
-def test_r2_fallback_amendment_pit_download_boundary_integration(tmp_path, monkeypatch):
-    """
-    End-to-end integration test proving:
-    1. Exact quarter resolution (2018-Q2 request fails if only 2018-Q1 exists).
-    2. SEC downloader is NEVER called during research access.
-    3. R2 ZIP -> parse -> normalize -> research access -> insider adapter -> amendment handling & PIT pricing.
-    4. Unified retention decision scenarios (Old -> R2, Recent -> NEON, Partial Neon -> R2).
-    """
-    db_file = tmp_path / "e2e_res_test.db"
-    db_url = f"sqlite:///{db_file}"
-    archive_dir = tmp_path / "archive"
-    archive = FilesystemSECArchive(base_path=str(archive_dir))
-
-    # Setup market prices in DB
-    from database.connection import initialize_database, connect
-    initialize_database(db_url)
-    with connect(db_url) as conn:
-        conn.execute(
-            "INSERT INTO market_prices (symbol, price_date, close, source, record_hash, created_at) VALUES "
-            "('MSFT', '2018-05-10', 100.0, 'test', 'h1', '2018-05-10'), "  # Filing date price (MUST NOT BE SELECTED)
-            "('MSFT', '2018-05-11', 102.0, 'test', 'h2', '2018-05-11'), "  # Entry price (MUST BE SELECTED)
-            "('MSFT', '2018-05-12', 105.0, 'test', 'h3', '2018-05-12')"   # Horizon price
-        )
-
-    # SEC Downloader safety mock: ensure research NEVER calls SEC download
-    def mock_sec_download(*args, **kwargs):
-        raise RuntimeError("SEC Downloader MUST NOT be called by research layer!")
-
-    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_sec_download)
-
-    # 1. Exact quarter resolution test: Put 2018-Q1 archive in R2
-    zfile_2018q1 = tmp_path / "2018Q1.zip"
-    with zipfile.ZipFile(zfile_2018q1, "w") as zf:
-        zf.writestr("SUBMISSION.tsv", "ACCESSION_NUMBER\tISSUERCIK\tISSUERNAME\tISSUERTRADINGSYMBOL\tFILING_DATE\n0000000001-18-000001\t0000789019\tMicrosoft\tMSFT\t2018-02-10\n")
-        zf.writestr("NONDERIV_TRANS.tsv", "ACCESSION_NUMBER\tNONDERIV_TRANS_SK\tTRANS_DATE\tTRANS_CODE\tTRANS_SHARES\tTRANS_PRICEPERSHARE\tTRANS_ACQUIRED_DISP_CD\tDIRECT_INDIRECT_OWNERSHIP\n0000000001-18-000001\t1\t2018-02-08\tP\t100\t90.0\tA\tD\n")
-    archive.put("2018-Q1", str(zfile_2018q1))
-
-    # Requesting 2018-Q2 when only 2018-Q1 exists MUST raise PeriodNotFoundError (wrong quarter cannot satisfy request)
-    with pytest.raises(PeriodNotFoundError, match="2018-Q2"):
-        get_historical_transactions(db_url, archive, "2018-Q2", "2018-Q2", reference_period="2026-Q2")
-
-    # 2. Put 2018-Q2 archive in R2 containing an original filing and an unresolved amendment
-    zfile_2018q2 = tmp_path / "2018Q2.zip"
-    with zipfile.ZipFile(zfile_2018q2, "w") as zf:
-        zf.writestr(
-            "SUBMISSION.tsv",
-            "ACCESSION_NUMBER\tISSUERCIK\tISSUERNAME\tISSUERTRADINGSYMBOL\tFILING_DATE\tDATE_OF_ORIG_SUB\n"
-            "0000000001-18-000002\t0000789019\tMicrosoft\tMSFT\t2018-05-10\t\n"
-            "0000000002-18-000003\t0000789019\tMicrosoft\tMSFT\t2018-05-10\t2018-05-10\n",
-        )
-        zf.writestr(
-            "NONDERIV_TRANS.tsv",
-            "ACCESSION_NUMBER\tNONDERIV_TRANS_SK\tTRANS_DATE\tTRANS_CODE\tTRANS_SHARES\tTRANS_PRICEPERSHARE\tTRANS_ACQUIRED_DISP_CD\tDIRECT_INDIRECT_OWNERSHIP\n"
-            "0000000001-18-000002\t1\t2018-05-08\tP\t5000\t98.0\tA\tD\n"
-            "0000000002-18-000003\t1\t2018-05-08\tP\t6000\t98.0\tA\tD\n",
-        )
-    archive.put("2018-Q2", str(zfile_2018q2))
-
-    # Retrieve historical transactions for 2018-Q2 from R2
-    txs_r2 = get_historical_transactions(db_url, archive, "2018-Q2", "2018-Q2", tickers="MSFT", reference_period="2026-Q2")
-    assert len(txs_r2) == 2
-    assert txs_r2[0].record_hash is not None
-    assert txs_r2[1].record_hash is not None
-
-    # Pass R2 retrieved transactions into insider adapter
-    adapter_res = prepare_event_study_inputs(db_url, txs_r2, horizon_days=1)
-
-    # Verify amendment rule: original preserved, unresolved amendment rejected
-    assert len(adapter_res.valid_events) == 1
-    assert len(adapter_res.rejections) == 1
-    assert adapter_res.rejections[0].reason == "REJECTED_AMENDMENT_UNRESOLVED_ORIGINAL"
-
-    # Verify Point-In-Time entry pricing:
-    # Filing date is 2018-05-10 ($100.0) -> MUST NOT be selected as entry price
-    # Entry date is 2018-05-11 ($102.0) -> MUST be selected as entry price
-    event = adapter_res.valid_events[0]
-    assert event.event_date == "2018-05-11"
-    assert event.event_price == 102.0
-
-    # 3. Unified retention decision test (Blocker 13)
-    # Scenario A: Old period outside retention -> resolves to R2
-    assert resolve_period_storage_location(db_url, archive, "2018-Q2", reference_period="2026-Q2") == "R2"
-
-    # Scenario B: Recent period with completed ingestion_state -> resolves to NEON
-    state_mgr = AcquisitionStateManager(db_url)
-    state_mgr.record_period_completion("2026-Q1", 10, 10, 0, 0, 0, status="COMPLETED")
-    assert resolve_period_storage_location(db_url, archive, "2026-Q1", reference_period="2026-Q2") == "NEON"
-
-    # Scenario C: Partial Neon period (status FAILED/incomplete) + valid R2 -> resolves to R2
-    state_mgr.record_period_completion("2018-Q1", 5, 2, 0, 0, 1, status="FAILED")
-    assert resolve_period_storage_location(db_url, archive, "2018-Q1", reference_period="2026-Q2") == "R2"

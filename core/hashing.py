@@ -58,3 +58,32 @@ def generate_record_hash(value: Any) -> str:
     """
 
     return sha256_record(value)
+
+
+def generate_market_price_hash(
+    symbol: str,
+    price_date: str,
+    source: str,
+    open_price: float | None = None,
+    high: float | None = None,
+    low: float | None = None,
+    close: float | None = None,
+    adjusted_close: float | None = None,
+    volume: float | None = None,
+) -> str:
+    """
+    Generate a deterministic SHA-256 fingerprint for a market price record
+    based on its normalized semantic fields.
+    """
+    payload = {
+        "symbol": str(symbol).strip().upper(),
+        "price_date": str(price_date).strip(),
+        "source": str(source).strip(),
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "adjusted_close": adjusted_close,
+        "volume": volume,
+    }
+    return sha256_record(payload)

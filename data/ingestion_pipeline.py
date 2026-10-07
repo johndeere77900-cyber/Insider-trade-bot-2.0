@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Iterable, Mapping
 
-from core.hashing import sha256_record
+from core.hashing import generate_market_price_hash, sha256_record
 from core.models import (
     CorporateAction,
     InsiderTransaction,
@@ -178,7 +178,7 @@ def ingest_market_price(
 
     raw_payload = dict(payload)
 
-    record_hash = store_market_price(
+    record_hash, _outcome = store_market_price(
         database_url,
         symbol=record.symbol,
         price_date=record.price_date,
@@ -281,11 +281,23 @@ def calculate_normalized_record_hash(
     This helper does not write anything to the database.
     """
 
+    if isinstance(record, MarketPrice):
+        return generate_market_price_hash(
+            symbol=record.symbol,
+            price_date=record.price_date,
+            source=record.source,
+            open_price=record.open,
+            high=record.high,
+            low=record.low,
+            close=record.close,
+            adjusted_close=record.adjusted_close,
+            volume=record.volume,
+        )
+
     if not isinstance(
         record,
         (
             InsiderTransaction,
-            MarketPrice,
             CorporateAction,
         ),
     ):

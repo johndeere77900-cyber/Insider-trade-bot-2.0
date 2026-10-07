@@ -18,7 +18,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from core.hashing import sha256_record
+from core.hashing import generate_market_price_hash, sha256_record
 from database.connection import (
     connect,
     initialize_database,
@@ -31,6 +31,10 @@ ALLOWED_PAYLOAD_TABLES = {
     "market_prices",
     "corporate_actions",
 }
+
+
+class MarketDataConflictError(ValueError):
+    """Raised when an insertion conflicts with an existing different record for the same symbol/date/source."""
 
 
 def utc_now() -> str:
@@ -461,35 +465,79 @@ def store_market_price(
     adjusted_close: float | None,
     volume: float | None,
     source: str,
-    raw_payload: dict[str, Any],
-) -> str:
-    """Store a normalized market-price record and return its hash."""
+    raw_payload: dict[str, Any] | None = None,
+) -> tuple[str, str]:
+    """
+    Store a normalized market-price record idempotently and return (record_hash, outcome).
+
+    Outcome is either 'INSERTED' or 'DUPLICATE'.
+    Raises MarketDataConflictError if a record for the same symbol/price_date/source
+    already exists with materially different price data.
+    """
 
     initialize_database(database_url)
 
-    record_hash = sha256_record(raw_payload)
+    normalized_symbol = str(symbol).strip().upper()
+    normalized_date = str(price_date).strip()
+    normalized_source = str(source).strip()
+
+    record_hash = generate_market_price_hash(
+        symbol=normalized_symbol,
+        price_date=normalized_date,
+        source=normalized_source,
+        open_price=open_price,
+        high=high,
+        low=low,
+        close=close,
+        adjusted_close=adjusted_close,
+        volume=volume,
+    )
+
     placeholder = _placeholder(database_url)
 
-    values = (
-        symbol,
-        price_date,
-        open_price,
-        high,
-        low,
-        close,
-        adjusted_close,
-        volume,
-        source,
-        record_hash,
-        utc_now(),
-    )
-
-    placeholders = ", ".join(
-        placeholder
-        for _ in values
-    )
+    select_sql = f"""
+        SELECT record_hash
+        FROM market_prices
+        WHERE symbol = {placeholder}
+          AND price_date = {placeholder}
+          AND source = {placeholder}
+    """
 
     with connect(database_url) as connection:
+        cursor = connection.execute(
+            select_sql,
+            (normalized_symbol, normalized_date, normalized_source),
+        )
+        existing = cursor.fetchone()
+
+        if existing is not None:
+            existing_hash = _row_value(existing, "record_hash", index=0)
+            if existing_hash == record_hash:
+                return record_hash, "DUPLICATE"
+            raise MarketDataConflictError(
+                f"Data conflict: market price for symbol '{normalized_symbol}', date '{normalized_date}', "
+                f"source '{normalized_source}' already exists with different values."
+            )
+
+        values = (
+            normalized_symbol,
+            normalized_date,
+            open_price,
+            high,
+            low,
+            close,
+            adjusted_close,
+            volume,
+            normalized_source,
+            record_hash,
+            utc_now(),
+        )
+
+        placeholders = ", ".join(
+            placeholder
+            for _ in values
+        )
+
         if is_postgresql_url(database_url):
             connection.execute(
                 f"""
@@ -543,7 +591,7 @@ def store_market_price(
 
         connection.commit()
 
-    return record_hash
+    return record_hash, "INSERTED"
 
 
 def store_corporate_action(
