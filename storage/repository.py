@@ -726,13 +726,12 @@ def store_corporate_action(
                     and isinstance(exc, psycopg.errors.UniqueViolation)
                 ):
                     diag = getattr(exc, "diag", None)
-                    diag_table = getattr(diag, "table_name", None) or ""
-                    diag_constraint = getattr(diag, "constraint_name", None) or ""
+                    diag_table = getattr(diag, "table_name", None)
+                    diag_constraint = getattr(diag, "constraint_name", None)
 
-                    # Must have structured diagnostics identifying corporate_actions and the identity constraint
-                    if diag_table == "corporate_actions":
-                        if diag_constraint and ("corporate_actions" in diag_constraint or "idx_corp_actions_identity" in diag_constraint or "idx_ca_uniq" in diag_constraint):
-                            is_expected_unique_race = True
+                    # Require exact table AND constraint match without substring or fallback matching
+                    if diag_table == "corporate_actions" and diag_constraint == "idx_corp_actions_identity":
+                        is_expected_unique_race = True
 
             elif isinstance(exc, sqlite3.IntegrityError):
                 msg = str(exc)

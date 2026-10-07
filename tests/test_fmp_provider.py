@@ -583,21 +583,21 @@ def test_unrelated_unique_integrity_error_does_not_mask_existing_identity(tmp_pa
     assert count_records(db_url, "corporate_actions") == 1
 
 
-def test_postgresql_style_unrelated_23505_integrity_error_propagates(tmp_path) -> None:
+def test_postgresql_unrelated_constraint_on_corporate_actions_table_propagates(tmp_path) -> None:
     """
-    Regression test proving that a PostgreSQL-style IntegrityError with SQLSTATE 23505
-    targeting an unrelated table or without corporate_actions diagnostic info re-raises
+    Regression test proving that a PostgreSQL-style IntegrityError with table_name == 'corporate_actions'
+    but an unrelated constraint_name (e.g. 'corporate_actions_some_other_unique_constraint') re-raises
     and is NOT converted to DUPLICATE or CONFLICT.
     """
-    db_url = f"sqlite:///{tmp_path}/ca_pg_unrelated_23505.db"
+    db_url = f"sqlite:///{tmp_path}/ca_pg_unrelated_constraint.db"
     initialize_database(db_url)
 
     raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
     store_corporate_action(db_url, symbol="AAPL", action_type="split", action_date="2020-08-31", ratio="4:1", cash_amount=None, source="fmp", raw_payload=raw1)
 
     class MockPGDiag:
-        table_name = "other_table"
-        constraint_name = "other_table_pkey"
+        table_name = "corporate_actions"
+        constraint_name = "corporate_actions_some_other_unique_constraint"
 
     class MockPGUniqueViolation(Exception):
         pgcode = "23505"
@@ -606,7 +606,7 @@ def test_postgresql_style_unrelated_23505_integrity_error_propagates(tmp_path) -
     real_connect = connect
 
     def mock_connect_pg(url):
-        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=MockPGUniqueViolation("Unrelated 23505"))
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=MockPGUniqueViolation("Unrelated corporate_actions constraint"))
 
     with patch("storage.repository.PSYCOPG_INTEGRITY_ERRORS", (MockPGUniqueViolation,)):
         with patch("storage.repository.connect", side_effect=mock_connect_pg):
@@ -621,6 +621,50 @@ def test_postgresql_style_unrelated_23505_integrity_error_propagates(tmp_path) -
                     source="fmp",
                     raw_payload=raw1,
                 )
+
+    assert count_records(db_url, "corporate_actions") == 1
+
+
+def test_postgresql_bare_23505_without_diagnostics_propagates(tmp_path) -> None:
+    """
+    Regression test proving that a PostgreSQL-style IntegrityError with SQLSTATE 23505
+    where diag.table_name = None / "" and diag.constraint_name = None / "" re-raises
+    and is NOT converted to DUPLICATE or CONFLICT.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_pg_bare_23505.db"
+    initialize_database(db_url)
+
+    raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
+    store_corporate_action(db_url, symbol="AAPL", action_type="split", action_date="2020-08-31", ratio="4:1", cash_amount=None, source="fmp", raw_payload=raw1)
+
+    class MockPGDiagBare:
+        table_name = None
+        constraint_name = None
+
+    class MockPGBareUniqueViolation(Exception):
+        pgcode = "23505"
+        diag = MockPGDiagBare()
+
+    real_connect = connect
+
+    def mock_connect_pg_bare(url):
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=MockPGBareUniqueViolation("Bare 23505"))
+
+    with patch("storage.repository.PSYCOPG_INTEGRITY_ERRORS", (MockPGBareUniqueViolation,)):
+        with patch("storage.repository.connect", side_effect=mock_connect_pg_bare):
+            with pytest.raises(MockPGBareUniqueViolation):
+                store_corporate_action(
+                    db_url,
+                    symbol="AAPL",
+                    action_type="split",
+                    action_date="2020-08-31",
+                    ratio="4:1",
+                    cash_amount=None,
+                    source="fmp",
+                    raw_payload=raw1,
+                )
+
+    assert count_records(db_url, "corporate_actions") == 1
 
 
 def test_store_corporate_action_non_integrity_failure_propagates(tmp_path) -> None:
