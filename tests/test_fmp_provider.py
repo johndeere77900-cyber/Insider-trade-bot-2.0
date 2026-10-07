@@ -117,22 +117,35 @@ def test_fmp_provider_unadjusted_close_and_no_adjusted_close_substitution() -> N
         assert records[0]["adjusted_close"] is None
 
 
-def test_fmp_provider_actual_non_split_adjusted_shape_mapping() -> None:
+def test_fmp_provider_raw_ohlc_preserved_and_no_adj_fallback() -> None:
     """
-    Regression test verifying FMP's actual non-split-adjusted endpoint response shape
-    containing adjOpen, adjHigh, adjLow, adjClose maps correctly to open, high, low, close
-    with adjusted_close remaining None.
+    Tests proving:
+    1. Raw "open/high/low/close" are preserved exactly.
+    2. "adjClose" does NOT become "close".
+    3. Missing raw "close" does NOT fall back to "adjClose".
+    4. Explicit "adjusted_close" / "adjustedClose" remains separate.
+    5. The non-split-adjusted FMP fixture produces raw OHLC values in canonical fields.
     """
     provider = FMPMarketDataProvider(api_key="dummy_key")
     raw_json = json.dumps([
         {
             "symbol": "AAPL",
             "date": "2025-12-31",
-            "adjOpen": 273.06,
-            "adjHigh": 273.68,
-            "adjLow": 271.75,
-            "adjClose": 271.86,
+            "open": 270.0,
+            "high": 275.0,
+            "low": 269.0,
+            "close": 272.0,
+            "adjustedClose": 271.86,
             "volume": 27293639,
+        },
+        {
+            "symbol": "AAPL",
+            "date": "2025-12-30",
+            "adjOpen": 268.0,
+            "adjHigh": 270.0,
+            "adjLow": 265.0,
+            "adjClose": 269.0,
+            "volume": 1000000,
         }
     ]).encode("utf-8")
 
@@ -143,16 +156,26 @@ def test_fmp_provider_actual_non_split_adjusted_shape_mapping() -> None:
         mock_urlopen.return_value.__enter__.return_value = mock_resp
 
         records = provider.get_historical_prices(symbol="AAPL")
-        assert len(records) == 1
-        rec = records[0]
-        assert rec["symbol"] == "AAPL"
-        assert rec["price_date"] == "2025-12-31"
-        assert rec["open"] == 273.06
-        assert rec["high"] == 273.68
-        assert rec["low"] == 271.75
-        assert rec["close"] == 271.86
-        assert rec["volume"] == 27293639
-        assert rec["adjusted_close"] is None
+        assert len(records) == 2
+
+        # Record 1: Canonical raw OHLC provided alongside adjustedClose
+        rec1 = records[0]
+        assert rec1["symbol"] == "AAPL"
+        assert rec1["price_date"] == "2025-12-31"
+        assert rec1["open"] == 270.0
+        assert rec1["high"] == 275.0
+        assert rec1["low"] == 269.0
+        assert rec1["close"] == 272.0
+        assert rec1["adjusted_close"] == 271.86
+        assert rec1["volume"] == 27293639
+
+        # Record 2: Only adjClose / adjOpen present (missing raw close/open)
+        rec2 = records[1]
+        assert rec2["open"] is None
+        assert rec2["high"] is None
+        assert rec2["low"] is None
+        assert rec2["close"] is None
+        assert rec2["adjusted_close"] == 269.0
 
 
 def test_fmp_provider_valid_empty_response() -> None:

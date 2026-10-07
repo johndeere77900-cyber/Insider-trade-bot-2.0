@@ -39,6 +39,7 @@ Research / Event Study / Backtest / Signal Engine
 - **Research / Data Access Layer:**
   - Clean abstraction (`research.research_data_access`) that hides storage location from research callers.
   - Transparently checks Neon operational cache first.
+  - Verifies dataset completeness (`verify_dataset_coverage`).
   - Falls back to reading and normalizing immutable quarterly ZIPs directly from R2 for periods outside Neon retention.
   - Period-based deterministic retrieval (`get_historical_transactions`).
 
@@ -46,9 +47,23 @@ Research / Event Study / Backtest / Signal Engine
   - External acquisition source only.
   - Not directly queried during research operations.
 
-- **Event Study Engine & Adapter:** An adapter (`research.insider_adapter`) maps normalized insider transactions into research event inputs for `research.event_study`, enforcing data quality safety checks (handling missing tickers, missing dates, missing market prices, point-in-time entry pricing, and unresolved amendments).
+- **RAW vs Point-in-Time Adjusted Price Rules:**
+  - **RAW Market Prices** are used for:
+    - Execution
+    - Position sizing
+    - Actual traded prices
+    - Cost / slippage calculations
+  - **Point-in-Time Adjusted Prices** (`research.price_adjustment`) are used for:
+    - Research returns across splits/dividends
+    - Technical indicators that must survive corporate actions
+    - Research comparisons
+  - RAW and Point-in-Time adjusted prices are NEVER mixed implicitly.
 
-- **Signals & Backtesting:** Clean research event outputs feed directly into signal generation and backtesting simulation (`backtesting.engine`).
+- **Event Study Engine & Adapter:** An adapter (`research.insider_adapter`) maps normalized insider transactions into research event inputs for `research.event_study`, enforcing price series mode selection (`RAW` vs `POINT_IN_TIME_ADJUSTED`) and data quality safety checks.
+
+- **Feature & Signal Engine:** Feature engine (`features.engine`) builds point-in-time features with explicit provenance. Signal engine (`signals.engine`) creates research-only signal candidates that CANNOT directly authorize execution.
+
+- **Signals & Backtesting:** Clean research event outputs feed directly into signal candidate generation and chronological portfolio backtesting simulation (`backtesting.engine`) with capital allocation, equity curve tracking, fees, slippage, and maximum drawdown calculations.
 
 ### Operational Retention Configuration (`SEC_OPERATIONAL_RETENTION_YEARS`)
 

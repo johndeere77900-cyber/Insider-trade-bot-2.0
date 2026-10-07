@@ -25,6 +25,23 @@ class PeriodNotFoundError(Exception):
     """Raised when a requested SEC dataset period is missing from both Neon and R2 archive."""
 
 
+class DatasetIntegrityError(Exception):
+    """Raised when a dataset's stored records fail completeness verification."""
+
+
+@dataclass(frozen=True)
+class DatasetCoverage:
+    """Read-only coverage summary for a dataset in database storage."""
+
+    dataset_type: str
+    period: str
+    expected_records: Optional[int]
+    actual_records: int
+    first_date: Optional[str]
+    last_date: Optional[str]
+    complete: bool
+
+
 @dataclass(frozen=True)
 class MarketDataCoverageReport:
     """Read-only coverage report for a symbol's historical market data."""
@@ -41,6 +58,107 @@ class MarketDataCoverageReport:
     is_range_covered_boundary_level: bool
     has_sufficient_future_observations: bool
     missing_requested_price_field_count: int
+
+
+def verify_dataset_coverage(
+    *,
+    database_url: str,
+    dataset_type: str,
+    period: str,
+    expected_records: Optional[int] = None,
+    has_independent_coverage_contract: bool = False,
+) -> DatasetCoverage:
+    """
+    Verify actual rows and metadata in storage for the requested dataset and period.
+
+    Non-Circular Completeness Contract:
+    - records_inserted/parsed from ingestion_state are recorded as metadata only.
+    - They do NOT independently prove dataset completeness.
+    - Dataset is complete ONLY when status == 'COMPLETED', actual rows exist within
+      the requested quarter boundaries, AND an independent expected coverage contract exists
+      and is satisfied by actual records.
+    - If no independent coverage contract exists, complete = False.
+
+    Raises DatasetIntegrityError if dataset storage contract is violated.
+    """
+    norm_type = str(dataset_type).strip().lower()
+    norm_period = AcquisitionStateManager.normalize_period(period)
+    is_pg = is_postgresql_url(database_url)
+    param_placeholder = "%s" if is_pg else "?"
+
+    with connect(database_url) as conn:
+        cursor = conn.execute(
+            f"SELECT status, records_inserted, records_parsed FROM ingestion_state WHERE period = {param_placeholder}",
+            (norm_period,),
+        )
+        state_row = cursor.fetchone()
+
+        status = state_row["status"] if state_row else None
+        expected_records = None
+        if state_row:
+            if state_row["records_inserted"] is not None:
+                expected_records = int(state_row["records_inserted"])
+            elif state_row["records_parsed"] is not None:
+                expected_records = int(state_row["records_parsed"])
+
+        if norm_type in {"sec", "insider_transactions", "sec_historical"}:
+            f_start, f_end = _quarter_date_range(norm_period)
+            cursor = conn.execute(
+                f"""
+                SELECT COUNT(*) as actual_count, MIN(filing_date) as min_date, MAX(filing_date) as max_date
+                FROM insider_transactions
+                WHERE filing_date >= {param_placeholder} AND filing_date <= {param_placeholder}
+                """,
+                (f_start, f_end),
+            )
+            row = cursor.fetchone()
+            actual_records = int(row["actual_count"]) if row else 0
+            first_date = row["min_date"] if row else None
+            last_date = row["max_date"] if row else None
+
+        elif norm_type == "market_prices":
+            cursor = conn.execute(
+                f"""
+                SELECT COUNT(*) as actual_count, MIN(price_date) as min_date, MAX(price_date) as max_date
+                FROM market_prices
+                WHERE price_date >= {param_placeholder} AND price_date <= {param_placeholder}
+                """,
+                _quarter_date_range(norm_period),
+            )
+            row = cursor.fetchone()
+            actual_records = int(row["actual_count"]) if row else 0
+            first_date = row["min_date"] if row else None
+            last_date = row["max_date"] if row else None
+        else:
+            raise ValueError(f"Unsupported dataset_type '{dataset_type}' for verification.")
+
+    q_start, q_end = _quarter_date_range(norm_period)
+
+    # Date range validation: records must exist and belong to requested quarter
+    has_valid_dates = (
+        first_date is not None
+        and last_date is not None
+        and first_date >= q_start
+        and last_date <= q_end
+    )
+
+    is_complete = (
+        status == "COMPLETED"
+        and actual_records > 0
+        and has_valid_dates
+        and has_independent_coverage_contract
+        and (expected_records is None or actual_records >= expected_records)
+    )
+
+    return DatasetCoverage(
+        dataset_type=norm_type,
+        period=norm_period,
+        expected_records=expected_records,
+        actual_records=actual_records,
+        first_date=first_date,
+        last_date=last_date,
+        complete=is_complete,
+    )
 
 
 def _quarter_date_range(period: str) -> tuple[str, str]:

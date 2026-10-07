@@ -302,7 +302,7 @@ def test_s3_orphan_zip_recovery_zero_sec_downloads(tmp_path, monkeypatch):
                 raise Exception("NotFound 404")
             return {}
 
-        def put_object(self, Bucket: str, Key: str, Body: bytes):
+        def put_object(self, Bucket: str, Key: str, Body: bytes, **kwargs):
             store[Key] = Body
 
         def get_object(self, Bucket: str, Key: str):

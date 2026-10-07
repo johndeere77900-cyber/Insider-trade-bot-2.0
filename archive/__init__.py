@@ -20,12 +20,25 @@ from archive.s3 import S3SECArchive
 def get_archive_backend(
     backend_type: str = "filesystem",
     archive_path: str = "data/archive",
+    environment: str | None = None,
     **kwargs: Any,
 ) -> SECArchiveInterface:
     """
     Factory to retrieve configured SEC dataset archive backend instance.
+
+    Rejects 'filesystem' backend when environment is production or staging.
     """
     b_type = (backend_type or "filesystem").strip().lower()
+    env = (environment or "").strip().lower()
+
+    from config.environment import EnvironmentConfigurationError
+
+    if env in {"production", "staging"} and b_type == "filesystem":
+        raise EnvironmentConfigurationError(
+            f"Archive backend 'filesystem' is prohibited in '{env}' environment. "
+            "SEC archive backend must be explicitly configured as S3/R2."
+        )
+
     if b_type == "filesystem":
         return FilesystemSECArchive(base_path=archive_path)
     elif b_type in ("s3", "r2", "object_storage", "objectstorage", "s3_compat"):
