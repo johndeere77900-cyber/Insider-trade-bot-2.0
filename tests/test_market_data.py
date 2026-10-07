@@ -538,6 +538,59 @@ def test_regression_b_provider_failure_is_not_record_failure(tmp_path) -> None:
     )
 
 
+def test_market_data_error_classification_provider_failure(tmp_path) -> None:
+    """
+    Regression test proving that when provider call raises expected provider exception:
+      - provider failure count increments
+      - storage loader is not falsely reported as provider failure
+      - records_failed remains 0
+    """
+    db_url = f"sqlite:///{tmp_path}/md_prov_fail.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "test_provider"
+    mock_provider.supports_batch = False
+    mock_provider.get_historical_prices.side_effect = MarketDataRequestError("Provider network timeout")
+
+    service = MarketDataAcquisitionService(mock_provider)
+    report = service.acquire_historical_data(db_url, symbols=["AAPL"])
+
+    assert report.provider_request_failures == 1
+    assert report.records_failed == 0
+    assert report.records_received == 0
+    assert report.symbol_results[0].provider_request_failures == 1
+    assert report.symbol_results[0].record_failures == 0
+
+
+def test_market_data_error_classification_storage_failure(tmp_path) -> None:
+    """
+    Regression test proving that when provider call succeeds but storage/loader fails:
+      - provider failure count remains 0
+      - storage/record failure is reported in records_failed / record_failures
+    """
+    db_url = f"sqlite:///{tmp_path}/md_storage_fail.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "test_provider"
+    mock_provider.supports_batch = False
+    mock_provider.get_historical_prices.return_value = [
+        {"symbol": "AAPL", "date": "2024-01-02", "close": 150.0}
+    ]
+
+    service = MarketDataAcquisitionService(mock_provider)
+
+    with patch("data.market_data_acquisition.load_market_prices_detailed", side_effect=RuntimeError("Database connection failed")):
+        report = service.acquire_historical_data(db_url, symbols=["AAPL"])
+
+        assert report.provider_request_failures == 0
+        assert report.records_failed == 1
+        assert report.records_received == 1
+        assert report.symbol_results[0].provider_request_failures == 0
+        assert report.symbol_results[0].record_failures == 1
+
+
 def test_regression_c_batch_failure_falls_back_to_individual_requests(tmp_path) -> None:
     db_url = f"sqlite:///{tmp_path}/batch_fallback_test.db"
     initialize_database(db_url)

@@ -208,7 +208,7 @@ def _postgres_schema() -> str:
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        UNIQUE (
+        CONSTRAINT corporate_actions_identity_key UNIQUE (
             symbol,
             action_type,
             action_date,
@@ -480,9 +480,34 @@ def initialize_database(database_url: str) -> Any:
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
                 )
+
+                # Migration for corporate_actions constraint canonicalization:
+                # Drop separate duplicate unique index if present
+                cursor.execute("DROP INDEX IF EXISTS idx_corp_actions_identity;")
+
+                # Ensure canonical UNIQUE constraint 'corporate_actions_identity_key' exists
                 cursor.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_corp_actions_identity ON corporate_actions (symbol, action_type, action_date, source);"
+                    """
+                    SELECT constraint_name
+                    FROM information_schema.table_constraints
+                    WHERE table_schema = 'public'
+                      AND table_name = 'corporate_actions'
+                      AND constraint_type = 'UNIQUE';
+                    """
                 )
+                existing_constraints = {row[0] for row in cursor.fetchall()}
+
+                if "corporate_actions_identity_key" not in existing_constraints:
+                    for old_con in existing_constraints:
+                        cursor.execute(f"ALTER TABLE corporate_actions DROP CONSTRAINT IF EXISTS {old_con};")
+
+                    cursor.execute(
+                        """
+                        ALTER TABLE corporate_actions
+                        ADD CONSTRAINT corporate_actions_identity_key
+                        UNIQUE (symbol, action_type, action_date, source);
+                        """
+                    )
 
             connection.commit()
 

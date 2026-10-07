@@ -485,9 +485,9 @@ def store_market_price(
     """
     Store a normalized market-price record idempotently and return (record_hash, outcome).
 
-    Outcome is either 'INSERTED' or 'DUPLICATE'.
+    Outcome is 'INSERTED', 'DUPLICATE', or 'CONFLICT'.
     Raises MarketDataConflictError if a record for the same symbol/price_date/source
-    already exists with materially different price data.
+    already exists with materially different price data (for SQLite or pre-check callers).
     """
 
     initialize_database(database_url)
@@ -518,6 +518,76 @@ def store_market_price(
           AND source = {placeholder}
     """
 
+    values = (
+        normalized_symbol,
+        normalized_date,
+        open_price,
+        high,
+        low,
+        close,
+        adjusted_close,
+        volume,
+        normalized_source,
+        record_hash,
+        utc_now(),
+    )
+
+    placeholders = ", ".join(
+        placeholder
+        for _ in values
+    )
+
+    if is_postgresql_url(database_url):
+        insert_sql = f"""
+            INSERT INTO market_prices (
+                symbol,
+                price_date,
+                open,
+                high,
+                low,
+                close,
+                adjusted_close,
+                volume,
+                source,
+                record_hash,
+                created_at
+            )
+            VALUES (
+                {placeholders}
+            )
+            ON CONFLICT (
+                symbol,
+                price_date,
+                source
+            )
+            DO NOTHING
+            RETURNING record_hash
+        """
+
+        with connect(database_url) as connection:
+            cursor = connection.execute(insert_sql, values)
+            row = cursor.fetchone()
+
+            if row is not None:
+                connection.commit()
+                return record_hash, "INSERTED"
+
+            connection.rollback()
+
+            cursor = connection.execute(
+                select_sql,
+                (normalized_symbol, normalized_date, normalized_source),
+            )
+            existing = cursor.fetchone()
+
+            if existing is not None:
+                existing_hash = _row_value(existing, "record_hash", index=0)
+                if existing_hash == record_hash:
+                    return record_hash, "DUPLICATE"
+                return record_hash, "CONFLICT"
+
+            return record_hash, "CONFLICT"
+
     with connect(database_url) as connection:
         cursor = connection.execute(
             select_sql,
@@ -534,75 +604,27 @@ def store_market_price(
                 f"source '{normalized_source}' already exists with different values."
             )
 
-        values = (
-            normalized_symbol,
-            normalized_date,
-            open_price,
-            high,
-            low,
-            close,
-            adjusted_close,
-            volume,
-            normalized_source,
-            record_hash,
-            utc_now(),
-        )
-
-        placeholders = ", ".join(
-            placeholder
-            for _ in values
-        )
-
-        if is_postgresql_url(database_url):
-            connection.execute(
-                f"""
-                INSERT INTO market_prices (
-                    symbol,
-                    price_date,
-                    open,
-                    high,
-                    low,
-                    close,
-                    adjusted_close,
-                    volume,
-                    source,
-                    record_hash,
-                    created_at
-                )
-                VALUES (
-                    {placeholders}
-                )
-                ON CONFLICT (
-                    symbol,
-                    price_date,
-                    source
-                )
-                DO NOTHING
-                """,
-                values,
+        connection.execute(
+            f"""
+            INSERT OR IGNORE INTO market_prices (
+                symbol,
+                price_date,
+                open,
+                high,
+                low,
+                close,
+                adjusted_close,
+                volume,
+                source,
+                record_hash,
+                created_at
             )
-        else:
-            connection.execute(
-                f"""
-                INSERT OR IGNORE INTO market_prices (
-                    symbol,
-                    price_date,
-                    open,
-                    high,
-                    low,
-                    close,
-                    adjusted_close,
-                    volume,
-                    source,
-                    record_hash,
-                    created_at
-                )
-                VALUES (
-                    {placeholders}
-                )
-                """,
-                values,
+            VALUES (
+                {placeholders}
             )
+            """,
+            values,
+        )
 
         connection.commit()
 
@@ -720,18 +742,13 @@ def store_corporate_action(
             is_expected_unique_race = False
 
             if PSYCOPG_INTEGRITY_ERRORS and isinstance(exc, PSYCOPG_INTEGRITY_ERRORS):
-                pgcode = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
-                if pgcode == "23505" or (
-                    hasattr(psycopg.errors, "UniqueViolation")
-                    and isinstance(exc, psycopg.errors.UniqueViolation)
-                ):
-                    diag = getattr(exc, "diag", None)
-                    diag_table = getattr(diag, "table_name", None)
-                    diag_constraint = getattr(diag, "constraint_name", None)
+                diag = getattr(exc, "diag", None)
+                diag_table = getattr(diag, "table_name", None) if diag else None
+                diag_constraint = getattr(diag, "constraint_name", None) if diag else None
 
-                    # Require exact table AND constraint match without substring or fallback matching
-                    if diag_table == "corporate_actions" and diag_constraint == "idx_corp_actions_identity":
-                        is_expected_unique_race = True
+                # Require exact table AND canonical constraint match
+                if diag_table == "corporate_actions" and diag_constraint == "corporate_actions_identity_key":
+                    is_expected_unique_race = True
 
             elif isinstance(exc, sqlite3.IntegrityError):
                 msg = str(exc)

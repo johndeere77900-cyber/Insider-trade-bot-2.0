@@ -43,7 +43,11 @@ from scripts.acquire_corporate_actions import (
     run_corporate_actions_acquisition,
 )
 from scripts.acquire_market_data import parse_args, run_acquisition
-from storage.repository import count_records, store_corporate_action
+from storage.repository import (
+    count_records,
+    store_corporate_action,
+    store_market_price,
+)
 
 
 # ==============================================================================
@@ -608,7 +612,7 @@ def test_postgresql_unrelated_constraint_on_corporate_actions_table_propagates(t
     def mock_connect_pg(url):
         return MockRaceConnectionWrapper(real_connect(url), err_to_raise=MockPGUniqueViolation("Unrelated corporate_actions constraint"))
 
-    with patch("storage.repository.PSYCOPG_INTEGRITY_ERRORS", (MockPGUniqueViolation,)):
+    with patch("storage.repository.PSYCOPG_INTEGRITY_ERRORS", (MockPGUniqueViolation,)), patch("storage.repository.INTEGRITY_ERRORS", (sqlite3.IntegrityError, MockPGUniqueViolation)):
         with patch("storage.repository.connect", side_effect=mock_connect_pg):
             with pytest.raises(MockPGUniqueViolation):
                 store_corporate_action(
@@ -623,6 +627,56 @@ def test_postgresql_unrelated_constraint_on_corporate_actions_table_propagates(t
                 )
 
     assert count_records(db_url, "corporate_actions") == 1
+
+
+def test_postgresql_expected_corporate_actions_identity_key_race_handled(tmp_path) -> None:
+    """
+    Regression test proving that a PostgreSQL-style UniqueViolation with table_name == 'corporate_actions'
+    and constraint_name == 'corporate_actions_identity_key' IS recognized as expected identity race.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_pg_expected_race.db"
+    initialize_database(db_url)
+
+    raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
+    hash1, outcome1 = store_corporate_action(
+        db_url,
+        symbol="AAPL",
+        action_type="split",
+        action_date="2020-08-31",
+        ratio="4:1",
+        cash_amount=None,
+        source="fmp",
+        raw_payload=raw1,
+    )
+    assert outcome1 == "INSERTED"
+
+    class MockPGDiag:
+        table_name = "corporate_actions"
+        constraint_name = "corporate_actions_identity_key"
+
+    class MockPGUniqueViolation(Exception):
+        pgcode = "23505"
+        diag = MockPGDiag()
+
+    real_connect = connect
+
+    def mock_connect_pg(url):
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=MockPGUniqueViolation("Canonical identity race"))
+
+    with patch("storage.repository.PSYCOPG_INTEGRITY_ERRORS", (MockPGUniqueViolation,)), patch("storage.repository.INTEGRITY_ERRORS", (sqlite3.IntegrityError, MockPGUniqueViolation)):
+        with patch("storage.repository.connect", side_effect=mock_connect_pg):
+            h_res, o_res = store_corporate_action(
+                db_url,
+                symbol="AAPL",
+                action_type="split",
+                action_date="2020-08-31",
+                ratio="4:1",
+                cash_amount=None,
+                source="fmp",
+                raw_payload=raw1,
+            )
+            assert o_res == "DUPLICATE"
+            assert h_res == hash1
 
 
 def test_postgresql_bare_23505_without_diagnostics_propagates(tmp_path) -> None:
@@ -650,7 +704,7 @@ def test_postgresql_bare_23505_without_diagnostics_propagates(tmp_path) -> None:
     def mock_connect_pg_bare(url):
         return MockRaceConnectionWrapper(real_connect(url), err_to_raise=MockPGBareUniqueViolation("Bare 23505"))
 
-    with patch("storage.repository.PSYCOPG_INTEGRITY_ERRORS", (MockPGBareUniqueViolation,)):
+    with patch("storage.repository.PSYCOPG_INTEGRITY_ERRORS", (MockPGBareUniqueViolation,)), patch("storage.repository.INTEGRITY_ERRORS", (sqlite3.IntegrityError, MockPGBareUniqueViolation)):
         with patch("storage.repository.connect", side_effect=mock_connect_pg_bare):
             with pytest.raises(MockPGBareUniqueViolation):
                 store_corporate_action(
@@ -834,6 +888,117 @@ def test_real_postgres_corporate_action_concurrency() -> None:
                 )
                 prov_row = cur.fetchone()
                 assert prov_row[0] == 1
+
+    finally:
+        cleanup_test_data()
+
+
+def test_real_postgres_market_price_concurrency() -> None:
+    """
+    Real PostgreSQL Market Price Concurrency Integration Test.
+    Executed only if POSTGRES_TEST_URL or DATABASE_URL targeting PostgreSQL is available.
+    """
+    pg_url = os.getenv("POSTGRES_TEST_URL") or os.getenv("DATABASE_URL", "")
+    if not is_postgresql_url(pg_url):
+        pytest.skip("PostgreSQL test database not available for live concurrency testing.")
+
+    initialize_database(pg_url)
+
+    test_symbol = "TESTPRICE"
+    test_date = "2024-01-02"
+    test_src = "test_src"
+
+    def cleanup_test_data():
+        with connect(pg_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM market_prices WHERE symbol = %s AND price_date = %s AND source = %s",
+                    (test_symbol, test_date, test_src)
+                )
+            conn.commit()
+
+    cleanup_test_data()
+
+    try:
+        # A. Same-content race
+        def worker_same():
+            return store_market_price(
+                pg_url,
+                symbol=test_symbol,
+                price_date=test_date,
+                open_price=100.0,
+                high=105.0,
+                low=99.0,
+                close=104.0,
+                adjusted_close=104.0,
+                volume=1000.0,
+                source=test_src,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(worker_same)
+            f2 = executor.submit(worker_same)
+            res1 = f1.result()
+            res2 = f2.result()
+
+        outcomes_same = sorted([res1[1], res2[1]])
+        assert outcomes_same == ["DUPLICATE", "INSERTED"]
+
+        with connect(pg_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM market_prices WHERE symbol = %s AND price_date = %s AND source = %s",
+                    (test_symbol, test_date, test_src)
+                )
+                assert cur.fetchone()[0] == 1
+
+        # B. Different-content race
+        cleanup_test_data()
+
+        def worker_diff_a():
+            return store_market_price(
+                pg_url,
+                symbol=test_symbol,
+                price_date=test_date,
+                open_price=100.0,
+                high=105.0,
+                low=99.0,
+                close=104.0,
+                adjusted_close=104.0,
+                volume=1000.0,
+                source=test_src,
+            )
+
+        def worker_diff_b():
+            return store_market_price(
+                pg_url,
+                symbol=test_symbol,
+                price_date=test_date,
+                open_price=100.0,
+                high=105.0,
+                low=99.0,
+                close=120.0,
+                adjusted_close=104.0,
+                volume=1000.0,
+                source=test_src,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(worker_diff_a)
+            f2 = executor.submit(worker_diff_b)
+            res_a = f1.result()
+            res_b = f2.result()
+
+        outcomes_diff = sorted([res_a[1], res_b[1]])
+        assert outcomes_diff == ["CONFLICT", "INSERTED"]
+
+        with connect(pg_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM market_prices WHERE symbol = %s AND price_date = %s AND source = %s",
+                    (test_symbol, test_date, test_src)
+                )
+                assert cur.fetchone()[0] == 1
 
     finally:
         cleanup_test_data()
