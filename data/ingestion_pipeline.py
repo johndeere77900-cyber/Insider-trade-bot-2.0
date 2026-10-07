@@ -211,12 +211,12 @@ def ingest_corporate_action(
     *,
     source: str,
     source_reference: str | None = None,
-) -> str:
+) -> tuple[str, str]:
     """
     Normalize, validate, store, and provenance-track one corporate action.
 
     Returns:
-        Deterministic record hash.
+        Tuple of (record_hash, outcome), where outcome is 'INSERTED', 'DUPLICATE', or 'CONFLICT'.
     """
 
     try:
@@ -242,9 +242,11 @@ def ingest_corporate_action(
             errors
         )
 
+    # Compute record_hash strictly from normalized domain record content
+    normalized_hash = calculate_normalized_record_hash(record)
     raw_payload = dict(payload)
 
-    record_hash = store_corporate_action(
+    record_hash, outcome = store_corporate_action(
         database_url,
         symbol=record.symbol,
         action_type=record.action_type,
@@ -253,19 +255,22 @@ def ingest_corporate_action(
         cash_amount=record.cash_amount,
         source=record.source,
         raw_payload=raw_payload,
+        record_hash=normalized_hash,
     )
 
-    store_provenance(
-        database_url,
-        record_type="corporate_action",
-        record_id=record_hash,
-        source=record.source,
-        source_reference=source_reference,
-        checksum=record_hash,
-        validation_status="validated",
-    )
+    # Provenance rule: Store provenance ONLY for newly INSERTED corporate actions.
+    if outcome == "INSERTED":
+        store_provenance(
+            database_url,
+            record_type="corporate_action",
+            record_id=record_hash,
+            source=record.source,
+            source_reference=source_reference,
+            checksum=record_hash,
+            validation_status="validated",
+        )
 
-    return record_hash
+    return record_hash, outcome
 
 
 def calculate_normalized_record_hash(
@@ -362,11 +367,12 @@ def ingest_batch(
                 )
 
             else:
-                record_hash = ingest_corporate_action(
+                res = ingest_corporate_action(
                     database_url,
                     payload,
                     source=source,
                 )
+                record_hash = res[0]
 
         except IngestionError as exc:
             raise IngestionError(

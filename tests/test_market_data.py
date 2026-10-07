@@ -431,6 +431,58 @@ def test_acquisition_provider_failure_and_symbol_mismatch(tmp_path) -> None:
     assert len(report.provider_failures) == 1
 
 
+def test_acquisition_storage_failure_is_not_provider_failure(tmp_path) -> None:
+    """
+    Tests that a database/loader exception during record ingestion does NOT
+    increment provider_request_failures or trigger a re-fetch.
+    """
+    db_url = f"sqlite:///{tmp_path}/storage_boundary_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "boundary_vendor"
+    mock_provider.supports_batch = False
+    mock_provider.get_historical_prices.return_value = [
+        {"symbol": "AAPL", "date": "2023-01-01", "close": 150.0}
+    ]
+
+    service = MarketDataAcquisitionService(mock_provider)
+
+    with patch("data.market_data_acquisition.load_market_prices_detailed", side_effect=RuntimeError("Disk write error")):
+        report = service.acquire_historical_data(db_url, symbols=["AAPL"])
+
+        assert report.provider_request_failures == 0
+        assert report.records_failed == 1
+        assert mock_provider.get_historical_prices.call_count == 1
+
+
+def test_batch_storage_failure_does_not_trigger_provider_fallback(tmp_path) -> None:
+    """
+    Tests that when a batch provider call succeeds but database storage fails,
+    provider_request_failures remains 0 and individual provider fallback is NOT triggered.
+    """
+    db_url = f"sqlite:///{tmp_path}/batch_storage_boundary_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "batch_boundary_vendor"
+    mock_provider.supports_batch = True
+    mock_provider.get_historical_prices_batch.return_value = [
+        {"symbol": "AAPL", "date": "2023-01-01", "close": 150.0},
+        {"symbol": "MSFT", "date": "2023-01-01", "close": 250.0},
+    ]
+
+    service = MarketDataAcquisitionService(mock_provider)
+
+    with patch("data.market_data_acquisition.load_market_prices_detailed", side_effect=RuntimeError("Batch storage crash")):
+        report = service.acquire_historical_data(db_url, symbols=["AAPL", "MSFT"])
+
+        assert mock_provider.get_historical_prices_batch.call_count == 1
+        assert mock_provider.get_historical_prices.call_count == 0
+        assert report.provider_request_failures == 0
+        assert report.records_failed == 2
+
+
 # ==========================================
 # G. NEW SPECIFIC REGRESSION TESTS (A - E)
 # ==========================================

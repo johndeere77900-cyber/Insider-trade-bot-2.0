@@ -86,6 +86,7 @@ class MarketDataAcquisitionService:
     ) -> MarketDataAcquisitionReport:
         """
         Acquire historical market data for symbols across start_date..end_date.
+        Separates Provider Fetch (Phase A) from Record Ingestion (Phase B).
         """
         requested_symbols = tuple(
             dict.fromkeys(
@@ -146,73 +147,112 @@ class MarketDataAcquisitionService:
         provider_failures: list[dict[str, Any]] = []
         total_provider_request_failures = 0
 
-        # Decide retrieval strategy
+        # Strategy decision
         if self.provider.supports_batch and len(requested_symbols) > 1:
-            batch_success = False
+            batch_response: list[dict[str, Any]] | None = None
+
+            # Phase A — Batch Provider Fetch
             try:
-                response = self.provider.get_historical_prices_batch(
+                batch_response = self.provider.get_historical_prices_batch(
                     symbols=requested_symbols,
                     start_date=start_date,
                     end_date=end_date,
                 )
-                outcomes = load_market_prices_detailed(
-                    database_url,
-                    response,
-                    source=provider_source,
-                    source_reference=source_reference or "batch_request",
-                )
-                self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts)
-                batch_success = True
-
             except Exception as exc:
                 err_msg = str(exc)
                 total_provider_request_failures += 1
                 provider_failures.append({"type": "batch", "symbols": requested_symbols, "error": err_msg})
+                batch_response = None
 
-            if not batch_success:
-                # Fallback to individual requests per symbol
+            # Phase B — Batch Ingestion (if provider fetch succeeded)
+            if batch_response is not None:
+                try:
+                    outcomes = load_market_prices_detailed(
+                        database_url,
+                        batch_response,
+                        source=provider_source,
+                        source_reference=source_reference or "batch_request",
+                    )
+                    self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts)
+                except Exception as exc:
+                    err_msg = f"Batch ingestion storage error: {exc}"
+                    rec_cnt = len(batch_response) if isinstance(batch_response, list) else 1
+                    # Attribute unmapped batch storage failure to requested symbols evenly or unmapped
+                    symbol_counts[unmapped_key]["received"] += rec_cnt
+                    symbol_counts[unmapped_key]["record_failures"] += rec_cnt
+                    symbol_counts[unmapped_key]["errors"].append(err_msg)
+            else:
+                # Fallback to individual requests per symbol ONLY when batch provider fetch failed
                 for sym in requested_symbols:
+                    sym_resp: list[dict[str, Any]] | None = None
+
+                    # Phase A — Individual Provider Fetch
                     try:
-                        response = self.provider.get_historical_prices(
+                        sym_resp = self.provider.get_historical_prices(
                             symbol=sym,
                             start_date=start_date,
                             end_date=end_date,
                         )
-                        outcomes = load_market_prices_detailed(
-                            database_url,
-                            response,
-                            source=provider_source,
-                            source_reference=source_reference or f"request:{sym}",
-                        )
-                        self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts, fallback_symbol=sym)
                     except Exception as exc:
                         err_msg = str(exc)
                         total_provider_request_failures += 1
                         symbol_counts[sym]["provider_request_failures"] += 1
                         symbol_counts[sym]["errors"].append(err_msg)
                         provider_failures.append({"type": "individual", "symbol": sym, "error": err_msg})
+                        sym_resp = None
+
+                    # Phase B — Individual Ingestion
+                    if sym_resp is not None:
+                        try:
+                            outcomes = load_market_prices_detailed(
+                                database_url,
+                                sym_resp,
+                                source=provider_source,
+                                source_reference=source_reference or f"request:{sym}",
+                            )
+                            self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts, fallback_symbol=sym)
+                        except Exception as exc:
+                            err_msg = f"Storage error for {sym}: {exc}"
+                            rec_cnt = len(sym_resp) if isinstance(sym_resp, list) else 1
+                            symbol_counts[sym]["received"] += rec_cnt
+                            symbol_counts[sym]["record_failures"] += rec_cnt
+                            symbol_counts[sym]["errors"].append(err_msg)
         else:
             # Direct per-symbol processing
             for sym in requested_symbols:
+                sym_resp = None
+
+                # Phase A — Provider Fetch
                 try:
-                    response = self.provider.get_historical_prices(
+                    sym_resp = self.provider.get_historical_prices(
                         symbol=sym,
                         start_date=start_date,
                         end_date=end_date,
                     )
-                    outcomes = load_market_prices_detailed(
-                        database_url,
-                        response,
-                        source=provider_source,
-                        source_reference=source_reference or f"request:{sym}",
-                    )
-                    self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts, fallback_symbol=sym)
                 except Exception as exc:
                     err_msg = str(exc)
                     total_provider_request_failures += 1
                     symbol_counts[sym]["provider_request_failures"] += 1
                     symbol_counts[sym]["errors"].append(err_msg)
                     provider_failures.append({"type": "individual", "symbol": sym, "error": err_msg})
+                    sym_resp = None
+
+                # Phase B — Record Ingestion
+                if sym_resp is not None:
+                    try:
+                        outcomes = load_market_prices_detailed(
+                            database_url,
+                            sym_resp,
+                            source=provider_source,
+                            source_reference=source_reference or f"request:{sym}",
+                        )
+                        self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts, fallback_symbol=sym)
+                    except Exception as exc:
+                        err_msg = f"Storage error for {sym}: {exc}"
+                        rec_cnt = len(sym_resp) if isinstance(sym_resp, list) else 1
+                        symbol_counts[sym]["received"] += rec_cnt
+                        symbol_counts[sym]["record_failures"] += rec_cnt
+                        symbol_counts[sym]["errors"].append(err_msg)
 
         # Calculate totals
         total_received = sum(c["received"] for c in symbol_counts.values())

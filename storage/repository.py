@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -24,6 +26,19 @@ from database.connection import (
     initialize_database,
     is_postgresql_url,
 )
+
+try:
+    import psycopg.errors
+    PSYCOPG_INTEGRITY_ERRORS: tuple[type[BaseException], ...] = (
+        psycopg.errors.UniqueViolation,
+        psycopg.errors.IntegrityError,
+    )
+except ImportError:
+    PSYCOPG_INTEGRITY_ERRORS = ()
+
+INTEGRITY_ERRORS: tuple[type[BaseException], ...] = (
+    sqlite3.IntegrityError,
+) + PSYCOPG_INTEGRITY_ERRORS
 
 
 ALLOWED_PAYLOAD_TABLES = {
@@ -604,59 +619,148 @@ def store_corporate_action(
     cash_amount: float | None,
     source: str,
     raw_payload: dict[str, Any],
-) -> str:
-    """Store a normalized corporate-action record and return its hash."""
+    record_hash: str | None = None,
+) -> tuple[str, str]:
+    """
+    Store a normalized corporate-action record idempotently and return (record_hash, outcome).
+
+    Identity is provider-neutral: (symbol, action_type, action_date, source).
+    Outcomes:
+        - 'INSERTED': New identity row stored.
+        - 'DUPLICATE': Identity exists with identical normalized record_hash (no-op).
+        - 'CONFLICT': Identity exists with different normalized record_hash (no-op, report conflict).
+    """
 
     initialize_database(database_url)
 
-    record_hash = sha256_record(raw_payload)
+    norm_symbol = str(symbol).strip().upper()
+    norm_action_type = str(action_type).strip().lower()
+    norm_action_date = str(action_date).strip()
+    norm_source = str(source).strip().lower()
+
+    if record_hash is None:
+        norm_dict = {
+            "symbol": norm_symbol,
+            "action_type": norm_action_type,
+            "action_date": norm_action_date,
+            "ratio": str(ratio).strip() if ratio is not None else None,
+            "cash_amount": float(cash_amount) if cash_amount is not None else None,
+            "source": norm_source,
+        }
+        record_hash = sha256_record(norm_dict)
+
     placeholder = _placeholder(database_url)
 
-    values = (
-        symbol,
-        action_type,
-        action_date,
-        ratio,
-        cash_amount,
-        source,
-        json.dumps(
-            raw_payload,
-            sort_keys=True,
-            default=str,
-        ),
-        record_hash,
-        utc_now(),
-    )
-
-    placeholders = ", ".join(
-        placeholder
-        for _ in values
-    )
+    select_sql = f"""
+        SELECT record_hash
+        FROM corporate_actions
+        WHERE symbol = {placeholder}
+          AND action_type = {placeholder}
+          AND action_date = {placeholder}
+          AND source = {placeholder}
+    """
 
     with connect(database_url) as connection:
-        connection.execute(
-            f"""
-            INSERT INTO corporate_actions (
-                symbol,
-                action_type,
-                action_date,
-                ratio,
-                cash_amount,
-                source,
+        cursor = connection.execute(
+            select_sql,
+            (norm_symbol, norm_action_type, norm_action_date, norm_source),
+        )
+        existing = cursor.fetchone()
+
+        if existing is not None:
+            existing_hash = _row_value(existing, "record_hash", index=0)
+            if existing_hash == record_hash:
+                return record_hash, "DUPLICATE"
+            return record_hash, "CONFLICT"
+
+        values = (
+            norm_symbol,
+            norm_action_type,
+            norm_action_date,
+            ratio,
+            cash_amount,
+            norm_source,
+            json.dumps(
                 raw_payload,
-                record_hash,
-                created_at
-            )
-            VALUES (
-                {placeholders}
-            )
-            """,
-            values,
+                sort_keys=True,
+                default=str,
+            ),
+            record_hash,
+            utc_now(),
         )
 
-        connection.commit()
+        placeholders = ", ".join(placeholder for _ in values)
 
-    return record_hash
+        try:
+            connection.execute(
+                f"""
+                INSERT INTO corporate_actions (
+                    symbol,
+                    action_type,
+                    action_date,
+                    ratio,
+                    cash_amount,
+                    source,
+                    raw_payload,
+                    record_hash,
+                    created_at
+                )
+                VALUES (
+                    {placeholders}
+                )
+                """,
+                values,
+            )
+            connection.commit()
+            return record_hash, "INSERTED"
+
+        except INTEGRITY_ERRORS as exc:
+            connection.rollback()
+
+            is_expected_unique_race = False
+
+            if PSYCOPG_INTEGRITY_ERRORS and isinstance(exc, PSYCOPG_INTEGRITY_ERRORS):
+                pgcode = getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None)
+                if pgcode == "23505" or (
+                    hasattr(psycopg.errors, "UniqueViolation")
+                    and isinstance(exc, psycopg.errors.UniqueViolation)
+                ):
+                    diag = getattr(exc, "diag", None)
+                    diag_table = getattr(diag, "table_name", None)
+                    diag_constraint = getattr(diag, "constraint_name", None)
+
+                    # Require exact table AND constraint match without substring or fallback matching
+                    if diag_table == "corporate_actions" and diag_constraint == "idx_corp_actions_identity":
+                        is_expected_unique_race = True
+
+            elif isinstance(exc, sqlite3.IntegrityError):
+                msg = str(exc)
+                if "UNIQUE constraint failed:" in msg:
+                    match = re.search(r"UNIQUE constraint failed:\s*(.+)$", msg, re.IGNORECASE)
+                    if match:
+                        cols = {c.strip() for c in match.group(1).split(",")}
+                        expected = {
+                            "corporate_actions.symbol",
+                            "corporate_actions.action_type",
+                            "corporate_actions.action_date",
+                            "corporate_actions.source",
+                        }
+                        if cols == expected:
+                            is_expected_unique_race = True
+
+            if is_expected_unique_race:
+                cursor = connection.execute(
+                    select_sql,
+                    (norm_symbol, norm_action_type, norm_action_date, norm_source),
+                )
+                race_existing = cursor.fetchone()
+                if race_existing is not None:
+                    race_hash = _row_value(race_existing, "record_hash", index=0)
+                    if race_hash == record_hash:
+                        return record_hash, "DUPLICATE"
+                    return record_hash, "CONFLICT"
+
+            raise
 
 
 def table_exists(

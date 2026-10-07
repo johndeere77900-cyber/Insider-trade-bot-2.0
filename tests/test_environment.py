@@ -5,8 +5,10 @@ import pytest
 from config.environment import (
     EnvironmentConfigurationError,
     load_environment,
+    validate_fmp_config,
 )
 from config.environment_validator import EnvironmentValidator
+from data.market_data_provider_factory import get_market_data_provider
 
 
 def base_environment() -> dict[str, str]:
@@ -57,6 +59,48 @@ def test_missing_sec_user_agent_is_rejected() -> None:
 
     with pytest.raises(EnvironmentConfigurationError):
         load_environment(values)
+
+
+def test_fmp_config_optional_at_startup() -> None:
+    values = base_environment()
+    settings = load_environment(values)
+    assert settings.fmp_api_key == ""
+    assert settings.fmp_base_url == "https://financialmodelingprep.com/stable"
+
+
+def test_fmp_config_validation_succeeds_when_key_present() -> None:
+    values = base_environment()
+    values["FMP_API_KEY"] = "my_fmp_key"
+    settings = load_environment(values)
+    validate_fmp_config(settings)
+    assert settings.fmp_api_key == "my_fmp_key"
+
+
+def test_fmp_config_validation_fails_when_key_missing() -> None:
+    values = base_environment()
+    settings = load_environment(values)
+    with pytest.raises(EnvironmentConfigurationError, match="FMP_API_KEY is required"):
+        validate_fmp_config(settings)
+
+
+def test_fmp_config_validation_fails_when_base_url_blank() -> None:
+    values = base_environment()
+    values["FMP_API_KEY"] = "key"
+    values["FMP_BASE_URL"] = "   "
+    settings = load_environment(values)
+    with pytest.raises(EnvironmentConfigurationError, match="FMP_BASE_URL is required"):
+        validate_fmp_config(settings)
+
+
+def test_factory_level_fmp_request_validates_resolved_configuration() -> None:
+    values = base_environment()
+    settings = load_environment(values)
+
+    with pytest.raises(EnvironmentConfigurationError, match="FMP_API_KEY is required"):
+        get_market_data_provider("fmp", settings=settings)
+
+    provider = get_market_data_provider("fmp", settings=settings, api_key="explicit_override_key")
+    assert provider.api_key == "explicit_override_key"
 
 
 def test_telegram_requires_bot_token() -> None:

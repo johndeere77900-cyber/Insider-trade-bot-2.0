@@ -207,7 +207,13 @@ def _postgres_schema() -> str:
         source TEXT NOT NULL,
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        UNIQUE (
+            symbol,
+            action_type,
+            action_date,
+            source
+        )
     );
 
     CREATE TABLE IF NOT EXISTS research_events (
@@ -340,7 +346,13 @@ def _sqlite_schema() -> str:
         source TEXT NOT NULL,
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        UNIQUE (
+            symbol,
+            action_type,
+            action_date,
+            source
+        )
     );
 
     CREATE TABLE IF NOT EXISTS research_events (
@@ -396,7 +408,7 @@ def _sqlite_schema() -> str:
 def initialize_database(database_url: str) -> Any:
     """
     Create and initialize the configured database, including migration
-    of new columns on existing tables.
+    of new columns and unique indexes on existing tables.
 
     The existing SQLite backend remains supported for local testing.
     PostgreSQL is supported for persistent deployment.
@@ -430,9 +442,12 @@ def initialize_database(database_url: str) -> Any:
                         f"ALTER TABLE insider_transactions ADD COLUMN {col_name} {col_type}"
                     )
 
-            # Ensure indexes exist for insider_transactions query optimization
+            # Ensure indexes exist for query optimization and identity enforcement
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_corp_actions_identity ON corporate_actions (symbol, action_type, action_date, source);"
             )
 
             connection.commit()
@@ -464,6 +479,9 @@ def initialize_database(database_url: str) -> Any:
                 # Ensure PostgreSQL indexes exist
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
+                )
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_corp_actions_identity ON corporate_actions (symbol, action_type, action_date, source);"
                 )
 
             connection.commit()
