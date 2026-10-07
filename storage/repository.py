@@ -604,6 +604,7 @@ def store_corporate_action(
     cash_amount: float | None,
     source: str,
     raw_payload: dict[str, Any],
+    record_hash: str | None = None,
 ) -> tuple[str, str]:
     """
     Store a normalized corporate-action record idempotently and return (record_hash, outcome).
@@ -611,8 +612,8 @@ def store_corporate_action(
     Identity is provider-neutral: (symbol, action_type, action_date, source).
     Outcomes:
         - 'INSERTED': New identity row stored.
-        - 'DUPLICATE': Identity exists with identical record_hash (no-op).
-        - 'CONFLICT': Identity exists with different record_hash (no-op, report conflict).
+        - 'DUPLICATE': Identity exists with identical normalized record_hash (no-op).
+        - 'CONFLICT': Identity exists with different normalized record_hash (no-op, report conflict).
     """
 
     initialize_database(database_url)
@@ -622,7 +623,17 @@ def store_corporate_action(
     norm_action_date = str(action_date).strip()
     norm_source = str(source).strip().lower()
 
-    record_hash = sha256_record(raw_payload)
+    if record_hash is None:
+        norm_dict = {
+            "symbol": norm_symbol,
+            "action_type": norm_action_type,
+            "action_date": norm_action_date,
+            "ratio": str(ratio).strip() if ratio is not None else None,
+            "cash_amount": float(cash_amount) if cash_amount is not None else None,
+            "source": norm_source,
+        }
+        record_hash = sha256_record(norm_dict)
+
     placeholder = _placeholder(database_url)
 
     select_sql = f"""
@@ -665,7 +676,7 @@ def store_corporate_action(
 
         placeholders = ", ".join(placeholder for _ in values)
 
-        if is_postgresql_url(database_url):
+        try:
             connection.execute(
                 f"""
                 INSERT INTO corporate_actions (
@@ -682,40 +693,25 @@ def store_corporate_action(
                 VALUES (
                     {placeholders}
                 )
-                ON CONFLICT (
-                    symbol,
-                    action_type,
-                    action_date,
-                    source
-                )
-                DO NOTHING
                 """,
                 values,
             )
-        else:
-            connection.execute(
-                f"""
-                INSERT OR IGNORE INTO corporate_actions (
-                    symbol,
-                    action_type,
-                    action_date,
-                    ratio,
-                    cash_amount,
-                    source,
-                    raw_payload,
-                    record_hash,
-                    created_at
-                )
-                VALUES (
-                    {placeholders}
-                )
-                """,
-                values,
+            connection.commit()
+            return record_hash, "INSERTED"
+
+        except Exception as exc:
+            connection.rollback()
+            cursor = connection.execute(
+                select_sql,
+                (norm_symbol, norm_action_type, norm_action_date, norm_source),
             )
-
-        connection.commit()
-
-    return record_hash, "INSERTED"
+            race_existing = cursor.fetchone()
+            if race_existing is not None:
+                race_hash = _row_value(race_existing, "record_hash", index=0)
+                if race_hash == record_hash:
+                    return record_hash, "DUPLICATE"
+                return record_hash, "CONFLICT"
+            raise exc
 
 
 def table_exists(

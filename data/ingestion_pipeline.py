@@ -242,6 +242,8 @@ def ingest_corporate_action(
             errors
         )
 
+    # Compute record_hash strictly from normalized domain record content
+    normalized_hash = calculate_normalized_record_hash(record)
     raw_payload = dict(payload)
 
     record_hash, outcome = store_corporate_action(
@@ -253,10 +255,11 @@ def ingest_corporate_action(
         cash_amount=record.cash_amount,
         source=record.source,
         raw_payload=raw_payload,
+        record_hash=normalized_hash,
     )
 
-    # Store provenance for accepted and duplicate records (avoiding provenance on conflicts)
-    if outcome in ("INSERTED", "DUPLICATE"):
+    # Provenance rule: Store provenance ONLY for newly INSERTED corporate actions.
+    if outcome == "INSERTED":
         store_provenance(
             database_url,
             record_type="corporate_action",

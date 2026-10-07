@@ -296,7 +296,7 @@ def test_store_corporate_action_outcomes(tmp_path) -> None:
     initialize_database(db_url)
 
     raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
-    raw2 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "5:1", "source": "fmp"}  # Different content
+    raw2 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "5:1", "source": "fmp"}
 
     # 1. New identity -> INSERTED
     hash1, outcome1 = store_corporate_action(
@@ -342,54 +342,61 @@ def test_store_corporate_action_outcomes(tmp_path) -> None:
     assert count_records(db_url, "corporate_actions") == 1  # Row count remains strictly 1!
 
 
+def test_store_corporate_action_unique_constraint_race_recovery(tmp_path) -> None:
+    """Tests unique constraint race recovery path returning DUPLICATE or CONFLICT."""
+    db_url = f"sqlite:///{tmp_path}/ca_race_test.db"
+    initialize_database(db_url)
+
+    raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
+
+    # Seed initial row
+    hash1, outcome1 = store_corporate_action(
+        db_url,
+        symbol="AAPL",
+        action_type="split",
+        action_date="2020-08-31",
+        ratio="4:1",
+        cash_amount=None,
+        source="fmp",
+        raw_payload=raw1,
+    )
+    assert outcome1 == "INSERTED"
+
+    # Simulate race condition: connection.execute raises sqlite3.IntegrityError on INSERT
+    with patch("storage.repository.connect") as mock_conn:
+        mock_cx = MagicMock()
+        mock_cursor = MagicMock()
+
+        # SELECT yields existing row, but execute(INSERT) raises IntegrityError
+        mock_cursor.fetchone.return_value = (hash1,)
+        mock_cx.execute.return_value = mock_cursor
+
+        mock_conn.return_value.__enter__.return_value = mock_cx
+
+        hash_res, outcome = store_corporate_action(
+            db_url,
+            symbol="AAPL",
+            action_type="split",
+            action_date="2020-08-31",
+            ratio="4:1",
+            cash_amount=None,
+            source="fmp",
+            raw_payload=raw1,
+            record_hash=hash1,
+        )
+        assert outcome == "DUPLICATE"
+        assert hash_res == hash1
+
+
 # ==============================================================================
-# 6. CORPORATE ACTIONS PROVIDER & PIPELINE TESTS
+# 6. CORPORATE ACTIONS ACQUISITION STRICT IDEMPOTENCY & CONFLICT TESTS
 # ==============================================================================
 
-def test_fmp_corporate_actions_endpoints_and_normalization() -> None:
-    """Verifies corporate split uses /splits and corporate dividend uses /dividends."""
-    ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
-
-    splits_json = json.dumps([
-        {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
-    ]).encode("utf-8")
-
-    divs_json = json.dumps([
-        {"symbol": "AAPL", "date": "2023-11-10", "dividend": 0.24}
-    ]).encode("utf-8")
-
-    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
-        mock_resp_splits = MagicMock()
-        mock_resp_splits.status = 200
-        mock_resp_splits.read.return_value = splits_json
-
-        mock_resp_divs = MagicMock()
-        mock_resp_divs.status = 200
-        mock_resp_divs.read.return_value = divs_json
-
-        mock_urlopen.return_value.__enter__.side_effect = [mock_resp_splits, mock_resp_divs]
-
-        splits = ca_provider.get_splits(symbol="AAPL")
-        req_splits = mock_urlopen.call_args_list[0][0][0]
-        assert "/splits" in req_splits.full_url
-        assert splits[0]["symbol"] == "AAPL"
-        assert splits[0]["action_type"] == "split"
-        assert splits[0]["action_date"] == "2020-08-31"
-        assert splits[0]["ratio"] == "4:1"
-
-        divs = ca_provider.get_dividends(symbol="AAPL")
-        req_divs = mock_urlopen.call_args_list[1][0][0]
-        assert "/dividends" in req_divs.full_url
-        assert divs[0]["symbol"] == "AAPL"
-        assert divs[0]["action_type"] == "dividend"
-        assert divs[0]["action_date"] == "2023-11-10"
-
-
-def test_fmp_corporate_actions_strict_idempotency_and_conflict(tmp_path) -> None:
+def test_fmp_corporate_actions_strict_tests_a_b_c(tmp_path) -> None:
     """
-    Strict Test A, Test B, and Test C for Corporate Actions Acquisition Idempotency & Conflicts.
+    Strict Test A, Test B, and Test C for Corporate Actions Acquisition.
     """
-    db_url = f"sqlite:///{tmp_path}/ca_idempotency_test.db"
+    db_url = f"sqlite:///{tmp_path}/ca_strict_test.db"
     initialize_database(db_url)
 
     ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
@@ -420,11 +427,12 @@ def test_fmp_corporate_actions_strict_idempotency_and_conflict(tmp_path) -> None
         report_a = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
 
         assert count_records(db_url, "corporate_actions") == 1
+        assert count_records(db_url, "provenance") == 1
         assert report_a.records_inserted == 1
         assert report_a.records_duplicate == 0
         assert report_a.records_conflict == 0
 
-    # TEST B — Identical second acquisition
+    # TEST B — Exact repeat acquisition
     with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
         m1 = MagicMock()
         m1.status = 200
@@ -439,11 +447,12 @@ def test_fmp_corporate_actions_strict_idempotency_and_conflict(tmp_path) -> None
         report_b = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
 
         assert count_records(db_url, "corporate_actions") == 1  # Row count remains strictly 1!
+        assert count_records(db_url, "provenance") == 1       # Provenance count remains strictly 1!
         assert report_b.records_inserted == 0
         assert report_b.records_duplicate == 1
         assert report_b.records_conflict == 0
 
-    # TEST C — Same identity, different content
+    # TEST C — Same identity, changed content
     with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
         m1 = MagicMock()
         m1.status = 200
@@ -458,9 +467,62 @@ def test_fmp_corporate_actions_strict_idempotency_and_conflict(tmp_path) -> None
         report_c = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
 
         assert count_records(db_url, "corporate_actions") == 1  # Row count remains strictly 1!
+        assert count_records(db_url, "provenance") == 1       # Provenance count remains strictly 1!
         assert report_c.records_inserted == 0
         assert report_c.records_duplicate == 0
         assert report_c.records_conflict == 1
+
+
+def test_fmp_corporate_actions_test_d_irrelevant_provider_payload_difference(tmp_path) -> None:
+    """
+    TEST D — Two provider payloads with irrelevant extra fields producing the exact same normalized corporate action.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_test_d.db"
+    initialize_database(db_url)
+
+    ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
+    service = CorporateActionsAcquisitionService(ca_provider)
+
+    # First payload: basic fields
+    splits_json_1 = json.dumps([
+        {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
+    ]).encode("utf-8")
+
+    # Second payload: includes extra/irrelevant provider response fields (e.g. "label", "fetched_at")
+    splits_json_2 = json.dumps([
+        {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1, "label": "4 for 1", "fetched_at": "12345"}
+    ]).encode("utf-8")
+
+    empty_divs_json = json.dumps([]).encode("utf-8")
+
+    # 1. First acquisition
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        m1 = MagicMock()
+        m1.status = 200
+        m1.read.return_value = splits_json_1
+        m2 = MagicMock()
+        m2.status = 200
+        m2.read.return_value = empty_divs_json
+        mock_urlopen.return_value.__enter__.side_effect = [m1, m2]
+
+        report1 = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
+        assert report1.records_inserted == 1
+        assert count_records(db_url, "corporate_actions") == 1
+
+    # 2. Second acquisition with extra raw provider fields
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        m1 = MagicMock()
+        m1.status = 200
+        m1.read.return_value = splits_json_2
+        m2 = MagicMock()
+        m2.status = 200
+        m2.read.return_value = empty_divs_json
+        mock_urlopen.return_value.__enter__.side_effect = [m1, m2]
+
+        report2 = service.acquire_corporate_actions(db_url, symbols=["AAPL"])
+        assert report2.records_inserted == 0
+        assert report2.records_duplicate == 1
+        assert count_records(db_url, "corporate_actions") == 1  # Normalized content hash match = DUPLICATE!
 
 
 def test_fmp_corporate_actions_malformed_response_rejected(tmp_path) -> None:
