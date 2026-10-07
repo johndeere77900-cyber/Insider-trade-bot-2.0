@@ -208,7 +208,7 @@ def _postgres_schema() -> str:
         raw_payload TEXT,
         record_hash TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        UNIQUE (
+        CONSTRAINT corporate_actions_identity_key UNIQUE (
             symbol,
             action_type,
             action_date,
@@ -480,9 +480,112 @@ def initialize_database(database_url: str) -> Any:
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_insider_tx_dates ON insider_transactions (transaction_date, filing_date);"
                 )
+
+                # Migration for corporate_actions constraint canonicalization:
+                # Query existing UNIQUE constraints and their column sets from PostgreSQL catalog
                 cursor.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_corp_actions_identity ON corporate_actions (symbol, action_type, action_date, source);"
+                    """
+                    SELECT
+                        c.conname AS constraint_name,
+                        ARRAY_AGG(a.attname::text) AS columns
+                    FROM pg_constraint c
+                    JOIN pg_class t ON c.conrelid = t.oid
+                    JOIN pg_namespace n ON t.relnamespace = n.oid
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+                    WHERE n.nspname = 'public'
+                      AND t.relname = 'corporate_actions'
+                      AND c.contype = 'u'
+                    GROUP BY c.conname;
+                    """
                 )
+                existing_con_rows = cursor.fetchall()
+                existing_constraints = {row[0]: set(row[1]) for row in existing_con_rows}
+
+                # Query standalone UNIQUE indexes (not backing a constraint) on corporate_actions
+                cursor.execute(
+                    """
+                    SELECT
+                        i.relname AS index_name,
+                        ARRAY_AGG(a.attname::text) AS columns
+                    FROM pg_index x
+                    JOIN pg_class t ON t.oid = x.indrelid
+                    JOIN pg_class i ON i.oid = x.indexrelid
+                    JOIN pg_namespace n ON t.relnamespace = n.oid
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(x.indkey)
+                    LEFT JOIN pg_constraint c ON c.conindid = i.oid
+                    WHERE n.nspname = 'public'
+                      AND t.relname = 'corporate_actions'
+                      AND x.indisunique = true
+                      AND c.oid IS NULL
+                    GROUP BY i.relname;
+                    """
+                )
+                existing_idx_rows = cursor.fetchall()
+                existing_indexes = {row[0]: set(row[1]) for row in existing_idx_rows}
+
+                target_cols = {"symbol", "action_type", "action_date", "source"}
+
+                identity_key_exists = (
+                    "corporate_actions_identity_key" in existing_constraints
+                    and existing_constraints["corporate_actions_identity_key"] == target_cols
+                )
+
+                matching_con_name = None
+                if not identity_key_exists:
+                    for con_name, con_cols in existing_constraints.items():
+                        if con_cols == target_cols:
+                            matching_con_name = con_name
+                            break
+
+                matching_idx_name = None
+                for idx_name, idx_cols in existing_indexes.items():
+                    if idx_cols == target_cols:
+                        matching_idx_name = idx_name
+                        break
+
+                try:
+                    from psycopg.sql import SQL, Identifier
+
+                    def drop_idx_sql(name: str):
+                        return SQL("DROP INDEX IF EXISTS {}").format(Identifier(name))
+
+                    def rename_con_sql(old_n: str, new_n: str):
+                        return SQL("ALTER TABLE corporate_actions RENAME CONSTRAINT {} TO {}").format(
+                            Identifier(old_n), Identifier("corporate_actions_identity_key")
+                        )
+                except ImportError:
+                    def drop_idx_sql(name: str):
+                        quoted = '"' + name.replace('"', '""') + '"'
+                        return f"DROP INDEX IF EXISTS {quoted}"
+
+                    def rename_con_sql(old_n: str, new_n: str):
+                        q_old = '"' + old_n.replace('"', '""') + '"'
+                        return f'ALTER TABLE corporate_actions RENAME CONSTRAINT {q_old} TO "corporate_actions_identity_key"'
+
+                if identity_key_exists:
+                    if matching_idx_name is not None:
+                        cursor.execute(drop_idx_sql(matching_idx_name))
+                elif matching_con_name is not None:
+                    cursor.execute(rename_con_sql(matching_con_name, "corporate_actions_identity_key"))
+                    if matching_idx_name is not None:
+                        cursor.execute(drop_idx_sql(matching_idx_name))
+                elif matching_idx_name is not None:
+                    cursor.execute(drop_idx_sql(matching_idx_name))
+                    cursor.execute(
+                        """
+                        ALTER TABLE corporate_actions
+                        ADD CONSTRAINT corporate_actions_identity_key
+                        UNIQUE (symbol, action_type, action_date, source);
+                        """
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        ALTER TABLE corporate_actions
+                        ADD CONSTRAINT corporate_actions_identity_key
+                        UNIQUE (symbol, action_type, action_date, source);
+                        """
+                    )
 
             connection.commit()
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Sequence
+from urllib.error import HTTPError, URLError
 
+from data.corporate_actions_client import CorporateActionsClientError
 from data.corporate_actions_loader import load_corporate_actions_detailed
 from data.providers.fmp_corporate_actions import FMPCorporateActionsProvider
 
@@ -137,7 +139,7 @@ class CorporateActionsAcquisitionService:
                     end_date=end_date,
                 )
                 sym_splits = len(split_records) if split_records else 0
-            except Exception as exc:
+            except (CorporateActionsClientError, TimeoutError, URLError, HTTPError, OSError) as exc:
                 err_msg = f"Splits provider error: {exc}"
                 sym_errors.append(err_msg)
                 sym_provider_fail += 1
@@ -183,7 +185,7 @@ class CorporateActionsAcquisitionService:
                     end_date=end_date,
                 )
                 sym_dividends = len(div_records) if div_records else 0
-            except Exception as exc:
+            except (CorporateActionsClientError, TimeoutError, URLError, HTTPError, OSError) as exc:
                 err_msg = f"Dividends provider error: {exc}"
                 sym_errors.append(err_msg)
                 sym_provider_fail += 1
