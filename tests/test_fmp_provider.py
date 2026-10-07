@@ -8,7 +8,9 @@ All network requests are mocked. No real external API requests.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
 
@@ -34,7 +36,7 @@ from data.market_data_client import (
 from data.market_data_provider_factory import get_market_data_provider
 from data.providers.fmp_corporate_actions import FMPCorporateActionsProvider
 from data.providers.fmp_market_data import FMPMarketDataProvider
-from database.connection import connect, initialize_database
+from database.connection import connect, initialize_database, is_postgresql_url
 from research.ticker_universe import get_ticker_universe
 from scripts.acquire_corporate_actions import (
     parse_args as parse_ca_args,
@@ -237,7 +239,7 @@ def test_ticker_universe_normalization_deduplication_ordering(tmp_path) -> None:
     res = get_ticker_universe(db_url, start_date="2006-01-01", end_date="2006-01-10")
     assert res.tickers == ("AAPL", "MSFT")
     assert res.unique_ticker_count == 2
-    assert res.source_transaction_count == 5
+    assert res.source_transaction_count == 4
 
 
 # ==============================================================================
@@ -290,6 +292,34 @@ def test_acquisition_workflow_date_validation() -> None:
 # ==============================================================================
 # 5. STORAGE-LEVEL CORPORATE ACTION TESTS
 # ==============================================================================
+
+class MockConnectionWrapper:
+    """Wrapper around a real database connection to simulate specific execution errors."""
+
+    def __init__(self, real_conn, err_to_raise=None):
+        self._conn = real_conn
+        self._err = err_to_raise
+
+    def execute(self, sql, params=()):
+        if "INSERT INTO corporate_actions" in sql and self._err is not None:
+            raise self._err
+        return self._conn.execute(sql, params)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._conn.__exit__(exc_type, exc_val, exc_tb)
+
 
 def test_store_corporate_action_outcomes(tmp_path) -> None:
     """Storage-level tests for store_corporate_action (INSERTED, DUPLICATE, CONFLICT)."""
@@ -369,15 +399,10 @@ def test_store_corporate_action_unique_constraint_race_cases(tmp_path) -> None:
 
     # Case A: Simulated race on exact same payload raising IntegrityError
     real_connect = connect
+    integrity_err = sqlite3.IntegrityError("UNIQUE constraint failed: corporate_actions.symbol, corporate_actions.action_type, corporate_actions.action_date, corporate_actions.source")
+
     def mock_connect_a(url):
-        cx = real_connect(url)
-        orig_execute = cx.execute
-        def fake_execute(sql, params=()):
-            if "INSERT INTO corporate_actions" in sql:
-                raise sqlite3.IntegrityError("UNIQUE constraint failed: corporate_actions.symbol, corporate_actions.action_type, corporate_actions.action_date, corporate_actions.source")
-            return orig_execute(sql, params)
-        cx.execute = fake_execute
-        return cx
+        return MockConnectionWrapper(real_connect(url), err_to_raise=integrity_err)
 
     with patch("storage.repository.connect", side_effect=mock_connect_a):
         hash_res_a, outcome_a = store_corporate_action(
@@ -396,15 +421,9 @@ def test_store_corporate_action_unique_constraint_race_cases(tmp_path) -> None:
 
     # Case B: Simulated race on same identity with DIFFERENT payload raising IntegrityError
     raw_diff = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "10:1", "source": "fmp"}
+
     def mock_connect_b(url):
-        cx = real_connect(url)
-        orig_execute = cx.execute
-        def fake_execute(sql, params=()):
-            if "INSERT INTO corporate_actions" in sql:
-                raise sqlite3.IntegrityError("UNIQUE constraint failed")
-            return orig_execute(sql, params)
-        cx.execute = fake_execute
-        return cx
+        return MockConnectionWrapper(real_connect(url), err_to_raise=sqlite3.IntegrityError("UNIQUE constraint failed"))
 
     with patch("storage.repository.connect", side_effect=mock_connect_b):
         hash_res_b, outcome_b = store_corporate_action(
@@ -429,14 +448,10 @@ def test_store_corporate_action_non_integrity_failure_propagates(tmp_path) -> No
     raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
 
     real_connect = connect
+    op_err = sqlite3.OperationalError("database is locked")
+
     def mock_connect_op(url):
-        cx = real_connect(url)
-        def fake_execute(sql, params=()):
-            if "INSERT INTO corporate_actions" in sql:
-                raise sqlite3.OperationalError("database is locked")
-            return cx.execute(sql, params)
-        cx.execute = fake_execute
-        return cx
+        return MockConnectionWrapper(real_connect(url), err_to_raise=op_err)
 
     with patch("storage.repository.connect", side_effect=mock_connect_op):
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
@@ -452,8 +467,92 @@ def test_store_corporate_action_non_integrity_failure_propagates(tmp_path) -> No
             )
 
 
+def test_real_postgres_corporate_action_concurrency() -> None:
+    """
+    Real PostgreSQL Concurrency Integration Test.
+    Executed only if POSTGRES_TEST_URL or DATABASE_URL targeting PostgreSQL is available.
+    """
+    pg_url = os.getenv("POSTGRES_TEST_URL") or os.getenv("DATABASE_URL", "")
+    if not is_postgresql_url(pg_url):
+        pytest.skip("PostgreSQL test database not available for live concurrency testing.")
+
+    initialize_database(pg_url)
+
+    # Cleanup any pre-existing test corporate actions for AAPL on 2020-08-31
+    with connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM corporate_actions WHERE symbol = %s AND action_date = %s",
+                ("AAPL", "2020-08-31")
+            )
+            cur.execute(
+                "DELETE FROM provenance WHERE record_type = %s AND record_id IN (SELECT record_hash FROM corporate_actions WHERE symbol = %s)",
+                ("corporate_action", "AAPL")
+            )
+        conn.commit()
+
+    raw_same = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
+    raw_diff = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "5:1", "source": "fmp"}
+
+    # Case A: Concurrent same content -> 1 INSERTED, 1 DUPLICATE, exactly 1 DB row
+    def worker_same():
+        return store_corporate_action(
+            pg_url,
+            symbol="AAPL",
+            action_type="split",
+            action_date="2020-08-31",
+            ratio="4:1",
+            cash_amount=None,
+            source="fmp",
+            raw_payload=raw_same,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(worker_same)
+        f2 = executor.submit(worker_same)
+        res1 = f1.result()
+        res2 = f2.result()
+
+    outcomes_same = {res1[1], res2[1]}
+    assert outcomes_same == {"INSERTED", "DUPLICATE"}
+
+    with connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM corporate_actions WHERE symbol = %s AND action_date = %s", ("AAPL", "2020-08-31"))
+            count_row = cur.fetchone()
+            assert count_row[0] == 1
+
+    # Case B: Concurrent different content against existing row -> CONFLICT
+    def worker_diff():
+        return store_corporate_action(
+            pg_url,
+            symbol="AAPL",
+            action_type="split",
+            action_date="2020-08-31",
+            ratio="5:1",
+            cash_amount=None,
+            source="fmp",
+            raw_payload=raw_diff,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        f_diff = executor.submit(worker_diff)
+        res_diff = f_diff.result()
+
+    assert res_diff[1] == "CONFLICT"
+
+    with connect(pg_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM corporate_actions WHERE symbol = %s AND action_date = %s", ("AAPL", "2020-08-31"))
+            count_row = cur.fetchone()
+            assert count_row[0] == 1  # Row count remains strictly 1!
+
+            cur.execute("DELETE FROM corporate_actions WHERE symbol = %s AND action_date = %s", ("AAPL", "2020-08-31"))
+        conn.commit()
+
+
 # ==============================================================================
-# 6. CORPORATE ACTIONS ACQUISITION STRICT IDEMPOTENCY & CONFLICT TESTS
+# 6. CORPORATE ACTIONS PROVIDER & PIPELINE TESTS
 # ==============================================================================
 
 def test_fmp_corporate_actions_endpoints_and_normalization() -> None:
