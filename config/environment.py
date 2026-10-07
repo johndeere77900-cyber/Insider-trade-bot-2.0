@@ -193,26 +193,32 @@ def load_environment(
         3,
     )
 
+    # Production/Staging archive backend requirement
+    if environment in {"production", "staging"}:
+        if sec_archive_backend not in {"s3", "r2", "object_storage", "objectstorage", "s3_compat"}:
+            raise EnvironmentConfigurationError(
+                "SEC archive backend must be explicitly configured as S3/R2 for production/staging environments."
+            )
+
     if sec_archive_backend in {"s3", "r2", "object_storage", "objectstorage", "s3_compat"}:
-        if environment == "production" or source.get("SEC_ARCHIVE_BACKEND") is not None:
-            if not sec_archive_bucket:
-                raise EnvironmentConfigurationError(
-                    "SEC_ARCHIVE_BUCKET is required when SEC_ARCHIVE_BACKEND is 's3'"
-                )
-            if not sec_archive_endpoint_url:
-                raise EnvironmentConfigurationError(
-                    "SEC_ARCHIVE_ENDPOINT_URL is required when SEC_ARCHIVE_BACKEND is 's3'"
-                )
-            aws_access_key = source.get("AWS_ACCESS_KEY_ID", "").strip()
-            if not aws_access_key:
-                raise EnvironmentConfigurationError(
-                    "AWS_ACCESS_KEY_ID is required when SEC_ARCHIVE_BACKEND is 's3'"
-                )
-            aws_secret_key = source.get("AWS_SECRET_ACCESS_KEY", "").strip()
-            if not aws_secret_key:
-                raise EnvironmentConfigurationError(
-                    "AWS_SECRET_ACCESS_KEY is required when SEC_ARCHIVE_BACKEND is 's3'"
-                )
+        if not sec_archive_bucket:
+            raise EnvironmentConfigurationError(
+                "SEC_ARCHIVE_BUCKET is required when SEC_ARCHIVE_BACKEND is 's3'"
+            )
+        if not sec_archive_endpoint_url:
+            raise EnvironmentConfigurationError(
+                "SEC_ARCHIVE_ENDPOINT_URL is required when SEC_ARCHIVE_BACKEND is 's3'"
+            )
+        aws_access_key = source.get("AWS_ACCESS_KEY_ID", "").strip()
+        if not aws_access_key:
+            raise EnvironmentConfigurationError(
+                "AWS_ACCESS_KEY_ID is required when SEC_ARCHIVE_BACKEND is 's3'"
+            )
+        aws_secret_key = source.get("AWS_SECRET_ACCESS_KEY", "").strip()
+        if not aws_secret_key:
+            raise EnvironmentConfigurationError(
+                "AWS_SECRET_ACCESS_KEY is required when SEC_ARCHIVE_BACKEND is 's3'"
+            )
 
     telegram_enabled = _get_bool(
         source,

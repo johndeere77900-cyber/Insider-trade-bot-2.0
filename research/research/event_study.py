@@ -12,8 +12,16 @@ those returns across a collection of events.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from statistics import mean, median
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Sequence
+
+from research.price_adjustment import apply_point_in_time_adjustment
+
+
+class PriceSeriesMode(str, Enum):
+    RAW = "raw"
+    POINT_IN_TIME_ADJUSTED = "point_in_time_adjusted"
 
 
 @dataclass(frozen=True)
@@ -208,6 +216,8 @@ def calculate_event_return(
     event_price: float,
     prices: Mapping[str, float],
     horizon_days: int,
+    price_series_mode: PriceSeriesMode = PriceSeriesMode.RAW,
+    corporate_actions: Sequence[Mapping[str, object]] | None = None,
 ) -> EventReturn:
     """
     Calculate the forward return for one research event.
@@ -251,9 +261,29 @@ def calculate_event_return(
         horizon_days,
     )
 
+    calc_event_price = float(event_price)
+    calc_future_price = float(future_price)
+
+    if price_series_mode == PriceSeriesMode.POINT_IN_TIME_ADJUSTED:
+        actions = corporate_actions or []
+        calc_event_price = apply_point_in_time_adjustment(
+            symbol=normalized_symbol,
+            price_date=normalized_event_date,
+            raw_price=calc_event_price,
+            corporate_actions=actions,
+            as_of_date=future_date,
+        )
+        calc_future_price = apply_point_in_time_adjustment(
+            symbol=normalized_symbol,
+            price_date=future_date,
+            raw_price=calc_future_price,
+            corporate_actions=actions,
+            as_of_date=future_date,
+        )
+
     return_pct = calculate_forward_return(
-        event_price,
-        future_price,
+        calc_event_price,
+        calc_future_price,
     )
 
     return EventReturn(
@@ -345,6 +375,7 @@ def summarize_event_returns(
 def run_event_study(
     events: Iterable[dict[str, object]],
     horizon_days: int,
+    price_series_mode: PriceSeriesMode = PriceSeriesMode.RAW,
 ) -> tuple[
     list[EventReturn],
     EventStudySummary,
@@ -404,6 +435,7 @@ def run_event_study(
                 "Event 'prices' must be a date-to-price mapping."
             )
 
+        ca = event.get("corporate_actions")
         result = calculate_event_return(
             event_key=event_key,
             symbol=symbol,
@@ -411,6 +443,8 @@ def run_event_study(
             event_price=event_price,
             prices=prices,
             horizon_days=horizon_days,
+            price_series_mode=price_series_mode,
+            corporate_actions=ca if isinstance(ca, Sequence) else None,
         )
 
         results.append(result)
