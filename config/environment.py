@@ -87,6 +87,9 @@ class EnvironmentSettings:
     corporate_actions_api_key: str
     corporate_actions_base_url: str
 
+    fmp_api_key: str
+    fmp_base_url: str
+
     log_level: str
     log_directory: str
 
@@ -96,17 +99,38 @@ class EnvironmentSettings:
     secret_key: str
 
 
-def validate_market_data_config(settings: EnvironmentSettings) -> None:
+def validate_fmp_config(settings: EnvironmentSettings) -> None:
+    """
+    Validate that required configuration for FMP market-data acquisition is present.
+    """
+    if not settings.fmp_base_url or not settings.fmp_base_url.strip():
+        raise EnvironmentConfigurationError(
+            "FMP_BASE_URL is required when FMP market-data acquisition is requested."
+        )
+    if not settings.fmp_api_key or not settings.fmp_api_key.strip():
+        raise EnvironmentConfigurationError(
+            "FMP_API_KEY is required when FMP market-data acquisition is requested."
+        )
+
+
+def validate_market_data_config(
+    settings: EnvironmentSettings,
+    provider: str = "fmp",
+) -> None:
     """
     Validate that required configuration for market-data acquisition is present.
 
     Must be called when the market-data acquisition path is requested, without
     failing application startup when market data acquisition is not being used.
     """
-    if not settings.market_data_base_url or not settings.market_data_base_url.strip():
-        raise EnvironmentConfigurationError(
-            "MARKET_DATA_BASE_URL is required when market-data acquisition is requested."
-        )
+    prov = str(provider).strip().lower()
+    if prov == "fmp":
+        validate_fmp_config(settings)
+    else:
+        if not settings.market_data_base_url or not settings.market_data_base_url.strip():
+            raise EnvironmentConfigurationError(
+                "MARKET_DATA_BASE_URL is required when market-data acquisition is requested."
+            )
 
 
 def load_environment(
@@ -215,6 +239,13 @@ def load_environment(
         if item.strip()
     )
 
+    # FMP configuration
+    fmp_api_key = source.get("FMP_API_KEY", "").strip()
+    fmp_base_url = (
+        source.get("FMP_BASE_URL", "https://financialmodelingprep.com/stable").strip()
+        or "https://financialmodelingprep.com/stable"
+    )
+
     return EnvironmentSettings(
         environment=environment,
         strict_mode=_get_bool(
@@ -271,6 +302,8 @@ def load_environment(
             "CORPORATE_ACTIONS_BASE_URL",
             "",
         ).strip(),
+        fmp_api_key=fmp_api_key,
+        fmp_base_url=fmp_base_url,
         log_level=source.get(
             "LOG_LEVEL",
             "INFO",
