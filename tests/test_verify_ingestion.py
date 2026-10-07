@@ -212,7 +212,7 @@ def test_main_historical_force_reprocessing(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(pipeline, "download_dataset_zip_to_file", mock_download)
     monkeypatch.setattr(pipeline, "parse_dataset_zip", lambda zip_path, source_url="": [])
 
-    ret = main.run_historical_acquisition("2006-Q1", "2006-Q1", force=True)
+    ret = main.run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="2006-Q1", force=True)
     assert ret == 0
 
 
@@ -702,6 +702,271 @@ def test_verify_run1_multi_owner_pass_and_not_testable(tmp_path: Path, monkeypat
         data = json.load(f)
 
     assert data["multi_owner_result"] == "PASS"
+
+
+def test_verify_run1_normalized_amendment_absent_archive_not_testable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test D: Normalized amendment with raw_payload=NULL and absent archive detects amendment and yields NOT TESTABLE for preservation."""
+    db_path = tmp_path / "test_norm_amend_absent.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, transaction_date,
+                form_type, is_amendment, date_of_orig_submission, raw_payload, record_hash, created_at
+            ) VALUES (
+                'SEC', '0000000000-06-000002', '0000001234', '2006-01-16', '2006-01-15',
+                '4/A', 1, '2006-01-10', NULL, 'hash_norm_amend_1', '2026-01-01T00:00:00Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES ('dataset_period', '2006-Q1', 'SEC', '2006q1_form345.zip', '2026-01-01', 'chk', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES ('2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    class AbsentArchive:
+        def exists(self, period):
+            return False
+
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: AbsentArchive())
+
+    state_file = str(tmp_path / "sec_norm_amend_run1_stats.json")
+
+    res = verify_run1("2006-Q1", state_file)
+    assert res == 0
+
+    with open(state_file, "r") as f:
+        saved = json.load(f)
+
+    assert saved["amendment_result"] == "NOT TESTABLE"
+
+
+def test_verify_run1_malformed_archive_fails_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test E: Malformed archive returning corrupt ZIP causes verification to fail rather than yielding NOT TESTABLE."""
+    db_path = tmp_path / "test_corrupt_arch_verify.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, raw_payload, record_hash, created_at
+            ) VALUES ('SEC', 'acc1', 'cik1', '2006-01-15', NULL, 'hash1', '2026-01-01')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES ('dataset_period', '2006-Q1', 'SEC', '2006q1_form345.zip', '2026-01-01', 'chk', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES ('2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    class CorruptArchive:
+        def exists(self, period):
+            return True
+        def get(self, period):
+            return b"CORRUPT NOT A ZIP FILE"
+
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: CorruptArchive())
+
+    state_file = str(tmp_path / "sec_corrupt_run1_stats.json")
+
+    with pytest.raises(Exception):
+        verify_run1("2006-Q1", state_file)
+
+
+def test_verify_run1_archive_absent_yields_not_testable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test B: When raw_payload is NULL and archive genuinely does not exist, verification results in NOT TESTABLE."""
+    db_path = tmp_path / "test_arch_absent.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, raw_payload, record_hash, form_type, is_amendment, created_at
+            ) VALUES ('SEC', 'acc1', 'cik1', '2006-01-15', NULL, 'hash1', '4/A', 1, '2026-01-01')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES ('dataset_period', '2006-Q1', 'SEC', '2006q1_form345.zip', '2026-01-01', 'chk', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES ('2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    class AbsentArchive:
+        def exists(self, period):
+            return False
+
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: AbsentArchive())
+
+    state_file = str(tmp_path / "sec_absent_run1_stats.json")
+
+    res = verify_run1("2006-Q1", state_file)
+    assert res == 0
+
+    with open(state_file, "r") as f:
+        data = json.load(f)
+
+    assert data["amendment_result"] == "NOT TESTABLE"
+
+
+def test_verify_run1_archive_error_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that verify_run1 propagates ArchiveError when archive access fails in lean storage mode."""
+    from archive import ArchiveError
+    db_path = tmp_path / "test_arch_err_verify.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, raw_payload, record_hash, created_at
+            ) VALUES ('SEC', 'acc1', 'cik1', '2006-01-15', NULL, 'hash1', '2026-01-01')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES ('dataset_period', '2006-Q1', 'SEC', '2006q1_form345.zip', '2026-01-01', 'chk', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES ('2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    class FailingArchive:
+        def exists(self, period):
+            raise ArchiveError("500 Internal Error from S3 storage during verifier check")
+
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: FailingArchive())
+
+    state_file = str(tmp_path / "sec_err_run1_stats.json")
+
+    with pytest.raises(ArchiveError, match="500 Internal Error"):
+        verify_run1("2006-Q1", state_file)
+
+
+def test_verify_run1_lean_neon_mode_null_raw_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that verify_run1 succeeds in lean Neon mode where raw_payload is NULL in database."""
+    db_path = tmp_path / "test_lean_verify.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, issuer_name, ticker,
+                insider_name, insider_cik, transaction_date, filing_date,
+                form_type, transaction_code, security_title, shares, price,
+                transaction_type, acquired_disposed, ownership_type, source_url,
+                raw_payload, record_hash, created_at
+            ) VALUES (
+                'SEC', '0000000000-06-000001', '0000001234', 'ACME CORP', 'ACME',
+                'DOE JANE', '0000005678', '2006-01-15', '2006-01-16',
+                '4', 'P', 'Common Stock', 100.0, 10.5,
+                'non_derivative', 'A', 'D', 'https://example.com',
+                NULL, 'hash_lean_verify_1', '2026-01-01T00:00:00Z'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference,
+                retrieved_at, checksum, validation_status
+            ) VALUES (
+                'dataset_period', '2006-Q1', 'SEC',
+                'https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/2006q1_form345.zip',
+                '2026-01-01T00:00:00Z', 'abc123checksum', 'validated'
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted,
+                duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES (
+                '2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01T00:00:00Z'
+            )
+            """
+        )
+        conn.commit()
+
+    state_file = str(tmp_path / "sec_lean_run1_stats.json")
+
+    res = verify_run1("2006-Q1", state_file)
+    assert res == 0
+
+    with open(state_file, "r") as f:
+        saved = json.load(f)
+
+    assert saved["status"] == "COMPLETED"
+    assert saved["period_tx_count"] == 1
 
 
 def test_verify_run1_amendment_fail_on_missing_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

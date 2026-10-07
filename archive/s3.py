@@ -134,6 +134,14 @@ class S3SECArchive(SECArchiveInterface):
         m_key = self._manifest_key(period)
         return self._object_exists(z_key) and self._object_exists(m_key)
 
+    def is_incomplete(self, period: str) -> bool:
+        norm_period = self._normalize_period(period)
+        zip_key = self._zip_key(norm_period)
+        manifest_key = self._manifest_key(norm_period)
+        z_exists = self._object_exists(zip_key)
+        m_exists = self._object_exists(manifest_key)
+        return (z_exists and not m_exists) or (m_exists and not z_exists)
+
     def delete_incomplete_archive(self, period: str) -> bool:
         """
         Safely remove a genuinely incomplete archive for period (ZIP exists without manifest,
@@ -222,15 +230,43 @@ class S3SECArchive(SECArchiveInterface):
                     f"({existing_meta.sha256} vs incoming {calc_sha256}). Immutable archives cannot be overwritten."
                 )
         elif zip_exists and not manifest_exists:
-            raise ArchiveExistsError(
-                f"Incomplete archive state for period '{norm_period}': ZIP archive exists but manifest is missing. "
-                f"Overwriting incomplete archives is forbidden."
-            )
+            client = self._get_client()
+            try:
+                existing_obj = client.get_object(Bucket=self.bucket, Key=zip_key)
+                existing_bytes = existing_obj["Body"].read()
+                existing_sha, _ = self._compute_sha256(existing_bytes)
+            except Exception as exc:
+                if _is_not_found_exception(exc):
+                    existing_sha = None
+                else:
+                    raise ArchiveError(f"Failed to inspect incomplete ZIP object '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
+
+            if existing_sha == calc_sha256:
+                pass
+            else:
+                raise ArchiveExistsError(
+                    f"Incomplete S3 archive ZIP for period '{norm_period}' exists with different SHA-256 "
+                    f"({existing_sha} vs incoming {calc_sha256}). Conflicting incomplete archives cannot be overwritten."
+                )
         elif manifest_exists and not zip_exists:
-            raise ArchiveExistsError(
-                f"Incomplete archive state for period '{norm_period}': Manifest exists but ZIP archive is missing. "
-                f"Recreating incomplete archives is forbidden."
-            )
+            client = self._get_client()
+            try:
+                m_obj = client.get_object(Bucket=self.bucket, Key=manifest_key)
+                m_data = json.loads(m_obj["Body"].read().decode("utf-8"))
+                existing_sha = str(m_data.get("sha256", ""))
+            except Exception as exc:
+                if _is_not_found_exception(exc):
+                    existing_sha = None
+                else:
+                    raise ArchiveError(f"Failed to inspect incomplete manifest object '{manifest_key}' in bucket '{self.bucket}': {exc}") from exc
+
+            if existing_sha == calc_sha256:
+                pass
+            else:
+                raise ArchiveExistsError(
+                    f"Incomplete S3 archive manifest for period '{norm_period}' exists with different SHA-256 "
+                    f"({existing_sha} vs incoming {calc_sha256}). Conflicting manifest cannot be overwritten."
+                )
 
         # Upload ZIP bytes
         if isinstance(content, str):
@@ -290,6 +326,34 @@ class S3SECArchive(SECArchiveInterface):
             if _is_not_found_exception(exc):
                 raise ArchiveNotFoundError(f"Archive key '{zip_key}' not found in bucket '{self.bucket}'.") from exc
             raise ArchiveError(f"Failed to retrieve archive key '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
+
+    def get_incomplete_zip(self, period: str) -> bytes:
+        """
+        Retrieve the ZIP component of an incomplete S3/R2 archive.
+
+        Unlike get(), this method intentionally does not require the
+        manifest to exist because it is used for orphan-ZIP recovery.
+        """
+        zip_key = self._zip_key(period)
+        client = self._get_client()
+
+        try:
+            response = client.get_object(
+                Bucket=self.bucket,
+                Key=zip_key,
+            )
+            return response["Body"].read()
+        except Exception as exc:
+            if _is_not_found_exception(exc):
+                raise ArchiveNotFoundError(
+                    f"Archive ZIP key '{zip_key}' not found in bucket "
+                    f"'{self.bucket}'."
+                ) from exc
+
+            raise ArchiveError(
+                f"Failed to retrieve incomplete archive ZIP key "
+                f"'{zip_key}' in bucket '{self.bucket}': {exc}"
+            ) from exc
 
     def metadata(self, period: str) -> ArchiveMetadata:
         manifest_key = self._manifest_key(period)

@@ -8,10 +8,54 @@ and enables idempotent, resumable execution across runs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from database.connection import connect, initialize_database, is_postgresql_url
 from storage.repository import _placeholder, _row_value, utc_now
+
+
+def get_current_sec_period(reference_date: Optional[datetime] = None) -> str:
+    """Return the SEC dataset period string ('YYYY-QX') corresponding to reference_date (or current UTC date)."""
+    if reference_date is None:
+        reference_date = datetime.now(timezone.utc)
+    qtr = (reference_date.month - 1) // 3 + 1
+    return f"{reference_date.year}-Q{qtr}"
+
+
+def get_latest_available_sec_period(
+    database_url: Optional[str] = None,
+    archive_backend: Any = None,
+) -> str:
+    """
+    Determine the latest authoritative SEC dataset period.
+
+    Uses only completed ingestion_state periods and complete archive periods.
+    Never falls back to the current calendar quarter.
+    Storage/database/archive errors must propagate instead of being treated
+    as evidence that no data exists.
+    """
+    candidates: List[str] = []
+
+    if database_url:
+        state_mgr = AcquisitionStateManager(database_url)
+        completed = state_mgr.get_completed_periods()
+        if completed:
+            candidates.extend(completed)
+
+    if archive_backend is not None:
+        archived = archive_backend.list()
+        if archived:
+            candidates.extend(archived)
+
+    if candidates:
+        candidates.sort()
+        return candidates[-1]
+
+    raise RuntimeError(
+        "No authoritative SEC dataset period is available from completed "
+        "ingestion state or archive backend."
+    )
 
 
 @dataclass
@@ -138,6 +182,40 @@ class AcquisitionStateManager:
             idx = cleaned.find("Q")
             return f"{cleaned[:idx]}-{cleaned[idx:]}"
         return cleaned
+
+    @staticmethod
+    def is_within_operational_retention(
+        period: str,
+        reference_period: str,
+        retention_years: int = 3,
+    ) -> bool:
+        """
+        Determine if `period` falls within `retention_years` of `reference_period`.
+        `reference_period` is required to anchor operational retention.
+
+        Deterministic calculation based on SEC quarter indexes:
+        diff_quarters = (ref_year * 4 + (ref_qtr - 1)) - (period_year * 4 + (period_qtr - 1))
+        Returns True if 0 <= diff_quarters < retention_years * 4.
+        """
+        if retention_years <= 0:
+            return False
+
+        if not reference_period:
+            raise ValueError(
+                "reference_period is required for operational retention evaluation"
+            )
+
+        norm_period = AcquisitionStateManager.normalize_period(period)
+        norm_ref = AcquisitionStateManager.normalize_period(reference_period)
+
+        p_year, p_qtr = int(norm_period[:4]), int(norm_period[-1])
+        r_year, r_qtr = int(norm_ref[:4]), int(norm_ref[-1])
+
+        p_idx = p_year * 4 + (p_qtr - 1)
+        r_idx = r_year * 4 + (r_qtr - 1)
+
+        diff = r_idx - p_idx
+        return 0 <= diff < retention_years * 4
 
     @staticmethod
     def parse_period_range(start_period: str, end_period: str) -> List[Tuple[int, int, str]]:

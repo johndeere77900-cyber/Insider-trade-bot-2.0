@@ -54,6 +54,7 @@ class Settings:
     sec_user_agent: str
     sec_archive_backend: str
     sec_archive_path: Path
+    sec_operational_retention_years: int
 
     # Storage directories
     data_directory: Path
@@ -110,6 +111,12 @@ def load_settings() -> Settings:
             os.getenv(
                 "SEC_ARCHIVE_PATH",
                 str(data_directory / "archive"),
+            )
+        ),
+        sec_operational_retention_years=int(
+            os.getenv(
+                "SEC_OPERATIONAL_RETENTION_YEARS",
+                "3",
             )
         ),
 

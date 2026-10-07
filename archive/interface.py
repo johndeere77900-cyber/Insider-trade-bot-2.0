@@ -67,6 +67,14 @@ class SECArchiveInterface(ABC):
         """Return True if an archived ZIP exists for the given period."""
 
     @abstractmethod
+    def is_incomplete(self, period: str) -> bool:
+        """Return True if a partial/incomplete archive state exists for the given period."""
+
+    @abstractmethod
+    def delete_incomplete_archive(self, period: str) -> bool:
+        """Safely remove partial archive state for period."""
+
+    @abstractmethod
     def put(
         self,
         period: str,
@@ -89,6 +97,15 @@ class SECArchiveInterface(ABC):
         Retrieve original SEC quarterly ZIP bytes for period.
         Raises ArchiveNotFoundError if missing.
         """
+
+    def get_incomplete_zip(self, period: str) -> bytes:
+        """
+        Retrieve the ZIP component of an incomplete archive.
+
+        This method is intentionally separate from get() because get()
+        requires a complete archive with both ZIP and manifest.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def metadata(self, period: str) -> ArchiveMetadata:

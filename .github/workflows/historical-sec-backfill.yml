@@ -28,6 +28,7 @@ jobs:
 
     env:
       SEC_STORE_RAW_PAYLOAD: "false"
+      SEC_OPERATIONAL_RETENTION_YEARS: "3"
       SEC_ARCHIVE_BACKEND: "s3"
       SEC_ARCHIVE_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
       SEC_ARCHIVE_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT }}
@@ -63,28 +64,32 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
 
-      - name: Run Historical Ingestion Engine
+      - name: Run Historical Ingestion Engine (R2 Archive + Lean Operational Cache)
         run: |
           if [ "${FORCE}" = "true" ]; then
             python main.py historical \
               --start "${START_PERIOD}" \
               --end "${END_PERIOD}" \
               --batch-size "${BATCH_SIZE}" \
+              --reference-period "${REFERENCE_PERIOD}" \
               --force
           else
             python main.py historical \
               --start "${START_PERIOD}" \
               --end "${END_PERIOD}" \
-              --batch-size "${BATCH_SIZE}"
+              --batch-size "${BATCH_SIZE}" \
+              --reference-period "${REFERENCE_PERIOD}"
           fi
         env:
           START_PERIOD: ${{ github.event.inputs.start_period }}
           END_PERIOD: ${{ github.event.inputs.end_period }}
+          REFERENCE_PERIOD: ${{ github.event.inputs.end_period }}
           BATCH_SIZE: ${{ github.event.inputs.batch_size }}
           FORCE: ${{ github.event.inputs.force }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
           SEC_STORE_RAW_PAYLOAD: "false"
+          SEC_OPERATIONAL_RETENTION_YEARS: "3"
 
       - name: Verify Range Ingestion & Output Final Report
         run: |

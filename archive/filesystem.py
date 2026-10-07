@@ -48,6 +48,12 @@ class FilesystemSECArchive(SECArchiveInterface):
         m_path = self._manifest_path(period)
         return os.path.exists(z_path) and os.path.exists(m_path)
 
+    def is_incomplete(self, period: str) -> bool:
+        norm_p = self._normalize_period(period)
+        z_exists = os.path.exists(self._zip_path(norm_p))
+        m_exists = os.path.exists(self._manifest_path(norm_p))
+        return (z_exists and not m_exists) or (m_exists and not z_exists)
+
     def delete_incomplete_archive(self, period: str) -> bool:
         """
         Safely remove a genuinely incomplete archive for period (ZIP exists without manifest,
@@ -124,15 +130,27 @@ class FilesystemSECArchive(SECArchiveInterface):
                     f"({existing_meta.sha256} vs incoming {calc_sha256}). Immutable archives cannot be overwritten."
                 )
         elif zip_exists and not manifest_exists:
-            raise ArchiveExistsError(
-                f"Incomplete archive state for period '{norm_period}': ZIP archive exists but manifest is missing. "
-                f"Overwriting incomplete archives is forbidden."
-            )
+            existing_sha, _ = self._compute_sha256(zip_file)
+            if existing_sha == calc_sha256:
+                # Content matches: complete manifest safely
+                pass
+            else:
+                raise ArchiveExistsError(
+                    f"Incomplete archive ZIP for period '{norm_period}' exists with different SHA-256 "
+                    f"({existing_sha} vs incoming {calc_sha256}). Conflicting incomplete archives cannot be overwritten."
+                )
         elif manifest_exists and not zip_exists:
-            raise ArchiveExistsError(
-                f"Incomplete archive state for period '{norm_period}': Manifest exists but ZIP archive is missing. "
-                f"Recreating incomplete archives is forbidden."
-            )
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            existing_sha = str(data.get("sha256", ""))
+            if existing_sha == calc_sha256:
+                # Incoming content matches manifest SHA -> safely recreate missing ZIP
+                pass
+            else:
+                raise ArchiveExistsError(
+                    f"Incomplete archive manifest for period '{norm_period}' exists with different SHA-256 "
+                    f"({existing_sha} vs incoming {calc_sha256}). Conflicting manifest cannot be overwritten."
+                )
 
         # Write ZIP content
         if isinstance(content, str):
@@ -175,6 +193,20 @@ class FilesystemSECArchive(SECArchiveInterface):
         if not self.exists(period):
             raise ArchiveNotFoundError(f"Archive for period '{period}' does not exist.")
         zip_file = self._zip_path(period)
+        with open(zip_file, "rb") as f:
+            return f.read()
+
+    def get_incomplete_zip(self, period: str) -> bytes:
+        """
+        Retrieve an orphan ZIP even when its manifest is missing.
+        """
+        zip_file = self._zip_path(period)
+
+        if not os.path.exists(zip_file):
+            raise ArchiveNotFoundError(
+                f"Archive ZIP for period '{period}' does not exist."
+            )
+
         with open(zip_file, "rb") as f:
             return f.read()
 

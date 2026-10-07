@@ -20,24 +20,43 @@ def run_historical_acquisition(
     end_period: str,
     batch_size: int = 5000,
     force: bool = False,
+    reference_period: str | None = None,
 ) -> int:
     """
     Execute historical SEC dataset acquisition from start_period to end_period
     using temporary disk files and bounded streaming batches to prevent high memory usage.
     """
+    import re
+
+    if reference_period is None or not str(reference_period).strip():
+        raise ValueError(
+            "reference_period is required for historical acquisition. "
+            "Pass --reference-period using the authoritative SEC dataset "
+            "period that should anchor the operational retention window."
+        )
+
+    retention_ref = str(reference_period).strip().upper()
+
+    if not re.fullmatch(r"\d{4}-Q[1-4]", retention_ref):
+        raise ValueError(
+            f"Invalid reference_period '{reference_period}'. "
+            "Expected format YYYY-Q1, YYYY-Q2, YYYY-Q3, or YYYY-Q4."
+        )
+
     import hashlib
     import os
     import tempfile
     import zipfile
-    from archive import ArchiveMetadata, get_archive_backend
+    from archive import ArchiveError, ArchiveMetadata, get_archive_backend
     from config.environment import load_environment
-    from data.acquisition_state import AcquisitionStateManager
+    from data.acquisition_state import AcquisitionStateManager, get_latest_available_sec_period
     from data.sec_dataset_pipeline import (
         build_dataset_url,
         download_dataset_zip_to_file,
         normalize_bulk_record,
         parse_dataset_zip,
         validate_bulk_record,
+            SECDatasetError,
         SECDatasetDownloadError,
     )
     from database.connection import connect
@@ -68,6 +87,9 @@ def run_historical_acquisition(
     state_mgr = AcquisitionStateManager(db_url)
     period_range = state_mgr.parse_period_range(start_period, end_period)
 
+    retention_years = getattr(settings, "sec_operational_retention_years", 3)
+
+
     periods_processed = 0
     periods_downloaded = 0
     total_parsed = 0
@@ -95,7 +117,7 @@ def run_historical_acquisition(
         try:
             dataset_url = build_dataset_url(year, qtr)
 
-            # Step 1: Reuse existing intact archive or download anew
+            # Step 1: Reuse existing intact archive or recover incomplete archive or download anew
             if archive_backend.exists(period_str):
                 print(f"Period {period_str}: Found existing immutable archive. Reusing archive.")
                 zip_bytes = archive_backend.get(period_str)
@@ -103,9 +125,65 @@ def run_historical_acquisition(
                     f.write(zip_bytes)
                 saved_meta = archive_backend.metadata(period_str)
             else:
-                # SEC Download
-                download_dataset_zip_to_file(year, qtr, user_agent=user_agent, target_path=temp_zip_path)
-                periods_downloaded += 1
+                # Check for partial / incomplete archive recovery.
+                #
+                # Storage errors MUST propagate. They must never be interpreted as
+                # "incomplete data" and must never trigger deletion or a fresh SEC
+                # download.
+                if archive_backend.is_incomplete(period_str):
+                    print(
+                        f"Period {period_str}: Found incomplete archive. "
+                        f"Attempting reconciliation."
+                    )
+
+                    try:
+                        zip_bytes = archive_backend.get_incomplete_zip(period_str)
+
+                        with open(temp_zip_path, "wb") as f:
+                            f.write(zip_bytes)
+
+                        if not zipfile.is_zipfile(temp_zip_path):
+                            raise ValueError(
+                                f"Incomplete archive ZIP for period {period_str} is invalid."
+                            )
+
+                        hasher = hashlib.sha256()
+                        file_size = os.path.getsize(temp_zip_path)
+
+                        with open(temp_zip_path, "rb") as f:
+                            while chunk := f.read(1024 * 1024):
+                                hasher.update(chunk)
+
+                        zip_checksum = hasher.hexdigest()
+
+                        archive_meta = ArchiveMetadata(
+                            period=period_str,
+                            source="SEC",
+                            source_url=dataset_url,
+                            sha256=zip_checksum,
+                            validation_status="validated",
+                            file_size_bytes=file_size,
+                        )
+
+                        saved_meta = archive_backend.put(
+                            period=period_str,
+                            content=temp_zip_path,
+                            metadata=archive_meta,
+                        )
+
+                    except ArchiveError:
+                        # Storage/auth/network failures are fatal.
+                        # Never delete the orphan archive and never fall back to SEC.
+                        raise
+
+                    except (zipfile.BadZipFile, ValueError):
+                        # Only an actually invalid ZIP may be treated as unrecoverable.
+                        archive_backend.delete_incomplete_archive(period_str)
+
+                # Download from SEC if temp ZIP is not available or not valid
+                if not os.path.exists(temp_zip_path) or os.path.getsize(temp_zip_path) == 0 or not zipfile.is_zipfile(temp_zip_path):
+                    download_dataset_zip_to_file(year, qtr, user_agent=user_agent, target_path=temp_zip_path)
+                    periods_downloaded += 1
 
                 # ZIP Validation
                 if not zipfile.is_zipfile(temp_zip_path):
@@ -145,6 +223,12 @@ def run_historical_acquisition(
                 validation_status="validated",
             )
 
+            within_retention = AcquisitionStateManager.is_within_operational_retention(
+                period_str,
+                reference_period=retention_ref,
+                retention_years=retention_years,
+            )
+
             # Normalized Ingestion
             p_parsed = 0
             p_invalid = 0
@@ -158,11 +242,12 @@ def run_historical_acquisition(
                 val_res = validate_bulk_record(norm_rec)
 
                 if val_res.is_valid:
-                    batch.append(norm_rec)
+                    if within_retention:
+                        batch.append(norm_rec)
                 else:
                     p_invalid += 1
 
-                if len(batch) >= batch_size:
+                if within_retention and len(batch) >= batch_size:
                     b_ins, b_dup = store_bulk_insider_transactions(
                         db_url,
                         batch,
@@ -172,8 +257,8 @@ def run_historical_acquisition(
                     p_duplicates += b_dup
                     batch.clear()
 
-            # Process final remaining batch for period
-            if batch:
+            # Process final remaining batch for period if within retention window
+            if within_retention and batch:
                 b_ins, b_dup = store_bulk_insider_transactions(
                     db_url,
                     batch,
@@ -182,6 +267,9 @@ def run_historical_acquisition(
                 p_inserted += b_ins
                 p_duplicates += b_dup
                 batch.clear()
+
+            if not within_retention:
+                print(f"Period {period_str}: Outside operational retention window ({retention_years} years relative to {retention_ref}). Archived in R2, skipped Neon transaction insertion.")
 
             # Mark COMPLETED only after normalized ingestion completes successfully
             state_mgr.record_period_completion(
@@ -204,15 +292,8 @@ def run_historical_acquisition(
                 f"Duplicates {p_duplicates}, Invalid {p_invalid}"
             )
 
-        except SECDatasetDownloadError as exc:
-            print(f"Period {period_str}: Download failed ({exc}). Marking FAILED.")
-            total_failures += 1
-            state_mgr.record_period_completion(
-                period_str, 0, 0, 0, 0, 1, status="FAILED"
-            )
-
-        except Exception as exc:
-            print(f"Period {period_str}: Ingestion error ({exc}). Marking FAILED.")
+        except (SECDatasetDownloadError, SECDatasetError, zipfile.BadZipFile, ValueError) as exc:
+            print(f"Period {period_str}: Recoverable dataset ingestion error ({exc}). Marking FAILED.")
             total_failures += 1
             state_mgr.record_period_completion(
                 period=period_str,
@@ -302,8 +383,17 @@ def main() -> int:
         parser.add_argument("--end", default="2026-Q2", help="End period (e.g. 2026-Q2)")
         parser.add_argument("--batch-size", type=int, default=5000, help="Batch size for database insertion")
         parser.add_argument("--force", action="store_true", help="Force re-processing of completed periods")
+        parser.add_argument(
+            "--reference-period",
+            default=None,
+            help=(
+                "Authoritative SEC dataset period used as the operational "
+                "retention reference (required for historical acquisition). "
+                "Example: 2026-Q2"
+            ),
+        )
         args = parser.parse_args()
-        return run_historical_acquisition(args.start, args.end, batch_size=args.batch_size, force=args.force)
+        return run_historical_acquisition(args.start, args.end, batch_size=args.batch_size, force=args.force, reference_period=args.reference_period)
 
     try:
         settings = load_environment()

@@ -6,36 +6,57 @@ signal generation, backtesting, paper trading, and controlled execution.
 
 ## Target Storage Architecture
 
-Insider Trade Bot 2.0 uses a tiered, cost-efficient storage architecture designed for Neon PostgreSQL constraints:
+Insider Trade Bot 2.0 uses a tiered, storage-safe architecture designed for Neon PostgreSQL storage constraints:
 
 ```
-SEC Quarterly ZIP (Official SEC Data)
+SEC (Acquisition Source Only)
     ↓
-Immutable Raw Dataset Archive (Local Filesystem / Object Storage)
+Quarterly ZIP
     ↓
-Lean Normalized Operational Database (Neon PostgreSQL)
+Cloudflare R2 = COMPLETE IMMUTABLE SOURCE ARCHIVE (2006-Q1 → 2026-Q2)
     ↓
-Research Data Access Layer
+Research / Data Access Layer
+    ├── Neon = lean operational / research cache (configured retention window)
+    └── R2 = historical source fallback when data is not in Neon
     ↓
-Event Study Engine
-    ↓
-Signals / Backtesting
+Research / Event Study / Backtest / Signal Engine
 ```
 
 ### System Layer Responsibilities
 
-- **Source of Truth (Immutable SEC Archive):** Official SEC quarterly ZIP archives are downloaded, validated for SHA-256 checksum integrity, and persisted immutably in the archive storage layer before ingestion. If the same period archive is ingested twice, identical checksums are handled idempotently, while differing checksums raise explicit immutability errors to prevent silent data corruption.
-- **Operational Database (Lean Neon PostgreSQL):** Stores parsed, normalized domain records (`insider_transactions`, `market_prices`, `ingestion_state`, `dataset_period` provenance). In lean operational storage mode (`SEC_STORE_RAW_PAYLOAD=false`), `raw_payload` is stored as NULL while retaining normalized fields, deterministic `record_hash` identity, and zero per-transaction provenance bloat.
-- **Research Data Access Layer:** A clean, read-only interface (`research.research_data_access`) that queries normalized insider transactions and market prices using parameter filters (date ranges, tickers, CIKs, transaction codes) without embedding SQL in research or signal calculations.
-- **Event Study Engine & Adapter:** An adapter (`research.insider_adapter`) maps normalized insider transactions into research event inputs for `research.research.event_study`, enforcing data quality safety checks (handling missing tickers, missing dates, missing market prices, and insufficient future observations).
+- **Cloudflare R2:**
+  - Complete immutable SEC quarterly source archive (2006-Q1 through 2026-Q2).
+  - Authoritative source for historical raw SEC datasets.
+  - Receives and stores all historical quarterly ZIP archives upon acquisition.
+  - Preserved permanently across database retries or resets.
+
+- **Neon PostgreSQL:**
+  - Lean operational/research database cache.
+  - Stores configured recent operational retention window (`SEC_OPERATIONAL_RETENTION_YEARS=3`).
+  - Indexed, research-ready operational data (`insider_transactions`, `market_prices`, `ingestion_state`, `dataset_period` provenance).
+  - NOT the complete raw 20-year historical transaction warehouse.
+
+- **Research / Data Access Layer:**
+  - Clean abstraction (`research.research_data_access`) that hides storage location from research callers.
+  - Transparently checks Neon operational cache first.
+  - Falls back to reading and normalizing immutable quarterly ZIPs directly from R2 for periods outside Neon retention.
+  - Period-based deterministic retrieval (`get_historical_transactions`).
+
+- **SEC:**
+  - External acquisition source only.
+  - Not directly queried during research operations.
+
+- **Event Study Engine & Adapter:** An adapter (`research.insider_adapter`) maps normalized insider transactions into research event inputs for `research.event_study`, enforcing data quality safety checks (handling missing tickers, missing dates, missing market prices, point-in-time entry pricing, and unresolved amendments).
+
 - **Signals & Backtesting:** Clean research event outputs feed directly into signal generation and backtesting simulation (`backtesting.engine`).
 
-### Lean Operational Storage Mode (`SEC_STORE_RAW_PAYLOAD`)
+### Operational Retention Configuration (`SEC_OPERATIONAL_RETENTION_YEARS`)
 
-Operational storage behavior is controlled by `SEC_STORE_RAW_PAYLOAD`:
+Neon database storage is kept lean using configurable operational retention:
 
+- **`SEC_OPERATIONAL_RETENTION_YEARS=3` (Default / Production):** Neon stores normalized transaction records for the most recent 3 years of operational data.
+- **Historical Backfills:** For periods outside the operational retention window, acquisition downloads and validates the SEC ZIP, persists the complete archive in R2, records dataset-level provenance and completion state, and omits bulk transaction insertion into Neon.
 - **`SEC_STORE_RAW_PAYLOAD=false` (Default / Production):** `raw_payload` is NOT persisted into `insider_transactions`, saving substantial database storage while retaining all normalized transaction fields, deterministic transaction identity (`record_hash`), dataset-level provenance, and ingestion state.
-- **`SEC_STORE_RAW_PAYLOAD=true`:** Retains the existing behavior where `raw_payload` JSON is persisted into `insider_transactions`.
 
 ### Immutable Archive Configuration
 
