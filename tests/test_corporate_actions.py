@@ -50,6 +50,7 @@ def test_postgres_migration_logic_preserves_unrelated_constraints() -> None:
 
     mock_cursor.fetchall.side_effect = [
         [("unrelated_idx_key", ["created_at"])],  # pg_constraint query for corporate_actions
+        [],  # pg_index query for corporate_actions
     ]
 
     with patch("database.connection.connect", return_value=mock_conn):
