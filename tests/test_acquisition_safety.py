@@ -44,10 +44,17 @@ def test_historical_acquisition_requires_explicit_reference_period(tmp_path, mon
                 reference_period=invalid_ref,
             )
 
-    # Verify " 2026-Q2 " normalizes successfully
-    # (will proceed past reference check to downstream download/parse mock)
-    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **k: "")
+    # Verify " 2026-Q2 " normalizes successfully and proceeds past validation
+    def mock_download(year, qtr, user_agent, target_path):
+        with zipfile.ZipFile(target_path, "w") as zf:
+            zf.writestr("test.txt", "data")
+        return target_path
+
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", mock_download)
     monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", lambda *a, **k: [])
+
+    ret_code = run_historical_acquisition("2006-Q1", "2006-Q1", reference_period=" 2026-Q2 ", force=True)
+    assert ret_code == 0
 
 
 def test_invalid_reference_period_fails_before_infrastructure(monkeypatch):

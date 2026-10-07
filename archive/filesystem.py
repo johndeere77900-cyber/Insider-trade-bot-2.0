@@ -140,7 +140,17 @@ class FilesystemSECArchive(SECArchiveInterface):
                     f"({existing_sha} vs incoming {calc_sha256}). Conflicting incomplete archives cannot be overwritten."
                 )
         elif manifest_exists and not zip_exists:
-            self.delete_incomplete_archive(norm_period)
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            existing_sha = str(data.get("sha256", ""))
+            if existing_sha == calc_sha256:
+                # Incoming content matches manifest SHA -> safely recreate missing ZIP
+                pass
+            else:
+                raise ArchiveExistsError(
+                    f"Incomplete archive manifest for period '{norm_period}' exists with different SHA-256 "
+                    f"({existing_sha} vs incoming {calc_sha256}). Conflicting manifest cannot be overwritten."
+                )
 
         # Write ZIP content
         if isinstance(content, str):

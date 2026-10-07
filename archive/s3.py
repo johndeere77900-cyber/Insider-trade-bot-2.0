@@ -249,7 +249,24 @@ class S3SECArchive(SECArchiveInterface):
                     f"({existing_sha} vs incoming {calc_sha256}). Conflicting incomplete archives cannot be overwritten."
                 )
         elif manifest_exists and not zip_exists:
-            self.delete_incomplete_archive(norm_period)
+            client = self._get_client()
+            try:
+                m_obj = client.get_object(Bucket=self.bucket, Key=manifest_key)
+                m_data = json.loads(m_obj["Body"].read().decode("utf-8"))
+                existing_sha = str(m_data.get("sha256", ""))
+            except Exception as exc:
+                if _is_not_found_exception(exc):
+                    existing_sha = None
+                else:
+                    raise ArchiveError(f"Failed to inspect incomplete manifest object '{manifest_key}' in bucket '{self.bucket}': {exc}") from exc
+
+            if existing_sha == calc_sha256:
+                pass
+            else:
+                raise ArchiveExistsError(
+                    f"Incomplete S3 archive manifest for period '{norm_period}' exists with different SHA-256 "
+                    f"({existing_sha} vs incoming {calc_sha256}). Conflicting manifest cannot be overwritten."
+                )
 
         # Upload ZIP bytes
         if isinstance(content, str):

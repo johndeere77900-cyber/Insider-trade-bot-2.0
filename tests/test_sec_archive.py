@@ -92,15 +92,29 @@ def test_archive_idempotency_and_immutability(tmp_path) -> None:
     with pytest.raises(ArchiveExistsError, match="Conflicting incomplete archives cannot be overwritten"):
         archive.put(incomplete_diff_period, str(zip_file2))
 
-    # 4. Manifest exists but ZIP missing -> Differing SHA clears orphaned manifest and writes new archive
+    # 4. Manifest exists but ZIP missing -> Differing SHA rejects with ArchiveExistsError and preserves manifest
     manifest_only_period = "2006-Q3"
     m_file = archive_dir / f"{manifest_only_period}.json"
     m_file.write_text('{"period": "2006-Q3", "sha256": "abc"}')
     assert archive.is_incomplete(manifest_only_period) is True
 
-    m_recreated = archive.put(manifest_only_period, str(zip_file1))
-    assert m_recreated.period == manifest_only_period
-    assert archive.exists(manifest_only_period) is True
+    with pytest.raises(ArchiveExistsError, match="Conflicting manifest cannot be overwritten"):
+        archive.put(manifest_only_period, str(zip_file1))
+
+    # Assert manifest still exists and SHA remains intact
+    assert m_file.exists() is True
+    data = json.loads(m_file.read_text())
+    assert data["sha256"] == "abc"
+
+    # 4b. Manifest exists but ZIP missing -> Matching SHA safely completes archive
+    m_matching_period = "2006-Q4"
+    m_file_match = archive_dir / f"{m_matching_period}.json"
+    calc_sha = saved_meta1.sha256
+    m_file_match.write_text(f'{{"period": "{m_matching_period}", "sha256": "{calc_sha}"}}')
+
+    m_recreated = archive.put(m_matching_period, str(zip_file1))
+    assert m_recreated.period == m_matching_period
+    assert archive.exists(m_matching_period) is True
 
 
 def test_archive_metadata_and_list(tmp_path) -> None:
@@ -254,16 +268,24 @@ def test_s3_archive_cases_a_through_f(tmp_path) -> None:
     with pytest.raises(ArchiveNotFoundError):
         s3_backend.get_incomplete_zip("2099-Q4")
 
-    # CASE E: Metadata exists but ZIP does not -> clears orphaned manifest and recreates
+    # CASE E: Metadata exists but ZIP does not -> differing SHA rejects with ArchiveExistsError
     period_e = "2006-Q3"
     store[f"sec-archives/{period_e}.json"] = b'{"sha256": "abc"}'
     assert s3_backend.is_incomplete(period_e) is True
-    meta_e = s3_backend.put(period_e, str(z1))
-    assert meta_e.period == period_e
-    assert s3_backend.exists(period_e) is True
+    with pytest.raises(ArchiveExistsError, match="Conflicting manifest cannot be overwritten"):
+        s3_backend.put(period_e, str(z1))
+
+    # CASE E2: Metadata exists but ZIP does not -> matching SHA safely completes archive
+    period_e2 = "2006-Q4"
+    matching_meta_json = json.dumps({"sha256": meta_a.sha256}).encode("utf-8")
+    store[f"sec-archives/{period_e2}.json"] = matching_meta_json
+    assert s3_backend.is_incomplete(period_e2) is True
+    meta_e = s3_backend.put(period_e2, str(z1))
+    assert meta_e.period == period_e2
+    assert s3_backend.exists(period_e2) is True
 
     # CASE F: ZIP upload succeeds but metadata upload fails -> next retry completes manifest safely
-    period_f = "2006-Q4"
+    period_f = "2007-Q1"
     fail_manifest_write = True
     with pytest.raises(ArchiveError, match="Simulated network failure"):
         s3_backend.put(period_f, str(z1))
