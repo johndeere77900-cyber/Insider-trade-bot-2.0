@@ -308,19 +308,77 @@ def test_storage_idempotency_and_conflicts(tmp_path) -> None:
     assert count_records(db_url, "market_prices") == 2
 
     # 4. Same symbol/date/source with changed price data
-    with pytest.raises(MarketDataConflictError, match="Data conflict"):
-        store_market_price(
-            db_url,
-            symbol="AAPL",
-            price_date="2023-01-01",
-            open_price=100.0,
-            high=105.0,
-            low=99.0,
-            close=120.0,
-            adjusted_close=104.0,
-            volume=1000.0,
-            source="provider_a",
-        )
+    hash4, status4 = store_market_price(
+        db_url,
+        symbol="AAPL",
+        price_date="2023-01-01",
+        open_price=100.0,
+        high=105.0,
+        low=99.0,
+        close=120.0,
+        adjusted_close=104.0,
+        volume=1000.0,
+        source="provider_a",
+    )
+    assert status4 == "CONFLICT"
+
+
+def test_sqlite_market_price_concurrent_insert_classification(tmp_path) -> None:
+    """
+    Regression test for SQLite market-price insertion classification under
+    concurrent / race conditions or ignored inserts.
+    """
+    db_url = f"sqlite:///{tmp_path}/sqlite_concurrent_md.db"
+    initialize_database(db_url)
+
+    # 1. Normal first insert -> "INSERTED"
+    hash1, status1 = store_market_price(
+        db_url,
+        symbol="AAPL",
+        price_date="2023-01-01",
+        open_price=100.0,
+        high=105.0,
+        low=99.0,
+        close=104.0,
+        adjusted_close=104.0,
+        volume=1000.0,
+        source="provider_a",
+    )
+    assert status1 == "INSERTED"
+    assert count_records(db_url, "market_prices") == 1
+
+    # 2. SQLite ignored insert with same hash -> "DUPLICATE"
+    hash2, status2 = store_market_price(
+        db_url,
+        symbol="AAPL",
+        price_date="2023-01-01",
+        open_price=100.0,
+        high=105.0,
+        low=99.0,
+        close=104.0,
+        adjusted_close=104.0,
+        volume=1000.0,
+        source="provider_a",
+    )
+    assert status2 == "DUPLICATE"
+    assert hash2 == hash1
+    assert count_records(db_url, "market_prices") == 1
+
+    # 3. SQLite ignored insert with different hash -> "CONFLICT"
+    hash3, status3 = store_market_price(
+        db_url,
+        symbol="AAPL",
+        price_date="2023-01-01",
+        open_price=100.0,
+        high=105.0,
+        low=99.0,
+        close=120.0,
+        adjusted_close=104.0,
+        volume=1000.0,
+        source="provider_a",
+    )
+    assert status3 == "CONFLICT"
+    assert count_records(db_url, "market_prices") == 1
 
 
 def test_deterministic_hash_has_no_retrieval_timestamp() -> None:
@@ -536,6 +594,85 @@ def test_regression_b_provider_failure_is_not_record_failure(tmp_path) -> None:
         + report.conflicts
         + report.records_failed
     )
+
+
+def test_market_data_acquisition_exception_boundaries(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/acq_boundary_test.db"
+    initialize_database(db_url)
+
+    # 1. MarketDataRequestError -> provider failure
+    mock_p1 = MagicMock()
+    mock_p1.source = "p1"
+    mock_p1.supports_batch = False
+    mock_p1.get_historical_prices.side_effect = MarketDataRequestError("Request failed")
+    service1 = MarketDataAcquisitionService(mock_p1)
+    report1 = service1.acquire_historical_data(db_url, symbols=["AAPL"])
+    assert report1.provider_request_failures == 1
+    assert report1.records_failed == 0
+
+    # 2. MarketDataResponseError -> provider failure
+    mock_p2 = MagicMock()
+    mock_p2.source = "p2"
+    mock_p2.supports_batch = False
+    mock_p2.get_historical_prices.side_effect = MarketDataResponseError("Response bad JSON")
+    service2 = MarketDataAcquisitionService(mock_p2)
+    report2 = service2.acquire_historical_data(db_url, symbols=["AAPL"])
+    assert report2.provider_request_failures == 1
+    assert report2.records_failed == 0
+
+    # 3. Storage RuntimeError -> record/storage failure, NOT provider failure
+    mock_p3 = MagicMock()
+    mock_p3.source = "p3"
+    mock_p3.supports_batch = False
+    mock_p3.get_historical_prices.return_value = [{"symbol": "AAPL", "date": "2023-01-01", "close": 100.0}]
+    service3 = MarketDataAcquisitionService(mock_p3)
+    with patch("data.market_data_acquisition.load_market_prices_detailed", side_effect=RuntimeError("DB disk full")):
+        report3 = service3.acquire_historical_data(db_url, symbols=["AAPL"])
+        assert report3.provider_request_failures == 0
+        assert report3.records_failed == 1
+
+    # 4. Provider-side unexpected ValueError -> propagates
+    mock_p4 = MagicMock()
+    mock_p4.source = "p4"
+    mock_p4.supports_batch = False
+    mock_p4.get_historical_prices.side_effect = ValueError("Invalid arg in provider code")
+    service4 = MarketDataAcquisitionService(mock_p4)
+    with pytest.raises(ValueError, match="Invalid arg in provider code"):
+        service4.acquire_historical_data(db_url, symbols=["AAPL"])
+
+    # 5. Provider-side unexpected RuntimeError -> propagates
+    mock_p5 = MagicMock()
+    mock_p5.source = "p5"
+    mock_p5.supports_batch = False
+    mock_p5.get_historical_prices.side_effect = RuntimeError("Bug in provider code")
+    service5 = MarketDataAcquisitionService(mock_p5)
+    with pytest.raises(RuntimeError, match="Bug in provider code"):
+        service5.acquire_historical_data(db_url, symbols=["AAPL"])
+
+    # 6. Batch provider expected failure still triggers individual-request fallback
+    mock_p6 = MagicMock()
+    mock_p6.source = "p6"
+    mock_p6.supports_batch = True
+    mock_p6.get_historical_prices_batch.side_effect = MarketDataRequestError("Batch endpoint failed")
+    mock_p6.get_historical_prices.return_value = [{"symbol": "AAPL", "date": "2023-01-01", "close": 100.0}]
+    service6 = MarketDataAcquisitionService(mock_p6)
+    report6 = service6.acquire_historical_data(db_url, symbols=["AAPL", "MSFT"])
+    assert mock_p6.get_historical_prices_batch.call_count == 1
+    assert mock_p6.get_historical_prices.call_count == 2
+    assert report6.provider_request_failures == 1  # batch failure recorded
+
+    # 7. Batch storage failure does NOT trigger individual provider fallback
+    mock_p7 = MagicMock()
+    mock_p7.source = "p7"
+    mock_p7.supports_batch = True
+    mock_p7.get_historical_prices_batch.return_value = [{"symbol": "AAPL", "date": "2023-01-01", "close": 100.0}]
+    service7 = MarketDataAcquisitionService(mock_p7)
+    with patch("data.market_data_acquisition.load_market_prices_detailed", side_effect=RuntimeError("Storage fail")):
+        report7 = service7.acquire_historical_data(db_url, symbols=["AAPL", "MSFT"])
+        assert mock_p7.get_historical_prices_batch.call_count == 1
+        assert mock_p7.get_historical_prices.call_count == 0
+        assert report7.provider_request_failures == 0
+        assert report7.records_failed == 1
 
 
 def test_market_data_error_classification_provider_failure(tmp_path) -> None:

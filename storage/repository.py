@@ -590,21 +590,6 @@ def store_market_price(
 
     with connect(database_url) as connection:
         cursor = connection.execute(
-            select_sql,
-            (normalized_symbol, normalized_date, normalized_source),
-        )
-        existing = cursor.fetchone()
-
-        if existing is not None:
-            existing_hash = _row_value(existing, "record_hash", index=0)
-            if existing_hash == record_hash:
-                return record_hash, "DUPLICATE"
-            raise MarketDataConflictError(
-                f"Data conflict: market price for symbol '{normalized_symbol}', date '{normalized_date}', "
-                f"source '{normalized_source}' already exists with different values."
-            )
-
-        connection.execute(
             f"""
             INSERT OR IGNORE INTO market_prices (
                 symbol,
@@ -626,9 +611,27 @@ def store_market_price(
             values,
         )
 
-        connection.commit()
+        if cursor.rowcount > 0:
+            connection.commit()
+            return record_hash, "INSERTED"
 
-    return record_hash, "INSERTED"
+        cursor = connection.execute(
+            select_sql,
+            (normalized_symbol, normalized_date, normalized_source),
+        )
+        existing = cursor.fetchone()
+
+        if existing is None:
+            raise RuntimeError(
+                f"Data consistency error: INSERT OR IGNORE was ignored for symbol '{normalized_symbol}', "
+                f"date '{normalized_date}', source '{normalized_source}', but no existing record was found."
+            )
+
+        existing_hash = _row_value(existing, "record_hash", index=0)
+        if existing_hash == record_hash:
+            return record_hash, "DUPLICATE"
+
+        return record_hash, "CONFLICT"
 
 
 def store_corporate_action(
