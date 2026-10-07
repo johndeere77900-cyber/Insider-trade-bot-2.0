@@ -26,6 +26,23 @@ def run_historical_acquisition(
     Execute historical SEC dataset acquisition from start_period to end_period
     using temporary disk files and bounded streaming batches to prevent high memory usage.
     """
+    import re
+
+    if reference_period is None or not str(reference_period).strip():
+        raise ValueError(
+            "reference_period is required for historical acquisition. "
+            "Pass --reference-period using the authoritative SEC dataset "
+            "period that should anchor the operational retention window."
+        )
+
+    retention_ref = str(reference_period).strip().upper()
+
+    if not re.fullmatch(r"\d{4}-Q[1-4]", retention_ref):
+        raise ValueError(
+            f"Invalid reference_period '{reference_period}'. "
+            "Expected format YYYY-Q1, YYYY-Q2, YYYY-Q3, or YYYY-Q4."
+        )
+
     import hashlib
     import os
     import tempfile
@@ -72,32 +89,6 @@ def run_historical_acquisition(
 
     retention_years = getattr(settings, "sec_operational_retention_years", 3)
 
-    # The retention reference must be explicit for a historical acquisition.
-    #
-    # Do NOT derive it from the current contents of Neon/R2 here.
-    # A fresh database/archive may legitimately contain no authoritative
-    # period yet, and deriving the reference from partially populated
-    # historical data could incorrectly make an old quarter the retention
-    # anchor.
-    #
-    # The caller/workflow must explicitly provide the authoritative SEC
-    # reference period for the acquisition window.
-    if not reference_period or not str(reference_period).strip():
-        raise ValueError(
-            "reference_period is required for historical acquisition. "
-            "Pass --reference-period using the authoritative SEC dataset "
-            "period that should anchor the operational retention window."
-        )
-
-    try:
-        ref_parsed = state_mgr.parse_period_range(reference_period, reference_period)
-        if not ref_parsed or ref_parsed[0][1] not in (1, 2, 3, 4):
-            raise ValueError(f"Invalid reference_period format or quarter: '{reference_period}'")
-        retention_ref = ref_parsed[0][2]
-    except Exception as exc:
-        raise ValueError(
-            f"Invalid reference_period '{reference_period}': {exc}"
-        ) from exc
 
     periods_processed = 0
     periods_downloaded = 0

@@ -33,13 +33,42 @@ def test_historical_acquisition_requires_explicit_reference_period(tmp_path, mon
             reference_period=None,
         )
 
-    for invalid_ref in ["INVALID", "2026-Q0", "2026-Q5", "2026-QX", "ABC-Q1", "2026"]:
+    for invalid_ref in [
+        "INVALID", "2026", "2026-Q", "2026-Q0", "2026-Q5", "2026-QX",
+        "2026-Q11", "X2026-Q2", "2026-Q2-extra"
+    ]:
         with pytest.raises(ValueError, match="Invalid reference_period"):
             run_historical_acquisition(
                 "2006-Q1",
                 "2006-Q1",
                 reference_period=invalid_ref,
             )
+
+    # Verify " 2026-Q2 " normalizes successfully
+    # (will proceed past reference check to downstream download/parse mock)
+    monkeypatch.setattr("data.sec_dataset_pipeline.download_dataset_zip_to_file", lambda *a, **k: "")
+    monkeypatch.setattr("data.sec_dataset_pipeline.parse_dataset_zip", lambda *a, **k: [])
+
+
+def test_invalid_reference_period_fails_before_infrastructure(monkeypatch):
+    """Verify malformed reference_period fails BEFORE load_environment or archive backend initialization."""
+    called_infra = []
+
+    def fail_env():
+        called_infra.append("env")
+        raise RuntimeError("load_environment should NOT be called!")
+
+    def fail_archive(*args, **kwargs):
+        called_infra.append("archive")
+        raise RuntimeError("get_archive_backend should NOT be called!")
+
+    monkeypatch.setattr("config.environment.load_environment", fail_env)
+    monkeypatch.setattr("archive.get_archive_backend", fail_archive)
+
+    with pytest.raises(ValueError, match="Invalid reference_period"):
+        run_historical_acquisition("2006-Q1", "2006-Q1", reference_period="INVALID-REF")
+
+    assert len(called_infra) == 0
 
     with pytest.raises(ValueError, match="reference_period is required"):
         AcquisitionStateManager.is_within_operational_retention("2006-Q1", reference_period=None)

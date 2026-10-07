@@ -394,17 +394,24 @@ def verify_run1(period: str, state_file: str) -> int:
         if amendment_rows:
             distinct_amendment_proven = False
             amendment_failed = False
+            untestable_amendment = False
 
             for acc, rec_hash, date_orig, doc_type, raw_obj in amendment_rows:
                 if not acc or not rec_hash or rec_hash not in all_period_hashes:
                     amendment_failed = True
                     break
 
-                sub_info = raw_obj.get("submission", {}) if isinstance(raw_obj, dict) else {}
-                orig_acc = sub_info.get("ACCESSION_NUMBER") or acc
+                orig_acc = None
+                if raw_obj is not None and isinstance(raw_obj, dict):
+                    sub_info = raw_obj.get("submission", {}) if isinstance(raw_obj.get("submission"), dict) else {}
+                    orig_acc = sub_info.get("ACCESSION_NUMBER")
 
-                # Check if a separate original filing record exists in original_rows_by_acc
-                matching_origs = original_rows_by_acc.get(orig_acc) or original_rows_by_acc.get(acc)
+                if not orig_acc:
+                    # Original accession cannot be established without source detail
+                    untestable_amendment = True
+                    continue
+
+                matching_origs = original_rows_by_acc.get(orig_acc)
                 if matching_origs:
                     for orig_hash, orig_r in matching_origs:
                         if orig_hash != rec_hash:
@@ -415,11 +422,15 @@ def verify_run1(period: str, state_file: str) -> int:
                 amendment_result = "FAIL"
             elif distinct_amendment_proven:
                 amendment_result = "PASS"
+            elif untestable_amendment or archive_genuinely_absent:
+                amendment_result = "NOT TESTABLE"
             else:
                 amendment_result = "NOT TESTABLE"
 
         if multi_owner_found:
             multi_owner_result = "PASS" if multi_owner_valid else "FAIL"
+        elif archive_genuinely_absent and any(get_field(r, "raw_payload", period_tx_cols) is None for r in period_rows):
+            multi_owner_result = "NOT TESTABLE"
         else:
             multi_owner_result = "NOT TESTABLE"
 

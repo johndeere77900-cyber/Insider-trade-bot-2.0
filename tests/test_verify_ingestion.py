@@ -704,6 +704,57 @@ def test_verify_run1_multi_owner_pass_and_not_testable(tmp_path: Path, monkeypat
     assert data["multi_owner_result"] == "PASS"
 
 
+def test_verify_run1_archive_absent_yields_not_testable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test B: When raw_payload is NULL and archive genuinely does not exist, verification results in NOT TESTABLE."""
+    db_path = tmp_path / "test_arch_absent.db"
+    db_url = f"sqlite:///{db_path}"
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SEC_USER_AGENT", "InsiderTradeBotTest/test@example.com")
+    monkeypatch.setenv("SEC_STORE_RAW_PAYLOAD", "false")
+
+    initialize_database(db_url)
+
+    with connect(db_url) as conn:
+        conn.execute(
+            """
+            INSERT INTO insider_transactions (
+                source, accession_number, issuer_cik, filing_date, raw_payload, record_hash, form_type, is_amendment, created_at
+            ) VALUES ('SEC', 'acc1', 'cik1', '2006-01-15', NULL, 'hash1', '4/A', 1, '2026-01-01')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO provenance (
+                record_type, record_id, source, source_reference, retrieved_at, checksum, validation_status
+            ) VALUES ('dataset_period', '2006-Q1', 'SEC', '2006q1_form345.zip', '2026-01-01', 'chk', 'validated')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_state (
+                period, status, records_parsed, records_inserted, duplicates_count, invalid_count, failures_count, completed_at
+            ) VALUES ('2006-Q1', 'COMPLETED', 1, 1, 0, 0, 0, '2026-01-01')
+            """
+        )
+        conn.commit()
+
+    class AbsentArchive:
+        def exists(self, period):
+            return False
+
+    monkeypatch.setattr("archive.get_archive_backend", lambda *a, **k: AbsentArchive())
+
+    state_file = str(tmp_path / "sec_absent_run1_stats.json")
+
+    res = verify_run1("2006-Q1", state_file)
+    assert res == 0
+
+    with open(state_file, "r") as f:
+        data = json.load(f)
+
+    assert data["amendment_result"] == "NOT TESTABLE"
+
+
 def test_verify_run1_archive_error_propagates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that verify_run1 propagates ArchiveError when archive access fails in lean storage mode."""
     from archive import ArchiveError
