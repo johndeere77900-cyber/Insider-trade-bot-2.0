@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from data.corporate_actions_loader import load_corporate_actions
+from data.corporate_actions_loader import load_corporate_actions_detailed
 from data.providers.fmp_corporate_actions import FMPCorporateActionsProvider
 
 
@@ -24,7 +24,9 @@ class SymbolCorporateActionsResult:
     dividends_received: int
     records_inserted: int
     duplicates_count: int
+    conflicts_count: int
     rejected_count: int
+    record_failures: int
     provider_failures: int
     error_message: str | None = None
 
@@ -42,6 +44,7 @@ class CorporateActionsAcquisitionReport:
     dividends_received: int
     records_inserted: int
     records_duplicate: int
+    records_conflict: int
     records_rejected: int
     records_failed: int
     provider_request_failures: int
@@ -89,6 +92,7 @@ class CorporateActionsAcquisitionService:
                 dividends_received=0,
                 records_inserted=0,
                 records_duplicate=0,
+                records_conflict=0,
                 records_rejected=0,
                 records_failed=0,
                 provider_request_failures=0,
@@ -101,6 +105,7 @@ class CorporateActionsAcquisitionService:
         total_dividends = 0
         total_inserted = 0
         total_duplicate = 0
+        total_conflict = 0
         total_rejected = 0
         total_failed = 0
         total_provider_failures = 0
@@ -115,7 +120,9 @@ class CorporateActionsAcquisitionService:
             sym_dividends = 0
             sym_inserted = 0
             sym_duplicate = 0
+            sym_conflict = 0
             sym_rejected = 0
+            sym_failed = 0
             sym_provider_fail = 0
             sym_errors: list[str] = []
 
@@ -130,13 +137,23 @@ class CorporateActionsAcquisitionService:
                 )
                 sym_splits = len(split_records)
                 if split_records:
-                    hashes = load_corporate_actions(
+                    outcomes = load_corporate_actions_detailed(
                         database_url,
                         split_records,
                         source=provider_source,
                         source_reference=source_ref,
                     )
-                    sym_inserted += len(hashes)
+                    for o in outcomes:
+                        if o.outcome == "INSERTED":
+                            sym_inserted += 1
+                        elif o.outcome == "DUPLICATE":
+                            sym_duplicate += 1
+                        elif o.outcome == "CONFLICT":
+                            sym_conflict += 1
+                        elif o.outcome == "REJECTED":
+                            sym_rejected += 1
+                        elif o.outcome == "FAILED":
+                            sym_failed += 1
 
             except Exception as exc:
                 err_msg = f"Splits fetch/ingest error: {exc}"
@@ -153,13 +170,23 @@ class CorporateActionsAcquisitionService:
                 )
                 sym_dividends = len(div_records)
                 if div_records:
-                    hashes = load_corporate_actions(
+                    outcomes = load_corporate_actions_detailed(
                         database_url,
                         div_records,
                         source=provider_source,
                         source_reference=source_ref,
                     )
-                    sym_inserted += len(hashes)
+                    for o in outcomes:
+                        if o.outcome == "INSERTED":
+                            sym_inserted += 1
+                        elif o.outcome == "DUPLICATE":
+                            sym_duplicate += 1
+                        elif o.outcome == "CONFLICT":
+                            sym_conflict += 1
+                        elif o.outcome == "REJECTED":
+                            sym_rejected += 1
+                        elif o.outcome == "FAILED":
+                            sym_failed += 1
 
             except Exception as exc:
                 err_msg = f"Dividends fetch/ingest error: {exc}"
@@ -167,11 +194,11 @@ class CorporateActionsAcquisitionService:
                 sym_provider_fail += 1
                 provider_failures_list.append({"symbol": sym, "action": "dividends", "error": str(exc)})
 
-            # Determine status
-            if sym_provider_fail == 0:
+            has_rec_failures = sym_rejected > 0 or sym_failed > 0 or sym_conflict > 0
+            if sym_provider_fail == 0 and not has_rec_failures:
                 status = "SUCCESS"
                 successful_symbols.append(sym)
-            elif sym_inserted > 0 or sym_splits > 0 or sym_dividends > 0:
+            elif sym_inserted > 0 or sym_duplicate > 0:
                 status = "PARTIAL"
                 failed_symbols.append(sym)
             else:
@@ -188,7 +215,9 @@ class CorporateActionsAcquisitionService:
                     dividends_received=sym_dividends,
                     records_inserted=sym_inserted,
                     duplicates_count=sym_duplicate,
+                    conflicts_count=sym_conflict,
                     rejected_count=sym_rejected,
+                    record_failures=sym_failed,
                     provider_failures=sym_provider_fail,
                     error_message=err_str,
                 )
@@ -198,7 +227,9 @@ class CorporateActionsAcquisitionService:
             total_dividends += sym_dividends
             total_inserted += sym_inserted
             total_duplicate += sym_duplicate
+            total_conflict += sym_conflict
             total_rejected += sym_rejected
+            total_failed += sym_failed
             total_provider_failures += sym_provider_fail
 
         return CorporateActionsAcquisitionReport(
@@ -211,6 +242,7 @@ class CorporateActionsAcquisitionService:
             dividends_received=total_dividends,
             records_inserted=total_inserted,
             records_duplicate=total_duplicate,
+            records_conflict=total_conflict,
             records_rejected=total_rejected,
             records_failed=total_failed,
             provider_request_failures=total_provider_failures,

@@ -604,59 +604,118 @@ def store_corporate_action(
     cash_amount: float | None,
     source: str,
     raw_payload: dict[str, Any],
-) -> str:
-    """Store a normalized corporate-action record and return its hash."""
+) -> tuple[str, str]:
+    """
+    Store a normalized corporate-action record idempotently and return (record_hash, outcome).
+
+    Identity is provider-neutral: (symbol, action_type, action_date, source).
+    Outcomes:
+        - 'INSERTED': New identity row stored.
+        - 'DUPLICATE': Identity exists with identical record_hash (no-op).
+        - 'CONFLICT': Identity exists with different record_hash (no-op, report conflict).
+    """
 
     initialize_database(database_url)
+
+    norm_symbol = str(symbol).strip().upper()
+    norm_action_type = str(action_type).strip().lower()
+    norm_action_date = str(action_date).strip()
+    norm_source = str(source).strip().lower()
 
     record_hash = sha256_record(raw_payload)
     placeholder = _placeholder(database_url)
 
-    values = (
-        symbol,
-        action_type,
-        action_date,
-        ratio,
-        cash_amount,
-        source,
-        json.dumps(
-            raw_payload,
-            sort_keys=True,
-            default=str,
-        ),
-        record_hash,
-        utc_now(),
-    )
-
-    placeholders = ", ".join(
-        placeholder
-        for _ in values
-    )
+    select_sql = f"""
+        SELECT record_hash
+        FROM corporate_actions
+        WHERE symbol = {placeholder}
+          AND action_type = {placeholder}
+          AND action_date = {placeholder}
+          AND source = {placeholder}
+    """
 
     with connect(database_url) as connection:
-        connection.execute(
-            f"""
-            INSERT INTO corporate_actions (
-                symbol,
-                action_type,
-                action_date,
-                ratio,
-                cash_amount,
-                source,
-                raw_payload,
-                record_hash,
-                created_at
-            )
-            VALUES (
-                {placeholders}
-            )
-            """,
-            values,
+        cursor = connection.execute(
+            select_sql,
+            (norm_symbol, norm_action_type, norm_action_date, norm_source),
         )
+        existing = cursor.fetchone()
+
+        if existing is not None:
+            existing_hash = _row_value(existing, "record_hash", index=0)
+            if existing_hash == record_hash:
+                return record_hash, "DUPLICATE"
+            return record_hash, "CONFLICT"
+
+        values = (
+            norm_symbol,
+            norm_action_type,
+            norm_action_date,
+            ratio,
+            cash_amount,
+            norm_source,
+            json.dumps(
+                raw_payload,
+                sort_keys=True,
+                default=str,
+            ),
+            record_hash,
+            utc_now(),
+        )
+
+        placeholders = ", ".join(placeholder for _ in values)
+
+        if is_postgresql_url(database_url):
+            connection.execute(
+                f"""
+                INSERT INTO corporate_actions (
+                    symbol,
+                    action_type,
+                    action_date,
+                    ratio,
+                    cash_amount,
+                    source,
+                    raw_payload,
+                    record_hash,
+                    created_at
+                )
+                VALUES (
+                    {placeholders}
+                )
+                ON CONFLICT (
+                    symbol,
+                    action_type,
+                    action_date,
+                    source
+                )
+                DO NOTHING
+                """,
+                values,
+            )
+        else:
+            connection.execute(
+                f"""
+                INSERT OR IGNORE INTO corporate_actions (
+                    symbol,
+                    action_type,
+                    action_date,
+                    ratio,
+                    cash_amount,
+                    source,
+                    raw_payload,
+                    record_hash,
+                    created_at
+                )
+                VALUES (
+                    {placeholders}
+                )
+                """,
+                values,
+            )
 
         connection.commit()
 
-    return record_hash
+    return record_hash, "INSERTED"
 
 
 def table_exists(

@@ -145,7 +145,9 @@ def format_ca_report_dict(
             "dividends_received": res.dividends_received,
             "records_inserted": res.records_inserted,
             "duplicates_count": res.duplicates_count,
+            "conflicts_count": res.conflicts_count,
             "rejected_count": res.rejected_count,
+            "record_failures": res.record_failures,
             "provider_failures": res.provider_failures,
             "error_message": res.error_message,
         }
@@ -166,6 +168,7 @@ def format_ca_report_dict(
             "dividends_received": report.dividends_received,
             "records_inserted": report.records_inserted,
             "records_duplicate": report.records_duplicate,
+            "records_conflict": report.records_conflict,
             "records_rejected": report.records_rejected,
             "records_failed": report.records_failed,
             "provider_request_failures": report.provider_request_failures,
@@ -199,6 +202,7 @@ def main(args: list[str] | None = None) -> None:
             print(f"  Dividends Received:     {summary['dividends_received']}")
             print(f"  Records Inserted:       {summary['records_inserted']}")
             print(f"  Duplicates:             {summary['records_duplicate']}")
+            print(f"  Conflicts:              {summary['records_conflict']}")
             print(f"  Rejections:             {summary['records_rejected']}")
             print(f"  Failures:               {summary['records_failed']}")
             print(f"  Provider Failures:      {summary['provider_request_failures']}")
