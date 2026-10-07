@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -24,6 +25,19 @@ from database.connection import (
     initialize_database,
     is_postgresql_url,
 )
+
+try:
+    import psycopg.errors
+    PSYCOPG_INTEGRITY_ERRORS: tuple[type[BaseException], ...] = (
+        psycopg.errors.UniqueViolation,
+        psycopg.errors.IntegrityError,
+    )
+except ImportError:
+    PSYCOPG_INTEGRITY_ERRORS = ()
+
+INTEGRITY_ERRORS: tuple[type[BaseException], ...] = (
+    sqlite3.IntegrityError,
+) + PSYCOPG_INTEGRITY_ERRORS
 
 
 ALLOWED_PAYLOAD_TABLES = {
@@ -699,7 +713,7 @@ def store_corporate_action(
             connection.commit()
             return record_hash, "INSERTED"
 
-        except Exception as exc:
+        except INTEGRITY_ERRORS:
             connection.rollback()
             cursor = connection.execute(
                 select_sql,
@@ -711,7 +725,7 @@ def store_corporate_action(
                 if race_hash == record_hash:
                     return record_hash, "DUPLICATE"
                 return record_hash, "CONFLICT"
-            raise exc
+            raise
 
 
 def table_exists(

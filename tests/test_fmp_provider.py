@@ -8,6 +8,7 @@ All network requests are mocked. No real external API requests.
 from __future__ import annotations
 
 import json
+import sqlite3
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
 
@@ -342,9 +343,13 @@ def test_store_corporate_action_outcomes(tmp_path) -> None:
     assert count_records(db_url, "corporate_actions") == 1  # Row count remains strictly 1!
 
 
-def test_store_corporate_action_unique_constraint_race_recovery(tmp_path) -> None:
-    """Tests unique constraint race recovery path returning DUPLICATE or CONFLICT."""
-    db_url = f"sqlite:///{tmp_path}/ca_race_test.db"
+def test_store_corporate_action_unique_constraint_race_cases(tmp_path) -> None:
+    """
+    Tests unique-constraint race condition handling:
+      - Case A (same content): raises IntegrityError -> returns DUPLICATE
+      - Case B (different content): raises IntegrityError -> returns CONFLICT
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_race_cases_test.db"
     initialize_database(db_url)
 
     raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
@@ -362,18 +367,20 @@ def test_store_corporate_action_unique_constraint_race_recovery(tmp_path) -> Non
     )
     assert outcome1 == "INSERTED"
 
-    # Simulate race condition: connection.execute raises sqlite3.IntegrityError on INSERT
-    with patch("storage.repository.connect") as mock_conn:
-        mock_cx = MagicMock()
-        mock_cursor = MagicMock()
+    # Case A: Simulated race on exact same payload raising IntegrityError
+    real_connect = connect
+    def mock_connect_a(url):
+        cx = real_connect(url)
+        orig_execute = cx.execute
+        def fake_execute(sql, params=()):
+            if "INSERT INTO corporate_actions" in sql:
+                raise sqlite3.IntegrityError("UNIQUE constraint failed: corporate_actions.symbol, corporate_actions.action_type, corporate_actions.action_date, corporate_actions.source")
+            return orig_execute(sql, params)
+        cx.execute = fake_execute
+        return cx
 
-        # SELECT yields existing row, but execute(INSERT) raises IntegrityError
-        mock_cursor.fetchone.return_value = (hash1,)
-        mock_cx.execute.return_value = mock_cursor
-
-        mock_conn.return_value.__enter__.return_value = mock_cx
-
-        hash_res, outcome = store_corporate_action(
+    with patch("storage.repository.connect", side_effect=mock_connect_a):
+        hash_res_a, outcome_a = store_corporate_action(
             db_url,
             symbol="AAPL",
             action_type="split",
@@ -382,15 +389,111 @@ def test_store_corporate_action_unique_constraint_race_recovery(tmp_path) -> Non
             cash_amount=None,
             source="fmp",
             raw_payload=raw1,
-            record_hash=hash1,
         )
-        assert outcome == "DUPLICATE"
-        assert hash_res == hash1
+        assert outcome_a == "DUPLICATE"
+        assert hash_res_a == hash1
+        assert count_records(db_url, "corporate_actions") == 1
+
+    # Case B: Simulated race on same identity with DIFFERENT payload raising IntegrityError
+    raw_diff = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "10:1", "source": "fmp"}
+    def mock_connect_b(url):
+        cx = real_connect(url)
+        orig_execute = cx.execute
+        def fake_execute(sql, params=()):
+            if "INSERT INTO corporate_actions" in sql:
+                raise sqlite3.IntegrityError("UNIQUE constraint failed")
+            return orig_execute(sql, params)
+        cx.execute = fake_execute
+        return cx
+
+    with patch("storage.repository.connect", side_effect=mock_connect_b):
+        hash_res_b, outcome_b = store_corporate_action(
+            db_url,
+            symbol="AAPL",
+            action_type="split",
+            action_date="2020-08-31",
+            ratio="10:1",
+            cash_amount=None,
+            source="fmp",
+            raw_payload=raw_diff,
+        )
+        assert outcome_b == "CONFLICT"
+        assert count_records(db_url, "corporate_actions") == 1
+
+
+def test_store_corporate_action_non_integrity_failure_propagates(tmp_path) -> None:
+    """Verifies that non-integrity database exceptions (e.g., OperationalError) propagate directly as failures."""
+    db_url = f"sqlite:///{tmp_path}/ca_op_err_test.db"
+    initialize_database(db_url)
+
+    raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
+
+    real_connect = connect
+    def mock_connect_op(url):
+        cx = real_connect(url)
+        def fake_execute(sql, params=()):
+            if "INSERT INTO corporate_actions" in sql:
+                raise sqlite3.OperationalError("database is locked")
+            return cx.execute(sql, params)
+        cx.execute = fake_execute
+        return cx
+
+    with patch("storage.repository.connect", side_effect=mock_connect_op):
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            store_corporate_action(
+                db_url,
+                symbol="AAPL",
+                action_type="split",
+                action_date="2020-08-31",
+                ratio="4:1",
+                cash_amount=None,
+                source="fmp",
+                raw_payload=raw1,
+            )
 
 
 # ==============================================================================
 # 6. CORPORATE ACTIONS ACQUISITION STRICT IDEMPOTENCY & CONFLICT TESTS
 # ==============================================================================
+
+def test_fmp_corporate_actions_endpoints_and_normalization() -> None:
+    """Verifies corporate split uses /splits and corporate dividend uses /dividends."""
+    ca_provider = FMPCorporateActionsProvider(api_key="ca_key")
+
+    splits_json = json.dumps([
+        {"symbol": "AAPL", "date": "2020-08-31", "numerator": 4, "denominator": 1}
+    ]).encode("utf-8")
+
+    divs_json = json.dumps([
+        {"symbol": "AAPL", "date": "2023-11-10", "dividend": 0.24}
+    ]).encode("utf-8")
+
+    with patch("data.providers.fmp_corporate_actions.urlopen") as mock_urlopen:
+        mock_resp_splits = MagicMock()
+        mock_resp_splits.status = 200
+        mock_resp_splits.read.return_value = splits_json
+
+        mock_resp_divs = MagicMock()
+        mock_resp_divs.status = 200
+        mock_resp_divs.read.return_value = divs_json
+
+        mock_urlopen.return_value.__enter__.side_effect = [mock_resp_splits, mock_resp_divs]
+
+        splits = ca_provider.get_splits(symbol="AAPL")
+        req_splits = mock_urlopen.call_args_list[0][0][0]
+        assert "/splits" in req_splits.full_url
+        assert splits[0]["symbol"] == "AAPL"
+        assert splits[0]["action_type"] == "split"
+        assert splits[0]["action_date"] == "2020-08-31"
+        assert splits[0]["ratio"] == "4:1"
+
+        divs = ca_provider.get_dividends(symbol="AAPL")
+        req_divs = mock_urlopen.call_args_list[1][0][0]
+        assert "/dividends" in req_divs.full_url
+        assert divs[0]["symbol"] == "AAPL"
+        assert divs[0]["action_type"] == "dividend"
+        assert divs[0]["action_date"] == "2023-11-10"
+
 
 def test_fmp_corporate_actions_strict_tests_a_b_c(tmp_path) -> None:
     """
