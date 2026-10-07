@@ -1,8 +1,8 @@
 """
-Historical market-data client for Insider Trade Bot.
+Historical market-data client and provider contract for Insider Trade Bot.
 
-This module defines the controlled interface for retrieving market-price
-data from an external provider.
+This module defines the provider-neutral interface/contract for retrieving
+market-price data from external market-data providers.
 
 It deliberately does not write directly to the permanent database.
 Retrieved data must pass through normalization, validation, ingestion,
@@ -15,7 +15,7 @@ import json
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
-from typing import Any
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 
 class MarketDataClientError(Exception):
@@ -34,9 +34,45 @@ class MarketDataResponseError(
     """Raised when a market-data response cannot be interpreted."""
 
 
+@runtime_checkable
+class MarketDataProvider(Protocol):
+    """
+    Provider-neutral interface contract for historical OHLCV market-data retrieval.
+
+    Implementations must provide source identification, batch support capability,
+    and single/batch historical price retrieval without performing direct database writes.
+    """
+
+    @property
+    def source(self) -> str:
+        ...
+
+    @property
+    def supports_batch(self) -> bool:
+        ...
+
+    def get_historical_prices(
+        self,
+        *,
+        symbol: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> Any:
+        ...
+
+    def get_historical_prices_batch(
+        self,
+        *,
+        symbols: Sequence[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> Any:
+        ...
+
+
 class MarketDataClient:
     """
-    Generic HTTP JSON market-data client.
+    Generic HTTP JSON market-data client implementing the provider contract.
 
     The provider URL is supplied by configuration so that the rest of the
     system remains independent of a specific market-data vendor.
@@ -48,6 +84,8 @@ class MarketDataClient:
         api_key: str = "",
         timeout: int = 30,
         api_key_parameter: str = "apikey",
+        source: str = "market_data_provider",
+        supports_batch: bool = False,
     ) -> None:
         self.base_url = str(
             base_url
@@ -62,6 +100,24 @@ class MarketDataClient:
         self.api_key_parameter = str(
             api_key_parameter
         ).strip()
+
+        self._source = str(
+            source
+        ).strip() or "market_data_provider"
+
+        self._supports_batch = bool(
+            supports_batch
+        )
+
+    @property
+    def source(self) -> str:
+        """Provider identifier for provenance tracking."""
+        return self._source
+
+    @property
+    def supports_batch(self) -> bool:
+        """Indicates whether the provider supports multi-symbol batch requests."""
+        return self._supports_batch
 
     def _build_url(
         self,
@@ -279,4 +335,66 @@ class MarketDataClient:
         return self._request_json(
             path,
             parameters,
+        )
+
+    def get_historical_prices_batch(
+        self,
+        *,
+        symbols: Sequence[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+        path: str = "historical/batch",
+    ) -> object:
+        """
+        Retrieve historical price data for multiple symbols if supported by provider.
+        """
+        if not self.supports_batch:
+            raise NotImplementedError(
+                f"Provider '{self.source}' does not support batch symbol requests."
             )
+
+        normalized_symbols = [
+            str(s).strip().upper() for s in symbols if str(s).strip()
+        ]
+
+        if not normalized_symbols:
+            raise ValueError(
+                "symbols sequence cannot be empty."
+            )
+
+        parameters: dict[str, Any] = {
+            "symbols": ",".join(normalized_symbols),
+        }
+
+        if start_date is not None:
+            normalized_start = str(
+                start_date
+            ).strip()
+
+            if not normalized_start:
+                raise ValueError(
+                    "start_date cannot be empty."
+                )
+
+            parameters[
+                "start_date"
+            ] = normalized_start
+
+        if end_date is not None:
+            normalized_end = str(
+                end_date
+            ).strip()
+
+            if not normalized_end:
+                raise ValueError(
+                    "end_date cannot be empty."
+                )
+
+            parameters[
+                "end_date"
+            ] = normalized_end
+
+        return self._request_json(
+            path,
+            parameters,
+        )

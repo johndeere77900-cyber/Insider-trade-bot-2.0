@@ -8,6 +8,7 @@ from operational storage without duplicating data or embedding SQL in research l
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 from data.acquisition_state import AcquisitionStateManager
@@ -22,6 +23,18 @@ from database.connection import connect, is_postgresql_url
 
 class PeriodNotFoundError(Exception):
     """Raised when a requested SEC dataset period is missing from both Neon and R2 archive."""
+
+
+@dataclass(frozen=True)
+class MarketDataCoverageReport:
+    """Read-only coverage report for a symbol's historical market data."""
+
+    symbol: str
+    first_available_date: Optional[str]
+    last_available_date: Optional[str]
+    observation_count: int
+    missing_requested_range: bool
+    has_sufficient_future_observations: bool
 
 
 def _quarter_date_range(period: str) -> tuple[str, str]:
@@ -53,12 +66,6 @@ def resolve_period_storage_location(
     """
     norm_period = AcquisitionStateManager.normalize_period(period)
 
-    # Check operational retention window.
-    #
-    # Infrastructure/configuration failures and absence of an authoritative
-    # retention reference MUST propagate. They must never be converted into
-    # "outside retention", because doing so can silently route a valid request
-    # to the wrong storage state.
     within_retention = AcquisitionStateManager.is_within_operational_retention(
         norm_period,
         reference_period=reference_period,
@@ -75,7 +82,6 @@ def resolve_period_storage_location(
     if is_neon_completed:
         return "NEON"
 
-    # Fallback to R2 / archive backend if Neon is incomplete, failed, missing, or outside retention
     if archive_backend is not None:
         if archive_backend.exists(norm_period):
             return "R2"
@@ -270,14 +276,6 @@ def get_historical_transactions(
 ) -> List[NormalizedBulkTransaction]:
     """
     Retrieve historical SEC transactions across a range of periods [start_period, end_period].
-
-    Hides storage location from caller:
-    1. For periods available in Neon: queries operational Neon database.
-    2. For historical periods missing from Neon: retrieves quarterly ZIP from R2 archive,
-       parses and normalizes using SEC dataset pipeline parser/validator.
-    3. If any period is missing from both Neon and R2: raises PeriodNotFoundError.
-
-    Returns unified, normalized transaction domain objects.
     """
     period_tuples = AcquisitionStateManager.parse_period_range(start_period, end_period)
     periods = [p[2] for p in period_tuples]
@@ -357,13 +355,18 @@ def get_market_prices_for_ticker(
     *,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    use_adjusted_close: bool = False,
 ) -> Dict[str, float]:
     """
     Retrieve price records for a ticker symbol from market_prices table as a date -> close_price mapping.
+
+    Symbol is normalized. Results are ordered chronologically by price_date ASC.
+    No external provider or SEC downloader is contacted.
     """
     if not ticker or not ticker.strip():
         return {}
 
+    norm_ticker = ticker.strip().upper()
     is_pg = is_postgresql_url(database_url)
     param_placeholder = "%s" if is_pg else "?"
 
@@ -372,15 +375,15 @@ def get_market_prices_for_ticker(
         FROM market_prices
         WHERE UPPER(symbol) = {param_placeholder}
     """
-    params: List[Any] = [ticker.strip().upper()]
+    params: List[Any] = [norm_ticker]
 
     if start_date:
         query += f" AND price_date >= {param_placeholder}"
-        params.append(start_date)
+        params.append(start_date.strip())
 
     if end_date:
         query += f" AND price_date <= {param_placeholder}"
-        params.append(end_date)
+        params.append(end_date.strip())
 
     query += " ORDER BY price_date ASC"
 
@@ -390,8 +393,80 @@ def get_market_prices_for_ticker(
         cursor = conn.execute(query, params)
         rows = cursor.fetchall()
         for row in rows:
-            price_val = row["close"] if row["close"] is not None else row["adjusted_close"]
+            if use_adjusted_close:
+                price_val = row["adjusted_close"] if row["adjusted_close"] is not None else row["close"]
+            else:
+                price_val = row["close"] if row["close"] is not None else row["adjusted_close"]
+
             if price_val is not None:
                 prices[row["price_date"]] = float(price_val)
 
     return prices
+
+
+def check_market_data_coverage(
+    database_url: str,
+    symbol: str,
+    *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    required_horizon_days: int = 0,
+) -> MarketDataCoverageReport:
+    """
+    Determine whether market data exists for a symbol across a date range.
+
+    Read-only helper that does not download missing data automatically.
+    """
+    norm_symbol = str(symbol).strip().upper() if symbol else ""
+    if not norm_symbol:
+        return MarketDataCoverageReport(
+            symbol="",
+            first_available_date=None,
+            last_available_date=None,
+            observation_count=0,
+            missing_requested_range=True,
+            has_sufficient_future_observations=False,
+        )
+
+    prices = get_market_prices_for_ticker(database_url, norm_symbol)
+    if not prices:
+        return MarketDataCoverageReport(
+            symbol=norm_symbol,
+            first_available_date=None,
+            last_available_date=None,
+            observation_count=0,
+            missing_requested_range=True,
+            has_sufficient_future_observations=False,
+        )
+
+    available_dates = sorted(prices.keys())
+    first_avail = available_dates[0]
+    last_avail = available_dates[-1]
+
+    filtered_dates = [
+        d for d in available_dates
+        if (not start_date or d >= start_date) and (not end_date or d <= end_date)
+    ]
+
+    obs_count = len(filtered_dates)
+    missing_requested_range = False
+
+    if start_date and first_avail > start_date:
+        missing_requested_range = True
+    if end_date and last_avail < end_date:
+        missing_requested_range = True
+
+    if start_date:
+        future_obs = [d for d in available_dates if d > start_date]
+        sufficient_future = len(future_obs) >= required_horizon_days
+    else:
+        sufficient_future = obs_count >= required_horizon_days
+
+    return MarketDataCoverageReport(
+        symbol=norm_symbol,
+        first_available_date=first_avail,
+        last_available_date=last_avail,
+        observation_count=obs_count,
+        missing_requested_range=missing_requested_range,
+        has_sufficient_future_observations=sufficient_future,
+    )

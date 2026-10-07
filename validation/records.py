@@ -21,6 +21,7 @@ Both interfaces operate on normalized records or dictionaries.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
@@ -71,8 +72,11 @@ def _numeric_error(
     if value is None:
         return None
 
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return f"{field} must be numeric."
+
+    if not math.isfinite(value):
+        return f"{field} must be finite."
 
     return None
 
@@ -154,31 +158,107 @@ def validate_market_price(
         ),
     )
 
-    numeric_fields = (
-        "open",
-        "high",
-        "low",
-        "close",
-        "adjusted_close",
-        "volume",
+    open_price = data.get("open") if "open" in data else data.get("open_price")
+    high_price = data.get("high") if "high" in data else data.get("high_price")
+    low_price = data.get("low") if "low" in data else data.get("low_price")
+    close_price = data.get("close") if "close" in data else data.get("close_price")
+    adjusted_close = data.get("adjusted_close") if "adjusted_close" in data else data.get("adjustedClose")
+    volume = data.get("volume")
+
+    check_fields = (
+        ("open", open_price),
+        ("high", high_price),
+        ("low", low_price),
+        ("close", close_price),
+        ("adjusted_close", adjusted_close),
+        ("volume", volume),
     )
 
-    for field in numeric_fields:
-        value = data.get(field)
+    for field_name, value in check_fields:
+        numeric_err = _numeric_error(value, field_name)
+        if numeric_err:
+            errors.append(numeric_err)
 
-        numeric_error = _numeric_error(
-            value,
-            field,
-        )
+    # Price non-negativity
+    for field_name, value in (
+        ("open", open_price),
+        ("high", high_price),
+        ("low", low_price),
+        ("close", close_price),
+    ):
+        if value is not None and isinstance(value, (int, float)) and math.isfinite(value):
+            if value < 0:
+                errors.append(f"{field_name} cannot be negative.")
 
-        if numeric_error:
-            errors.append(numeric_error)
-            continue
+    # Adjusted close must be > 0 when supplied
+    if adjusted_close is not None and isinstance(adjusted_close, (int, float)) and math.isfinite(adjusted_close):
+        if adjusted_close <= 0:
+            errors.append("adjusted_close must be greater than zero.")
 
-        if value is not None and value < 0:
-            errors.append(
-                f"{field} cannot be negative."
-            )
+    # Volume must be >= 0 when supplied
+    if volume is not None and isinstance(volume, (int, float)) and math.isfinite(volume):
+        if volume < 0:
+            errors.append("volume cannot be negative.")
+
+    # At least one of close or adjusted_close must exist
+    if close_price is None and adjusted_close is None:
+        errors.append("at least one of close or adjusted_close is required.")
+
+    # High >= Low
+    if (
+        high_price is not None
+        and low_price is not None
+        and isinstance(high_price, (int, float))
+        and isinstance(low_price, (int, float))
+        and math.isfinite(high_price)
+        and math.isfinite(low_price)
+    ):
+        if high_price < low_price:
+            errors.append("high cannot be lower than low.")
+
+    # Open between low and high
+    if (
+        open_price is not None
+        and isinstance(open_price, (int, float))
+        and math.isfinite(open_price)
+    ):
+        if (
+            high_price is not None
+            and isinstance(high_price, (int, float))
+            and math.isfinite(high_price)
+            and open_price > high_price
+        ):
+            errors.append("open cannot exceed high.")
+
+        if (
+            low_price is not None
+            and isinstance(low_price, (int, float))
+            and math.isfinite(low_price)
+            and open_price < low_price
+        ):
+            errors.append("open cannot be below low.")
+
+    # Close between low and high
+    if (
+        close_price is not None
+        and isinstance(close_price, (int, float))
+        and math.isfinite(close_price)
+    ):
+        if (
+            high_price is not None
+            and isinstance(high_price, (int, float))
+            and math.isfinite(high_price)
+            and close_price > high_price
+        ):
+            errors.append("close cannot exceed high.")
+
+        if (
+            low_price is not None
+            and isinstance(low_price, (int, float))
+            and math.isfinite(low_price)
+            and close_price < low_price
+        ):
+            errors.append("close cannot be below low.")
 
     return errors
 
@@ -326,91 +406,7 @@ def validate_market_price_record(
         RecordValidationError when invalid.
     """
 
-    data = _record_to_dict(record)
-
-    errors = _required_field_errors(
-        data,
-        (
-            "symbol",
-            "price_date",
-            "source",
-        ),
-    )
-
-    numeric_fields = (
-        "open_price",
-        "high_price",
-        "low_price",
-        "close_price",
-        "volume",
-    )
-
-    for field in numeric_fields:
-        value = data.get(field)
-
-        numeric_error = _numeric_error(
-            value,
-            field,
-        )
-
-        if numeric_error:
-            errors.append(numeric_error)
-            continue
-
-        if value is not None and value < 0:
-            errors.append(
-                f"{field} cannot be negative."
-            )
-
-    open_price = data.get("open_price")
-    high_price = data.get("high_price")
-    low_price = data.get("low_price")
-    close_price = data.get("close_price")
-
-    if (
-        high_price is not None
-        and low_price is not None
-        and high_price < low_price
-    ):
-        errors.append(
-            "high_price cannot be lower than low_price."
-        )
-
-    if (
-        open_price is not None
-        and high_price is not None
-        and open_price > high_price
-    ):
-        errors.append(
-            "open_price cannot exceed high_price."
-        )
-
-    if (
-        open_price is not None
-        and low_price is not None
-        and open_price < low_price
-    ):
-        errors.append(
-            "open_price cannot be below low_price."
-        )
-
-    if (
-        close_price is not None
-        and high_price is not None
-        and close_price > high_price
-    ):
-        errors.append(
-            "close_price cannot exceed high_price."
-        )
-
-    if (
-        close_price is not None
-        and low_price is not None
-        and close_price < low_price
-    ):
-        errors.append(
-            "close_price cannot be below low_price."
-        )
+    errors = validate_market_price(record)
 
     if errors:
         raise RecordValidationError(

@@ -8,7 +8,9 @@ while the existing model-based functions remain available for ingestion.
 
 from __future__ import annotations
 
+import datetime
 import math
+import re
 from typing import Any, Mapping
 
 from core.models import (
@@ -43,6 +45,35 @@ def _required_text(
         )
 
     return result
+
+
+def _normalize_iso_date(
+    value: Any,
+    field_name: str,
+) -> str:
+    """
+    Validate and normalize a date strictly as YYYY-MM-DD.
+
+    Rejects:
+    - empty/None values
+    - malformed strings
+    - impossible dates (e.g. Feb 31, Month 13)
+    - unparsed timestamps (e.g. '2023-01-01T00:00:00Z')
+    """
+    text_val = _required_text(value, field_name)
+
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", text_val):
+        raise NormalizationError(
+            f"{field_name} must be in YYYY-MM-DD ISO format."
+        )
+
+    try:
+        dt = datetime.datetime.strptime(text_val, "%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise NormalizationError(
+            f"{field_name} is an invalid calendar date."
+        ) from exc
 
 
 def _number(
@@ -285,13 +316,15 @@ def normalize_market_price(
         "symbol",
     )
 
-    price_date = _required_text(
-        _first_present(
-            data,
-            "price_date",
-            "priceDate",
-            "date",
-        ),
+    raw_price_date = _first_present(
+        data,
+        "price_date",
+        "priceDate",
+        "date",
+    )
+
+    price_date = _normalize_iso_date(
+        raw_price_date,
         "price_date",
     )
 
@@ -560,13 +593,15 @@ def normalize_market_price_record(
         "symbol",
     )
 
-    price_date = _required_text(
-        _first_present(
-            data,
-            "price_date",
-            "priceDate",
-            "date",
-        ),
+    raw_price_date = _first_present(
+        data,
+        "price_date",
+        "priceDate",
+        "date",
+    )
+
+    price_date = _normalize_iso_date(
+        raw_price_date,
         "price_date",
     )
 

@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+import zipfile
+import pytest
+
+from archive import ArchiveError, FilesystemSECArchive
+from data.acquisition_state import AcquisitionStateManager
+from data.sec_dataset_pipeline import NormalizedBulkTransaction
+from database.connection import initialize_database
 from research.event_study import EventStudyEngine
+from research.insider_adapter import prepare_event_study_inputs
+from research.research_data_access import (
+    PeriodNotFoundError,
+    check_market_data_coverage,
+    get_historical_transactions,
+    get_market_prices_for_ticker,
+    resolve_period_storage_location,
+)
+from storage.repository import store_bulk_insider_transactions, store_market_price
 
 
 def test_event_study_engine_can_calculate_returns() -> None:
@@ -38,20 +54,6 @@ def test_event_study_handles_single_price() -> None:
     )
 
     assert result == []
-
-
-import zipfile
-import pytest
-from archive import ArchiveError, FilesystemSECArchive
-from data.sec_dataset_pipeline import NormalizedBulkTransaction
-from data.acquisition_state import AcquisitionStateManager
-from research.research_data_access import (
-    PeriodNotFoundError,
-    get_historical_transactions,
-    resolve_period_storage_location,
-)
-from research.insider_adapter import prepare_event_study_inputs
-from storage.repository import store_bulk_insider_transactions
 
 
 def test_research_archive_storage_error_propagates(tmp_path):
@@ -195,12 +197,61 @@ def test_resolve_period_storage_location_and_get_historical_transactions(tmp_pat
     assert txs_combined[1].accession_number == "0000000002-06-000002"  # 2006-Q2 from Neon
 
 
+def test_get_market_prices_chronological_filtering_and_coverage(tmp_path):
+    db_file = tmp_path / "prices_res_test.db"
+    db_url = f"sqlite:///{db_file}"
+    initialize_database(db_url)
+
+    # Store prices out of chronological order
+    data_points = [
+        ("2023-01-03", 103.0, 101.0),
+        ("2023-01-01", 100.0, 98.0),
+        ("2023-01-02", 102.0, 100.0),
+    ]
+    for dt, c, adj in data_points:
+        store_market_price(
+            db_url,
+            symbol="aapl",
+            price_date=dt,
+            open_price=c,
+            high=c + 1,
+            low=c - 1,
+            close=c,
+            adjusted_close=adj,
+            volume=100.0,
+            source="src",
+        )
+
+    # Test chronological order & default close
+    prices = get_market_prices_for_ticker(db_url, "AAPL")
+    dates = list(prices.keys())
+    assert dates == ["2023-01-01", "2023-01-02", "2023-01-03"]
+    assert prices["2023-01-01"] == 100.0
+
+    # Test adjusted close selection
+    adj_prices = get_market_prices_for_ticker(db_url, "AAPL", use_adjusted_close=True)
+    assert adj_prices["2023-01-01"] == 98.0
+
+    # Test date range filtering
+    filtered = get_market_prices_for_ticker(db_url, "AAPL", start_date="2023-01-02", end_date="2023-01-02")
+    assert list(filtered.keys()) == ["2023-01-02"]
+
+    # Test market data coverage helper
+    report = check_market_data_coverage(db_url, "AAPL", start_date="2023-01-01", end_date="2023-01-03", required_horizon_days=2)
+    assert report.symbol == "AAPL"
+    assert report.first_available_date == "2023-01-01"
+    assert report.last_available_date == "2023-01-03"
+    assert report.observation_count == 3
+    assert report.missing_requested_range is False
+    assert report.has_sufficient_future_observations is True
+
+
 def test_point_in_time_price_rule_and_amendment_handling(tmp_path, monkeypatch):
     db_file = tmp_path / "pit_test.db"
     db_url = f"sqlite:///{db_file}"
 
     # Setup market_prices table
-    from database.connection import initialize_database, connect
+    from database.connection import connect
     initialize_database(db_url)
     with connect(db_url) as conn:
         conn.execute(
@@ -291,7 +342,7 @@ def test_r2_fallback_amendment_pit_download_boundary_integration(tmp_path, monke
     archive = FilesystemSECArchive(base_path=str(archive_dir))
 
     # Setup market prices in DB
-    from database.connection import initialize_database, connect
+    from database.connection import connect
     initialize_database(db_url)
     with connect(db_url) as conn:
         conn.execute(
