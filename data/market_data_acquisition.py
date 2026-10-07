@@ -18,20 +18,26 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from data.market_data_client import MarketDataClientError, MarketDataProvider
-from data.market_data_loader import MarketDataLoadError, load_market_prices
-from storage.repository import MarketDataConflictError, count_records
+from data.market_data_loader import (
+    MarketDataLoadError,
+    RecordLoadOutcome,
+    load_market_prices_detailed,
+)
 
 
 @dataclass(frozen=True)
 class SymbolAcquisitionResult:
-    """Summary result for a single symbol or batch retrieval."""
+    """Summary result for a single symbol."""
 
     symbol: str
     status: str  # 'SUCCESS', 'FAILED', 'PARTIAL'
+    requested: bool
     records_received: int
     records_inserted: int
     duplicates_count: int
     rejected_count: int
+    conflicts_count: int
+    failed_count: int
     error_message: str | None = None
 
 
@@ -40,12 +46,17 @@ class MarketDataAcquisitionReport:
     """Overall acquisition process report."""
 
     requested_symbols: tuple[str, ...]
+    requested_start_date: str | None
+    requested_end_date: str | None
     successful_symbols: tuple[str, ...]
     failed_symbols: tuple[str, ...]
     records_received: int
     records_inserted: int
-    duplicates: int
-    rejected_records: int
+    records_duplicate: int
+    records_rejected: int
+    records_failed: int
+    conflicts: int
+    source: str
     provider_failures: tuple[dict[str, Any], ...]
     symbol_results: tuple[SymbolAcquisitionResult, ...]
 
@@ -69,7 +80,7 @@ class MarketDataAcquisitionService:
         """
         Acquire historical market data for symbols across start_date..end_date.
         """
-        normalized_symbols = tuple(
+        requested_symbols = tuple(
             dict.fromkeys(
                 str(s).strip().upper()
                 for s in symbols
@@ -77,170 +88,216 @@ class MarketDataAcquisitionService:
             )
         )
 
-        if not normalized_symbols:
+        provider_source = self.provider.source
+
+        if not requested_symbols:
             return MarketDataAcquisitionReport(
                 requested_symbols=(),
+                requested_start_date=start_date,
+                requested_end_date=end_date,
                 successful_symbols=(),
                 failed_symbols=(),
                 records_received=0,
                 records_inserted=0,
-                duplicates=0,
-                rejected_records=0,
+                records_duplicate=0,
+                records_rejected=0,
+                records_failed=0,
+                conflicts=0,
+                source=provider_source,
                 provider_failures=(),
                 symbol_results=(),
             )
 
-        provider_source = self.provider.source
-        successful_symbols: list[str] = []
-        failed_symbols: list[str] = []
+        # Per-symbol counters for tracking
+        symbol_counts: dict[str, dict[str, Any]] = {
+            sym: {
+                "received": 0,
+                "inserted": 0,
+                "duplicate": 0,
+                "rejected": 0,
+                "conflict": 0,
+                "failed": 0,
+                "errors": [],
+            }
+            for sym in requested_symbols
+        }
+
+        # Extra bucket for unmapped/unexpected symbols
+        unmapped_key = "_UNMAPPED_"
+        symbol_counts[unmapped_key] = {
+            "received": 0,
+            "inserted": 0,
+            "duplicate": 0,
+            "rejected": 0,
+            "conflict": 0,
+            "failed": 0,
+            "errors": [],
+        }
+
         provider_failures: list[dict[str, Any]] = []
-        symbol_results: list[SymbolAcquisitionResult] = []
 
-        total_received = 0
-        total_inserted = 0
-        total_duplicates = 0
-        total_rejected = 0
-
-        # Decide strategy: batch or single symbol
-        if self.provider.supports_batch and len(normalized_symbols) > 1:
+        # Determine retrieval approach: batch or per-symbol
+        if self.provider.supports_batch and len(requested_symbols) > 1:
             try:
                 response = self.provider.get_historical_prices_batch(
-                    symbols=normalized_symbols,
+                    symbols=requested_symbols,
                     start_date=start_date,
                     end_date=end_date,
                 )
-
-                initial_count = count_records(database_url, "market_prices")
-                hashes = load_market_prices(
+                outcomes = load_market_prices_detailed(
                     database_url,
                     response,
                     source=provider_source,
-                    source_reference=source_reference,
+                    source_reference=source_reference or "batch_request",
                 )
-                final_count = count_records(database_url, "market_prices")
+                self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts)
 
-                inserted = final_count - initial_count
-                received = len(hashes)
-                duplicates = max(0, received - inserted)
-
-                total_received += received
-                total_inserted += inserted
-                total_duplicates += duplicates
-
-                successful_symbols.extend(normalized_symbols)
-
-                for sym in normalized_symbols:
-                    symbol_results.append(
-                        SymbolAcquisitionResult(
-                            symbol=sym,
-                            status="SUCCESS",
-                            records_received=received,
-                            records_inserted=inserted,
-                            duplicates_count=duplicates,
-                            rejected_count=0,
-                        )
-                    )
-
-            except (
-                MarketDataClientError,
-                MarketDataLoadError,
-                MarketDataConflictError,
-                ValueError,
-            ) as exc:
-                failed_symbols.extend(normalized_symbols)
+            except (MarketDataClientError, MarketDataLoadError, ValueError, Exception) as exc:
                 err_msg = str(exc)
-                provider_failures.append(
-                    {
-                        "symbols": normalized_symbols,
-                        "error": err_msg,
-                    }
-                )
-                for sym in normalized_symbols:
-                    symbol_results.append(
-                        SymbolAcquisitionResult(
-                            symbol=sym,
-                            status="FAILED",
-                            records_received=0,
-                            records_inserted=0,
-                            duplicates_count=0,
-                            rejected_count=0,
-                            error_message=err_msg,
-                        )
-                    )
+                provider_failures.append({"symbols": requested_symbols, "error": err_msg})
+                for sym in requested_symbols:
+                    symbol_counts[sym]["failed"] += 1
+                    symbol_counts[sym]["errors"].append(err_msg)
+
         else:
-            # Per-symbol processing
-            for sym in normalized_symbols:
+            # Per-symbol retrieval
+            for sym in requested_symbols:
                 try:
                     response = self.provider.get_historical_prices(
                         symbol=sym,
                         start_date=start_date,
                         end_date=end_date,
                     )
-
-                    initial_count = count_records(database_url, "market_prices")
-                    hashes = load_market_prices(
+                    outcomes = load_market_prices_detailed(
                         database_url,
                         response,
                         source=provider_source,
                         source_reference=source_reference or f"request:{sym}",
                     )
-                    final_count = count_records(database_url, "market_prices")
+                    self._accumulate_outcomes(outcomes, requested_symbols, symbol_counts, fallback_symbol=sym)
 
-                    inserted = final_count - initial_count
-                    received = len(hashes)
-                    duplicates = max(0, received - inserted)
-
-                    total_received += received
-                    total_inserted += inserted
-                    total_duplicates += duplicates
-
-                    successful_symbols.append(sym)
-                    symbol_results.append(
-                        SymbolAcquisitionResult(
-                            symbol=sym,
-                            status="SUCCESS",
-                            records_received=received,
-                            records_inserted=inserted,
-                            duplicates_count=duplicates,
-                            rejected_count=0,
-                        )
-                    )
-
-                except (
-                    MarketDataClientError,
-                    MarketDataLoadError,
-                    MarketDataConflictError,
-                    ValueError,
-                ) as exc:
-                    failed_symbols.append(sym)
+                except (MarketDataClientError, MarketDataLoadError, ValueError, Exception) as exc:
                     err_msg = str(exc)
-                    total_rejected += 1
-                    provider_failures.append(
-                        {
-                            "symbol": sym,
-                            "error": err_msg,
-                        }
-                    )
-                    symbol_results.append(
-                        SymbolAcquisitionResult(
-                            symbol=sym,
-                            status="FAILED",
-                            records_received=0,
-                            records_inserted=0,
-                            duplicates_count=0,
-                            rejected_count=1,
-                            error_message=err_msg,
-                        )
-                    )
+                    provider_failures.append({"symbol": sym, "error": err_msg})
+                    symbol_counts[sym]["failed"] += 1
+                    symbol_counts[sym]["errors"].append(err_msg)
+
+        # Calculate totals directly from individual record outcomes
+        total_received = sum(c["received"] for c in symbol_counts.values())
+        total_inserted = sum(c["inserted"] for c in symbol_counts.values())
+        total_duplicate = sum(c["duplicate"] for c in symbol_counts.values())
+        total_rejected = sum(c["rejected"] for c in symbol_counts.values())
+        total_conflicts = sum(c["conflict"] for c in symbol_counts.values())
+        total_failed = sum(c["failed"] for c in symbol_counts.values())
+
+        successful_symbols: list[str] = []
+        failed_symbols: list[str] = []
+        symbol_results: list[SymbolAcquisitionResult] = []
+
+        for sym in requested_symbols:
+            c = symbol_counts[sym]
+            is_failed = c["failed"] > 0 or c["conflict"] > 0
+            is_success = (c["inserted"] > 0 or c["duplicate"] > 0 or c["received"] > 0) and not is_failed
+
+            if is_success:
+                successful_symbols.append(sym)
+                status = "SUCCESS"
+            elif c["inserted"] > 0 or c["duplicate"] > 0:
+                status = "PARTIAL"
+                failed_symbols.append(sym)
+            else:
+                status = "FAILED"
+                failed_symbols.append(sym)
+
+            err_str = "; ".join(c["errors"]) if c["errors"] else None
+
+            symbol_results.append(
+                SymbolAcquisitionResult(
+                    symbol=sym,
+                    status=status,
+                    requested=True,
+                    records_received=c["received"],
+                    records_inserted=c["inserted"],
+                    duplicates_count=c["duplicate"],
+                    rejected_count=c["rejected"],
+                    conflicts_count=c["conflict"],
+                    failed_count=c["failed"],
+                    error_message=err_str,
+                )
+            )
+
+        # Unmapped symbol results if any existed
+        unmapped_c = symbol_counts[unmapped_key]
+        if unmapped_c["received"] > 0 or unmapped_c["rejected"] > 0 or unmapped_c["failed"] > 0:
+            err_str = "; ".join(unmapped_c["errors"]) if unmapped_c["errors"] else "Unidentified or unmapped provider symbol"
+            symbol_results.append(
+                SymbolAcquisitionResult(
+                    symbol="UNMAPPED",
+                    status="FAILED",
+                    requested=False,
+                    records_received=unmapped_c["received"],
+                    records_inserted=unmapped_c["inserted"],
+                    duplicates_count=unmapped_c["duplicate"],
+                    rejected_count=unmapped_c["rejected"],
+                    conflicts_count=unmapped_c["conflict"],
+                    failed_count=unmapped_c["failed"],
+                    error_message=err_str,
+                )
+            )
 
         return MarketDataAcquisitionReport(
-            requested_symbols=normalized_symbols,
+            requested_symbols=requested_symbols,
+            requested_start_date=start_date,
+            requested_end_date=end_date,
             successful_symbols=tuple(successful_symbols),
             failed_symbols=tuple(failed_symbols),
             records_received=total_received,
             records_inserted=total_inserted,
-            duplicates=total_duplicates,
-            rejected_records=total_rejected,
+            records_duplicate=total_duplicate,
+            records_rejected=total_rejected,
+            records_failed=total_failed,
+            conflicts=total_conflicts,
+            source=provider_source,
             provider_failures=tuple(provider_failures),
             symbol_results=tuple(symbol_results),
         )
+
+    def _accumulate_outcomes(
+        self,
+        outcomes: Sequence[RecordLoadOutcome],
+        requested_symbols: tuple[str, ...],
+        symbol_counts: dict[str, dict[str, Any]],
+        fallback_symbol: str | None = None,
+    ) -> None:
+        for outcome in outcomes:
+            rec_sym = outcome.symbol or fallback_symbol
+            if rec_sym and rec_sym in symbol_counts:
+                target_key = rec_sym
+            elif rec_sym is None and len(requested_symbols) == 1:
+                target_key = requested_symbols[0]
+            else:
+                target_key = "_UNMAPPED_"
+
+            c = symbol_counts[target_key]
+            c["received"] += 1
+
+            # Classification
+            if target_key == "_UNMAPPED_" and outcome.outcome != "REJECTED":
+                c["rejected"] += 1
+                if outcome.reason:
+                    c["errors"].append(outcome.reason)
+                continue
+
+            if outcome.outcome == "INSERTED":
+                c["inserted"] += 1
+            elif outcome.outcome == "DUPLICATE":
+                c["duplicate"] += 1
+            elif outcome.outcome == "REJECTED":
+                c["rejected"] += 1
+            elif outcome.outcome == "CONFLICT":
+                c["conflict"] += 1
+            elif outcome.outcome == "FAILED":
+                c["failed"] += 1
+
+            if outcome.reason:
+                c["errors"].append(outcome.reason)

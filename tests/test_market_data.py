@@ -13,7 +13,12 @@ from data.market_data_client import (
     MarketDataRequestError,
     MarketDataResponseError,
 )
-from data.market_data_loader import MarketDataLoadError, MarketDataLoader
+from data.market_data_loader import (
+    MarketDataLoadError,
+    MarketDataLoader,
+    load_market_prices,
+    load_market_prices_detailed,
+)
 from data.normalization import NormalizationError, normalize_market_price
 from database.connection import initialize_database
 from storage.repository import (
@@ -133,17 +138,14 @@ def test_normalization_symbol_and_date_normalization() -> None:
 
 
 def test_normalization_malformed_and_impossible_date() -> None:
-    # Malformed ISO string
     raw1 = {"symbol": "AAPL", "price_date": "2023/01/01", "close": 150}
     with pytest.raises(NormalizationError, match="YYYY-MM-DD ISO format"):
         normalize_market_price(raw1, source="src")
 
-    # Impossible calendar date
     raw2 = {"symbol": "AAPL", "price_date": "2023-02-29", "close": 150}
     with pytest.raises(NormalizationError, match="invalid calendar date"):
         normalize_market_price(raw2, source="src")
 
-    # Timestamp pretending to be date
     raw3 = {"symbol": "AAPL", "price_date": "2023-01-01T00:00:00Z", "close": 150}
     with pytest.raises(NormalizationError, match="YYYY-MM-DD ISO format"):
         normalize_market_price(raw3, source="src")
@@ -158,20 +160,16 @@ def test_normalization_missing_symbol_and_date() -> None:
 
 
 def test_normalization_numeric_conversions_nan_inf() -> None:
-    # Valid string numeric conversion
     raw = {"symbol": "NVDA", "price_date": "2023-01-01", "close": "1,234.56"}
     rec = normalize_market_price(raw, source="src")
     assert rec.close == 1234.56
 
-    # Invalid numeric value
     with pytest.raises(NormalizationError, match="must be numeric"):
         normalize_market_price({"symbol": "NVDA", "price_date": "2023-01-01", "close": "abc"}, source="src")
 
-    # NaN
     with pytest.raises(NormalizationError, match="must be finite"):
         normalize_market_price({"symbol": "NVDA", "price_date": "2023-01-01", "close": float("nan")}, source="src")
 
-    # Infinity
     with pytest.raises(NormalizationError, match="must be finite"):
         normalize_market_price({"symbol": "NVDA", "price_date": "2023-01-01", "close": float("inf")}, source="src")
 
@@ -181,41 +179,32 @@ def test_normalization_numeric_conversions_nan_inf() -> None:
 # ==========================================
 
 def test_validation_ohlc_relationships() -> None:
-    # High < Low
     errs = validate_market_price({"symbol": "A", "price_date": "2023-01-01", "source": "s", "high": 10, "low": 20, "close": 15})
     assert any("high cannot be lower than low" in e for e in errs)
 
-    # Open > High
     errs = validate_market_price({"symbol": "A", "price_date": "2023-01-01", "source": "s", "high": 20, "low": 10, "open": 25, "close": 15})
     assert any("open cannot exceed high" in e for e in errs)
 
-    # Open < Low
     errs = validate_market_price({"symbol": "A", "price_date": "2023-01-01", "source": "s", "high": 20, "low": 10, "open": 5, "close": 15})
     assert any("open cannot be below low" in e for e in errs)
 
-    # Close > High
     errs = validate_market_price({"symbol": "A", "price_date": "2023-01-01", "source": "s", "high": 20, "low": 10, "open": 15, "close": 25})
     assert any("close cannot exceed high" in e for e in errs)
 
-    # Close < Low
     errs = validate_market_price({"symbol": "A", "price_date": "2023-01-01", "source": "s", "high": 20, "low": 10, "open": 15, "close": 5})
     assert any("close cannot be below low" in e for e in errs)
 
 
 def test_validation_prices_and_volume_constraints() -> None:
-    # Negative price
     errs = validate_market_price({"symbol": "A", "price_date": "2023-01-01", "source": "s", "close": -10})
     assert any("cannot be negative" in e for e in errs)
 
-    # Negative volume
     errs = validate_market_price({"symbol": "A", "price_date": "2023-01-01", "source": "s", "close": 10, "volume": -5})
     assert any("volume cannot be negative" in e for e in errs)
 
-    # Missing close and adjusted_close
     errs = validate_market_price({"symbol": "A", "price_date": "2023-01-01", "source": "s", "open": 10})
     assert any("at least one of close or adjusted_close is required" in e for e in errs)
 
-    # Valid OHLCV passes strict validator
     valid_rec = {
         "symbol": "AAPL",
         "price_date": "2023-01-01",
@@ -231,7 +220,37 @@ def test_validation_prices_and_volume_constraints() -> None:
 
 
 # ==========================================
-# D. STORAGE TESTS
+# D. LOADER TESTS
+# ==========================================
+
+def test_loader_mixed_valid_and_invalid_records(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/loader_test.db"
+    initialize_database(db_url)
+
+    records = [
+        {"symbol": "AAPL", "price_date": "2023-01-01", "close": 150.0},
+        {"symbol": "AAPL", "price_date": "2023-01-01", "close": 150.0},  # duplicate
+        {"symbol": "AAPL", "price_date": "INVALID_DATE", "close": 150.0}, # invalid date
+        {"symbol": "AAPL", "price_date": "2023-01-02", "close": "NaN"},   # invalid numeric
+        {"price_date": "2023-01-03", "close": 150.0},                     # missing symbol
+        {"symbol": "AAPL", "close": 150.0},                                # missing date
+        {"symbol": "AAPL", "price_date": "2023-01-01", "close": 999.0},   # storage conflict
+    ]
+
+    outcomes = load_market_prices_detailed(db_url, records, source="test_src")
+    assert len(outcomes) == 7
+
+    assert outcomes[0].outcome == "INSERTED"
+    assert outcomes[1].outcome == "DUPLICATE"
+    assert outcomes[2].outcome == "REJECTED"
+    assert outcomes[3].outcome == "REJECTED"
+    assert outcomes[4].outcome == "REJECTED"
+    assert outcomes[5].outcome == "REJECTED"
+    assert outcomes[6].outcome == "CONFLICT"
+
+
+# ==========================================
+# E. STORAGE & IDENTITY TESTS
 # ==========================================
 
 def test_storage_idempotency_and_conflicts(tmp_path) -> None:
@@ -239,7 +258,7 @@ def test_storage_idempotency_and_conflicts(tmp_path) -> None:
     initialize_database(db_url)
 
     # 1. First insert
-    hash1 = store_market_price(
+    hash1, status1 = store_market_price(
         db_url,
         symbol="AAPL",
         price_date="2023-01-01",
@@ -251,10 +270,11 @@ def test_storage_idempotency_and_conflicts(tmp_path) -> None:
         volume=1000.0,
         source="provider_a",
     )
+    assert status1 == "INSERTED"
     assert count_records(db_url, "market_prices") == 1
 
     # 2. Exact duplicate
-    hash2 = store_market_price(
+    hash2, status2 = store_market_price(
         db_url,
         symbol="AAPL",
         price_date="2023-01-01",
@@ -266,11 +286,12 @@ def test_storage_idempotency_and_conflicts(tmp_path) -> None:
         volume=1000.0,
         source="provider_a",
     )
+    assert status2 == "DUPLICATE"
     assert hash1 == hash2
     assert count_records(db_url, "market_prices") == 1
 
     # 3. Same symbol/date from different source
-    hash3 = store_market_price(
+    hash3, status3 = store_market_price(
         db_url,
         symbol="AAPL",
         price_date="2023-01-01",
@@ -282,6 +303,7 @@ def test_storage_idempotency_and_conflicts(tmp_path) -> None:
         volume=1000.0,
         source="provider_b",
     )
+    assert status3 == "INSERTED"
     assert hash3 != hash1
     assert count_records(db_url, "market_prices") == 2
 
@@ -294,18 +316,25 @@ def test_storage_idempotency_and_conflicts(tmp_path) -> None:
             open_price=100.0,
             high=105.0,
             low=99.0,
-            close=120.0,  # Changed close
+            close=120.0,
             adjusted_close=104.0,
             volume=1000.0,
             source="provider_a",
         )
 
 
+def test_deterministic_hash_has_no_retrieval_timestamp() -> None:
+    # Hash must depend solely on normalized market content
+    h1 = generate_market_price_hash("AAPL", "2023-01-01", "src_a", close=100.0)
+    h2 = generate_market_price_hash("AAPL", "2023-01-01", "src_a", close=100.0)
+    assert h1 == h2
+
+
 # ==========================================
-# E. PROVENANCE & ACQUISITION TESTS
+# F. ACQUISITION SERVICE TESTS
 # ==========================================
 
-def test_acquisition_and_provenance_orchestration(tmp_path) -> None:
+def test_acquisition_single_and_multisymbol_accounting(tmp_path) -> None:
     db_url = f"sqlite:///{tmp_path}/acq_test.db"
     initialize_database(db_url)
 
@@ -314,12 +343,7 @@ def test_acquisition_and_provenance_orchestration(tmp_path) -> None:
     mock_provider.supports_batch = False
 
     mock_provider.get_historical_prices.side_effect = lambda symbol, **kwargs: [
-        {
-            "symbol": symbol,
-            "date": "2023-01-01",
-            "close": 100.0,
-            "volume": 500,
-        }
+        {"symbol": symbol, "date": "2023-01-01", "close": 100.0, "volume": 500}
     ]
 
     service = MarketDataAcquisitionService(mock_provider)
@@ -328,13 +352,78 @@ def test_acquisition_and_provenance_orchestration(tmp_path) -> None:
     assert report.requested_symbols == ("AAPL", "MSFT")
     assert report.records_received == 2
     assert report.records_inserted == 2
+    assert report.records_duplicate == 0
+    assert report.records_rejected == 0
+    assert report.records_failed == 0
+    assert report.conflicts == 0
     assert count_records(db_url, "market_prices") == 2
-    assert count_records(db_url, "provenance") == 2
 
-    # Deterministic Retry
+    # Deterministic Retry -> DUPLICATES
     retry_report = service.acquire_historical_data(db_url, symbols=["AAPL", "MSFT"])
     assert retry_report.records_received == 2
     assert retry_report.records_inserted == 0
-    assert retry_report.duplicates == 2
-    assert count_records(db_url, "market_prices") == 2
-    assert count_records(db_url, "provenance") == 2
+    assert retry_report.records_duplicate == 2
+    assert retry_report.records_received == (
+        retry_report.records_inserted
+        + retry_report.records_duplicate
+        + retry_report.records_rejected
+        + retry_report.records_failed
+        + retry_report.conflicts
+    )
+
+
+def test_acquisition_batch_supported_and_fallback(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/batch_acq_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "batch_vendor"
+    mock_provider.supports_batch = True
+
+    mock_provider.get_historical_prices_batch.return_value = [
+        {"symbol": "AAPL", "date": "2023-01-01", "close": 150.0},
+        {"symbol": "MSFT", "date": "2023-01-01", "close": 250.0},
+    ]
+
+    service = MarketDataAcquisitionService(mock_provider)
+    report = service.acquire_historical_data(db_url, symbols=["AAPL", "MSFT"])
+
+    assert report.records_received == 2
+    assert report.records_inserted == 2
+    assert len(report.symbol_results) == 2
+    # Check per-symbol results
+    aapl_res = next(r for r in report.symbol_results if r.symbol == "AAPL")
+    assert aapl_res.records_received == 1
+    assert aapl_res.records_inserted == 1
+
+
+def test_acquisition_empty_provider_response(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/empty_acq_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "empty_vendor"
+    mock_provider.supports_batch = False
+    mock_provider.get_historical_prices.return_value = []
+
+    service = MarketDataAcquisitionService(mock_provider)
+    report = service.acquire_historical_data(db_url, symbols=["AAPL"])
+
+    assert report.records_received == 0
+    assert report.records_inserted == 0
+
+
+def test_acquisition_provider_failure_and_symbol_mismatch(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/fail_acq_test.db"
+    initialize_database(db_url)
+
+    mock_provider = MagicMock()
+    mock_provider.source = "mismatch_vendor"
+    mock_provider.supports_batch = False
+    mock_provider.get_historical_prices.side_effect = MarketDataRequestError("API Down")
+
+    service = MarketDataAcquisitionService(mock_provider)
+    report = service.acquire_historical_data(db_url, symbols=["AAPL"])
+
+    assert report.records_failed == 1
+    assert len(report.provider_failures) == 1

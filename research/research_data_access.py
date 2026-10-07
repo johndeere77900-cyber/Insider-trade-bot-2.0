@@ -33,8 +33,14 @@ class MarketDataCoverageReport:
     first_available_date: Optional[str]
     last_available_date: Optional[str]
     observation_count: int
+    requested_start_date: Optional[str]
+    requested_end_date: Optional[str]
     missing_requested_range: bool
+    starts_before_available: bool
+    ends_after_available: bool
+    is_range_covered_boundary_level: bool
     has_sufficient_future_observations: bool
+    missing_requested_price_field_count: int
 
 
 def _quarter_date_range(period: str) -> tuple[str, str]:
@@ -358,10 +364,13 @@ def get_market_prices_for_ticker(
     use_adjusted_close: bool = False,
 ) -> Dict[str, float]:
     """
-    Retrieve price records for a ticker symbol from market_prices table as a date -> close_price mapping.
+    Retrieve price records for a ticker symbol from market_prices table as a date -> price mapping.
 
-    Symbol is normalized. Results are ordered chronologically by price_date ASC.
-    No external provider or SEC downloader is contacted.
+    Strict Series Isolation:
+    - If use_adjusted_close is True, ONLY non-NULL adjusted_close values are returned (no fallback to close).
+    - If use_adjusted_close is False, ONLY non-NULL raw close values are returned (no fallback to adjusted_close).
+    - Symbol is normalized. Results are ordered chronologically by price_date ASC.
+    - No external provider or SEC downloader is contacted.
     """
     if not ticker or not ticker.strip():
         return {}
@@ -394,9 +403,9 @@ def get_market_prices_for_ticker(
         rows = cursor.fetchall()
         for row in rows:
             if use_adjusted_close:
-                price_val = row["adjusted_close"] if row["adjusted_close"] is not None else row["close"]
+                price_val = row["adjusted_close"]
             else:
-                price_val = row["close"] if row["close"] is not None else row["adjusted_close"]
+                price_val = row["close"]
 
             if price_val is not None:
                 prices[row["price_date"]] = float(price_val)
@@ -411,11 +420,13 @@ def check_market_data_coverage(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     required_horizon_days: int = 0,
+    use_adjusted_close: bool = False,
 ) -> MarketDataCoverageReport:
     """
     Determine whether market data exists for a symbol across a date range.
 
-    Read-only helper that does not download missing data automatically.
+    Read-only helper that does not download missing data automatically and does not pretend
+    weekends or market holidays are automatic errors.
     """
     norm_symbol = str(symbol).strip().upper() if symbol else ""
     if not norm_symbol:
@@ -424,40 +435,83 @@ def check_market_data_coverage(
             first_available_date=None,
             last_available_date=None,
             observation_count=0,
+            requested_start_date=start_date,
+            requested_end_date=end_date,
             missing_requested_range=True,
+            starts_before_available=False,
+            ends_after_available=False,
+            is_range_covered_boundary_level=False,
             has_sufficient_future_observations=False,
+            missing_requested_price_field_count=0,
         )
 
-    prices = get_market_prices_for_ticker(database_url, norm_symbol)
-    if not prices:
+    # Query all raw rows for symbol in DB to inspect missing field counts
+    is_pg = is_postgresql_url(database_url)
+    param_placeholder = "%s" if is_pg else "?"
+    query = f"""
+        SELECT price_date, close, adjusted_close
+        FROM market_prices
+        WHERE UPPER(symbol) = {param_placeholder}
+    """
+    params: List[Any] = [norm_symbol]
+    if start_date:
+        query += f" AND price_date >= {param_placeholder}"
+        params.append(start_date.strip())
+    if end_date:
+        query += f" AND price_date <= {param_placeholder}"
+        params.append(end_date.strip())
+    query += " ORDER BY price_date ASC"
+
+    all_rows = []
+    with connect(database_url) as conn:
+        cursor = conn.execute(query, params)
+        all_rows = cursor.fetchall()
+
+    if not all_rows:
         return MarketDataCoverageReport(
             symbol=norm_symbol,
             first_available_date=None,
             last_available_date=None,
             observation_count=0,
-            missing_requested_range=True,
+            requested_start_date=start_date,
+            requested_end_date=end_date,
+            missing_requested_range=True if (start_date or end_date) else False,
+            starts_before_available=True if start_date else False,
+            ends_after_available=True if end_date else False,
+            is_range_covered_boundary_level=False,
             has_sufficient_future_observations=False,
+            missing_requested_price_field_count=0,
         )
 
-    available_dates = sorted(prices.keys())
+    available_dates = [r["price_date"] for r in all_rows]
     first_avail = available_dates[0]
     last_avail = available_dates[-1]
 
-    filtered_dates = [
-        d for d in available_dates
-        if (not start_date or d >= start_date) and (not end_date or d <= end_date)
-    ]
+    # Count missing requested price field across available dates
+    missing_field_count = 0
+    valid_series_dates = []
+    for r in all_rows:
+        val = r["adjusted_close"] if use_adjusted_close else r["close"]
+        if val is None:
+            missing_field_count += 1
+        else:
+            valid_series_dates.append(r["price_date"])
 
-    obs_count = len(filtered_dates)
-    missing_requested_range = False
+    obs_count = len(valid_series_dates)
+
+    starts_before = False
+    ends_after = False
 
     if start_date and first_avail > start_date:
-        missing_requested_range = True
+        starts_before = True
     if end_date and last_avail < end_date:
-        missing_requested_range = True
+        ends_after = True
+
+    missing_requested_range = starts_before or ends_after or (missing_field_count > 0)
+    boundary_covered = not starts_before and not ends_after and obs_count > 0
 
     if start_date:
-        future_obs = [d for d in available_dates if d > start_date]
+        future_obs = [d for d in valid_series_dates if d > start_date]
         sufficient_future = len(future_obs) >= required_horizon_days
     else:
         sufficient_future = obs_count >= required_horizon_days
@@ -467,6 +521,12 @@ def check_market_data_coverage(
         first_available_date=first_avail,
         last_available_date=last_avail,
         observation_count=obs_count,
+        requested_start_date=start_date,
+        requested_end_date=end_date,
         missing_requested_range=missing_requested_range,
+        starts_before_available=starts_before,
+        ends_after_available=ends_after,
+        is_range_covered_boundary_level=boundary_covered,
         has_sufficient_future_observations=sufficient_future,
+        missing_requested_price_field_count=missing_field_count,
     )

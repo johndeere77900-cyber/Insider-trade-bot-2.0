@@ -178,7 +178,7 @@ def ingest_market_price(
 
     raw_payload = dict(payload)
 
-    record_hash = store_market_price(
+    record_hash, _outcome = store_market_price(
         database_url,
         symbol=record.symbol,
         price_date=record.price_date,

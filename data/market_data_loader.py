@@ -5,24 +5,45 @@ This module converts provider responses into normalized market-price
 records and sends them through the standard validation, storage, and
 provenance pipeline.
 
-It does not bypass validation or write directly to the database.
+It processes payloads record-by-record to produce deterministic outcomes:
+- INSERTED
+- DUPLICATE
+- REJECTED
+- CONFLICT
+- FAILED
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Mapping
 
-from data.ingestion_pipeline import (
-    IngestionError,
-    ingest_market_price,
-)
 from data.normalization import (
     NormalizationError,
+    normalize_market_price,
 )
+from storage.repository import (
+    MarketDataConflictError,
+    store_market_price,
+    store_provenance,
+)
+from validation.records import validate_market_price
 
 
 class MarketDataLoadError(Exception):
-    """Raised when market-data loading fails."""
+    """Raised when market-data loading fails abruptly."""
+
+
+@dataclass(frozen=True)
+class RecordLoadOutcome:
+    """Detailed load outcome for a single market-price record."""
+
+    index: int
+    symbol: str | None
+    price_date: str | None
+    outcome: str  # 'INSERTED', 'DUPLICATE', 'REJECTED', 'CONFLICT', 'FAILED'
+    record_hash: str | None = None
+    reason: str | None = None
 
 
 def _extract_records(
@@ -82,21 +103,18 @@ def _extract_records(
     return normalized
 
 
-def load_market_prices(
+def load_market_prices_detailed(
     database_url: str,
     payload: Any,
     *,
     source: str,
     source_reference: str | None = None,
-) -> tuple[str, ...]:
+) -> tuple[RecordLoadOutcome, ...]:
     """
-    Normalize, validate, store, and provenance-track market-price records.
+    Normalize, validate, store, and provenance-track market-price records record-by-record.
 
     Returns:
-        Tuple containing deterministic record hashes for accepted records.
-
-    No record is silently substituted when normalization or validation
-    fails.
+        Tuple of RecordLoadOutcome for every record in the response payload.
     """
 
     normalized_source = str(source).strip()
@@ -107,30 +125,136 @@ def load_market_prices(
         )
 
     records = _extract_records(payload)
+    outcomes: list[RecordLoadOutcome] = []
+
+    for index, raw_record in enumerate(records):
+        # Extract potential symbol for diagnostic reporting before full normalization
+        candidate_symbol = raw_record.get("symbol") or raw_record.get("ticker")
+        sym_str = str(candidate_symbol).strip().upper() if candidate_symbol else None
+
+        # 1. Normalization
+        try:
+            record = normalize_market_price(
+                raw_record,
+                source=normalized_source,
+            )
+        except (NormalizationError, TypeError, ValueError) as exc:
+            outcomes.append(
+                RecordLoadOutcome(
+                    index=index,
+                    symbol=sym_str,
+                    price_date=str(raw_record.get("price_date") or raw_record.get("date") or ""),
+                    outcome="REJECTED",
+                    reason=f"Normalization failed: {exc}",
+                )
+            )
+            continue
+
+        symbol = record.symbol
+        price_date = record.price_date
+
+        # 2. Validation
+        validation_errors = validate_market_price(record)
+        if validation_errors:
+            outcomes.append(
+                RecordLoadOutcome(
+                    index=index,
+                    symbol=symbol,
+                    price_date=price_date,
+                    outcome="REJECTED",
+                    reason="Validation failed: " + "; ".join(validation_errors),
+                )
+            )
+            continue
+
+        # 3. Storage and conflict check
+        try:
+            record_hash, outcome_status = store_market_price(
+                database_url,
+                symbol=symbol,
+                price_date=price_date,
+                open_price=record.open,
+                high=record.high,
+                low=record.low,
+                close=record.close,
+                adjusted_close=record.adjusted_close,
+                volume=record.volume,
+                source=record.source,
+                raw_payload=dict(raw_record),
+            )
+
+            store_provenance(
+                database_url,
+                record_type="market_price",
+                record_id=record_hash,
+                source=record.source,
+                source_reference=source_reference,
+                checksum=record_hash,
+                validation_status="validated",
+            )
+
+            outcomes.append(
+                RecordLoadOutcome(
+                    index=index,
+                    symbol=symbol,
+                    price_date=price_date,
+                    outcome=outcome_status,  # 'INSERTED' or 'DUPLICATE'
+                    record_hash=record_hash,
+                )
+            )
+
+        except MarketDataConflictError as exc:
+            outcomes.append(
+                RecordLoadOutcome(
+                    index=index,
+                    symbol=symbol,
+                    price_date=price_date,
+                    outcome="CONFLICT",
+                    reason=str(exc),
+                )
+            )
+        except Exception as exc:
+            outcomes.append(
+                RecordLoadOutcome(
+                    index=index,
+                    symbol=symbol,
+                    price_date=price_date,
+                    outcome="FAILED",
+                    reason=f"Storage error: {exc}",
+                )
+            )
+
+    return tuple(outcomes)
+
+
+def load_market_prices(
+    database_url: str,
+    payload: Any,
+    *,
+    source: str,
+    source_reference: str | None = None,
+) -> tuple[str, ...]:
+    """
+    Compatibility wrapper returning deterministic record hashes for valid records,
+    raising MarketDataLoadError if any record fails.
+    """
+
+    outcomes = load_market_prices_detailed(
+        database_url,
+        payload,
+        source=source,
+        source_reference=source_reference,
+    )
 
     hashes: list[str] = []
 
-    for index, record in enumerate(records):
-        try:
-            record_hash = ingest_market_price(
-                database_url,
-                record,
-                source=normalized_source,
-                source_reference=source_reference,
-            )
-
-        except (
-            IngestionError,
-            NormalizationError,
-            TypeError,
-            ValueError,
-        ) as exc:
+    for outcome in outcomes:
+        if outcome.outcome in {"REJECTED", "CONFLICT", "FAILED"}:
             raise MarketDataLoadError(
-                "Market-price ingestion failed at "
-                f"record {index}: {exc}"
-            ) from exc
-
-        hashes.append(record_hash)
+                f"Market-price ingestion failed at record {outcome.index}: {outcome.reason}"
+            )
+        if outcome.record_hash:
+            hashes.append(outcome.record_hash)
 
     return tuple(hashes)
 
@@ -151,42 +275,51 @@ def load_single_market_price(
             "record must be a mapping."
         )
 
-    normalized_source = str(source).strip()
+    outcomes = load_market_prices_detailed(
+        database_url,
+        [record],
+        source=source,
+        source_reference=source_reference,
+    )
 
-    if not normalized_source:
+    if not outcomes:
+        raise MarketDataLoadError("Empty record payload.")
+
+    outcome = outcomes[0]
+
+    if outcome.outcome in {"REJECTED", "CONFLICT", "FAILED"}:
         raise MarketDataLoadError(
-            "source cannot be empty."
+            f"Market-price ingestion failed: {outcome.reason}"
         )
 
-    try:
-        return ingest_market_price(
-            database_url,
-            record,
-            source=normalized_source,
-            source_reference=source_reference,
-        )
+    if not outcome.record_hash:
+        raise MarketDataLoadError("Record hash missing.")
 
-    except (
-        IngestionError,
-        NormalizationError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        raise MarketDataLoadError(
-            f"Market-price ingestion failed: {exc}"
-        ) from exc
+    return outcome.record_hash
 
 
 class MarketDataLoader:
     """
     Compatibility wrapper around the market-data loading functions.
-
-    The client is retained for future/provider-backed loading and does
-    not alter the existing ingestion functions.
     """
 
     def __init__(self, client: Any | None = None) -> None:
         self.client = client
+
+    def load_detailed(
+        self,
+        database_url: str,
+        payload: Any,
+        *,
+        source: str,
+        source_reference: str | None = None,
+    ) -> tuple[RecordLoadOutcome, ...]:
+        return load_market_prices_detailed(
+            database_url,
+            payload,
+            source=source,
+            source_reference=source_reference,
+        )
 
     def load(
         self,

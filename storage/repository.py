@@ -466,10 +466,11 @@ def store_market_price(
     volume: float | None,
     source: str,
     raw_payload: dict[str, Any] | None = None,
-) -> str:
+) -> tuple[str, str]:
     """
-    Store a normalized market-price record idempotently and return its hash.
+    Store a normalized market-price record idempotently and return (record_hash, outcome).
 
+    Outcome is either 'INSERTED' or 'DUPLICATE'.
     Raises MarketDataConflictError if a record for the same symbol/price_date/source
     already exists with materially different price data.
     """
@@ -512,7 +513,7 @@ def store_market_price(
         if existing is not None:
             existing_hash = _row_value(existing, "record_hash", index=0)
             if existing_hash == record_hash:
-                return record_hash
+                return record_hash, "DUPLICATE"
             raise MarketDataConflictError(
                 f"Data conflict: market price for symbol '{normalized_symbol}', date '{normalized_date}', "
                 f"source '{normalized_source}' already exists with different values."
@@ -590,7 +591,7 @@ def store_market_price(
 
         connection.commit()
 
-    return record_hash
+    return record_hash, "INSERTED"
 
 
 def store_corporate_action(
