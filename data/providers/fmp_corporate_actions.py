@@ -144,7 +144,7 @@ class FMPCorporateActionsProvider:
         symbol: str,
         start_date: str | None = None,
         end_date: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:
         """
         Retrieve historical stock splits for a symbol.
 
@@ -175,7 +175,7 @@ class FMPCorporateActionsProvider:
         symbol: str,
         start_date: str | None = None,
         end_date: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:
         """
         Retrieve historical dividends for a symbol.
 
@@ -204,7 +204,7 @@ class FMPCorporateActionsProvider:
         self,
         payload: Any,
         requested_symbol: str,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:
         if isinstance(payload, dict):
             if "Error Message" in payload or "error" in payload or "message" in payload:
                 err_msg = payload.get("Error Message") or payload.get("error") or payload.get("message")
@@ -218,9 +218,11 @@ class FMPCorporateActionsProvider:
         if not isinstance(items, list):
             raise CorporateActionsResponseError("FMP splits field must be a list.")
 
-        results: list[dict[str, Any]] = []
+        results: list[Any] = []
         for item in items:
             if not isinstance(item, dict):
+                # Pass through non-dict items so detailed loader accounts for them as REJECTED
+                results.append(item)
                 continue
 
             action_date = item.get("date") or item.get("executionDate") or item.get("action_date")
@@ -249,7 +251,7 @@ class FMPCorporateActionsProvider:
         self,
         payload: Any,
         requested_symbol: str,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Any]:
         if isinstance(payload, dict):
             if "Error Message" in payload or "error" in payload or "message" in payload:
                 err_msg = payload.get("Error Message") or payload.get("error") or payload.get("message")
@@ -263,9 +265,11 @@ class FMPCorporateActionsProvider:
         if not isinstance(items, list):
             raise CorporateActionsResponseError("FMP dividends field must be a list.")
 
-        results: list[dict[str, Any]] = []
+        results: list[Any] = []
         for item in items:
             if not isinstance(item, dict):
+                # Pass through non-dict items so detailed loader accounts for them as REJECTED
+                results.append(item)
                 continue
 
             action_date = item.get("date") or item.get("paymentDate") or item.get("declarationDate") or item.get("action_date")

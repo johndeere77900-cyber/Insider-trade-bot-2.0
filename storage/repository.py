@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -726,22 +727,28 @@ def store_corporate_action(
                 ):
                     diag_table = getattr(getattr(exc, "diag", None), "table_name", "") or ""
                     diag_constraint = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
-                    exc_str = str(exc).lower()
-                    if (
-                        not diag_table
-                        and not diag_constraint
-                    ) or (
-                        "corporate_actions" in diag_table
-                        or "corporate_actions" in diag_constraint
-                        or "corporate_actions" in exc_str
-                    ):
-                        is_expected_unique_race = True
+                    if diag_table or diag_constraint:
+                        if (
+                            (diag_table and diag_table == "corporate_actions")
+                            or (diag_constraint and ("corporate_actions" in diag_constraint or "idx_ca_uniq" in diag_constraint))
+                        ):
+                            is_expected_unique_race = True
             elif isinstance(exc, sqlite3.IntegrityError):
-                msg = str(exc).lower()
-                if "unique" in msg and not any(
-                    k in msg for k in ("foreign key", "not null", "check constraint")
-                ):
-                    is_expected_unique_race = True
+                msg = str(exc)
+                # Check for explicit SQLite UNIQUE constraint matching corporate_actions identity columns
+                # E.g. "UNIQUE constraint failed: corporate_actions.symbol, corporate_actions.action_type, corporate_actions.action_date, corporate_actions.source"
+                if "UNIQUE constraint failed:" in msg:
+                    match = re.search(r"UNIQUE constraint failed:\s*(.+)$", msg, re.IGNORECASE)
+                    if match:
+                        cols = {c.strip() for c in match.group(1).split(",")}
+                        expected = {
+                            "corporate_actions.symbol",
+                            "corporate_actions.action_type",
+                            "corporate_actions.action_date",
+                            "corporate_actions.source",
+                        }
+                        if cols == expected:
+                            is_expected_unique_race = True
 
             if is_expected_unique_race:
                 cursor = connection.execute(

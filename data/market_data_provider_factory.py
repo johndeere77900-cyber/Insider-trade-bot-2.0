@@ -42,8 +42,10 @@ def get_market_data_provider(
         url = base_url if base_url is not None else resolved_settings.fmp_base_url
 
         if not key:
-            # Fall back to os.environ directly if setting was not set in load_environment
             key = os.getenv("FMP_API_KEY", "").strip()
+
+        # Validate FMP configuration prior to provider instantiation
+        validate_fmp_config(resolved_settings)
 
         return FMPMarketDataProvider(
             api_key=key,

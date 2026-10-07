@@ -42,13 +42,15 @@ class CorporateActionLoadOutcome:
 
 def _extract_records(
     payload: Any,
-) -> list[Mapping[str, Any]]:
+) -> list[Any]:
     """
     Extract a list of corporate-action records from a provider response.
+    Returns list items as-is (including non-mapping items) so the detailed
+    loader can isolate per-record outcomes (e.g. REJECTED for non-mappings).
     """
 
     if isinstance(payload, list):
-        records = payload
+        return payload
 
     elif isinstance(payload, Mapping):
         records = None
@@ -71,22 +73,12 @@ def _extract_records(
                 "a supported record list."
             )
 
+        return records
+
     else:
         raise CorporateActionsLoadError(
             "Corporate-actions response must be a list or mapping."
         )
-
-    normalized: list[Mapping[str, Any]] = []
-
-    for index, record in enumerate(records):
-        if not isinstance(record, Mapping):
-            raise CorporateActionsLoadError(
-                f"Corporate-action record {index} is not an object."
-            )
-
-        normalized.append(record)
-
-    return normalized
 
 
 def load_corporate_actions_detailed(

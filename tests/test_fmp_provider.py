@@ -113,11 +113,23 @@ def test_fmp_provider_unadjusted_close_and_no_adjusted_close_substitution() -> N
         assert records[0]["adjusted_close"] is None
 
 
-def test_fmp_provider_explicit_adjusted_close_preserved() -> None:
-    """Verifies explicit adjusted-close data remains separate when supplied."""
+def test_fmp_provider_actual_non_split_adjusted_shape_mapping() -> None:
+    """
+    Regression test verifying FMP's actual non-split-adjusted endpoint response shape
+    containing adjOpen, adjHigh, adjLow, adjClose maps correctly to open, high, low, close
+    with adjusted_close remaining None.
+    """
     provider = FMPMarketDataProvider(api_key="dummy_key")
     raw_json = json.dumps([
-        {"symbol": "AAPL", "date": "2024-01-02", "open": 100.0, "high": 105.0, "low": 99.0, "close": 104.0, "adjClose": 103.5, "volume": 1000}
+        {
+            "symbol": "AAPL",
+            "date": "2025-12-31",
+            "adjOpen": 273.06,
+            "adjHigh": 273.68,
+            "adjLow": 271.75,
+            "adjClose": 271.86,
+            "volume": 27293639,
+        }
     ]).encode("utf-8")
 
     with patch("data.providers.fmp_market_data.urlopen") as mock_urlopen:
@@ -127,8 +139,16 @@ def test_fmp_provider_explicit_adjusted_close_preserved() -> None:
         mock_urlopen.return_value.__enter__.return_value = mock_resp
 
         records = provider.get_historical_prices(symbol="AAPL")
-        assert records[0]["close"] == 104.0
-        assert records[0]["adjusted_close"] == 103.5
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["symbol"] == "AAPL"
+        assert rec["price_date"] == "2025-12-31"
+        assert rec["open"] == 273.06
+        assert rec["high"] == 273.68
+        assert rec["low"] == 271.75
+        assert rec["close"] == 271.86
+        assert rec["volume"] == 27293639
+        assert rec["adjusted_close"] is None
 
 
 def test_fmp_provider_valid_empty_response() -> None:
@@ -461,7 +481,7 @@ def test_store_corporate_action_unique_constraint_race_cases(tmp_path) -> None:
     raw_diff = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "10:1", "source": "fmp"}
 
     def mock_connect_b(url):
-        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=sqlite3.IntegrityError("UNIQUE constraint failed"))
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=sqlite3.IntegrityError("UNIQUE constraint failed: corporate_actions.symbol, corporate_actions.action_type, corporate_actions.action_date, corporate_actions.source"))
 
     with patch("storage.repository.connect", side_effect=mock_connect_b):
         hash_res_b, outcome_b = store_corporate_action(
@@ -508,13 +528,13 @@ def test_unrelated_integrity_error_propagates(tmp_path) -> None:
             )
 
 
-def test_unrelated_integrity_error_does_not_mask_existing_identity(tmp_path) -> None:
+def test_unrelated_unique_integrity_error_does_not_mask_existing_identity(tmp_path) -> None:
     """
     Regression test proving that when a corporate-action identity ALREADY EXISTS,
-    an unrelated IntegrityError (e.g., FOREIGN KEY failure) on a second write attempt
-    is re-raised and NOT converted into DUPLICATE or CONFLICT.
+    an unrelated IntegrityError (e.g. UNIQUE constraint on an unrelated table or foreign key)
+    on a second write attempt is re-raised and NOT converted into DUPLICATE or CONFLICT.
     """
-    db_url = f"sqlite:///{tmp_path}/ca_unrelated_integrity_mask_test.db"
+    db_url = f"sqlite:///{tmp_path}/ca_unrelated_unique_mask_test.db"
     initialize_database(db_url)
 
     raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
@@ -533,15 +553,15 @@ def test_unrelated_integrity_error_does_not_mask_existing_identity(tmp_path) -> 
     assert o1 == "INSERTED"
     assert count_records(db_url, "corporate_actions") == 1
 
-    # 2. Simulate an unrelated IntegrityError on second write during race
+    # 2. Simulate an unrelated UNIQUE IntegrityError (e.g. on another_table.code) during write race
     real_connect = connect
-    foreign_key_err = sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+    unrelated_unique_err = sqlite3.IntegrityError("UNIQUE constraint failed: another_table.code")
 
-    def mock_connect_fk(url):
-        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=foreign_key_err)
+    def mock_connect_unrelated(url):
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=unrelated_unique_err)
 
-    with patch("storage.repository.connect", side_effect=mock_connect_fk):
-        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+    with patch("storage.repository.connect", side_effect=mock_connect_unrelated):
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed: another_table.code"):
             store_corporate_action(
                 db_url,
                 symbol="AAPL",
@@ -561,6 +581,46 @@ def test_unrelated_integrity_error_does_not_mask_existing_identity(tmp_path) -> 
         assert row[0] == "4:1"
 
     assert count_records(db_url, "corporate_actions") == 1
+
+
+def test_postgresql_style_unrelated_23505_integrity_error_propagates(tmp_path) -> None:
+    """
+    Regression test proving that a PostgreSQL-style IntegrityError with SQLSTATE 23505
+    targeting an unrelated table or without corporate_actions diagnostic info re-raises
+    and is NOT converted to DUPLICATE or CONFLICT.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_pg_unrelated_23505.db"
+    initialize_database(db_url)
+
+    raw1 = {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1", "source": "fmp"}
+    store_corporate_action(db_url, symbol="AAPL", action_type="split", action_date="2020-08-31", ratio="4:1", cash_amount=None, source="fmp", raw_payload=raw1)
+
+    class MockPGDiag:
+        table_name = "other_table"
+        constraint_name = "other_table_pkey"
+
+    class MockPGUniqueViolation(Exception):
+        pgcode = "23505"
+        diag = MockPGDiag()
+
+    real_connect = connect
+
+    def mock_connect_pg(url):
+        return MockRaceConnectionWrapper(real_connect(url), err_to_raise=MockPGUniqueViolation("Unrelated 23505"))
+
+    with patch("storage.repository.PSYCOPG_INTEGRITY_ERRORS", (MockPGUniqueViolation,)):
+        with patch("storage.repository.connect", side_effect=mock_connect_pg):
+            with pytest.raises(MockPGUniqueViolation):
+                store_corporate_action(
+                    db_url,
+                    symbol="AAPL",
+                    action_type="split",
+                    action_date="2020-08-31",
+                    ratio="4:1",
+                    cash_amount=None,
+                    source="fmp",
+                    raw_payload=raw1,
+                )
 
 
 def test_store_corporate_action_non_integrity_failure_propagates(tmp_path) -> None:
@@ -807,6 +867,28 @@ def test_mixed_outcome_accounting_equation(tmp_path) -> None:
     # Exact accounting invariant
     total_processed = len(mixed_payload)
     assert inserted + duplicate + conflict + rejected + failed == total_processed
+
+
+def test_corporate_actions_loader_malformed_item_isolated_as_rejected(tmp_path) -> None:
+    """
+    Regression test proving that a response containing valid, malformed, valid items
+    isolates the malformed item as REJECTED without aborting the valid records.
+    """
+    db_url = f"sqlite:///{tmp_path}/ca_malformed_isolated.db"
+    initialize_database(db_url)
+
+    payload = [
+        {"symbol": "AAPL", "action_type": "split", "action_date": "2020-08-31", "ratio": "4:1"},
+        "NOT_A_DICTIONARY",  # Malformed item
+        {"symbol": "MSFT", "action_type": "split", "action_date": "2023-01-01", "ratio": "2:1"},
+    ]
+
+    outcomes = load_corporate_actions_detailed(db_url, payload, source="fmp")
+    assert len(outcomes) == 3
+    assert outcomes[0].outcome == "INSERTED"
+    assert outcomes[1].outcome == "REJECTED"
+    assert outcomes[2].outcome == "INSERTED"
+    assert count_records(db_url, "corporate_actions") == 2
 
 
 def test_symbol_status_semantics_success_partial_failed(tmp_path) -> None:

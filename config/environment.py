@@ -241,10 +241,12 @@ def load_environment(
 
     # FMP configuration
     fmp_api_key = source.get("FMP_API_KEY", "").strip()
-    fmp_base_url = (
-        source.get("FMP_BASE_URL", "https://financialmodelingprep.com/stable").strip()
-        or "https://financialmodelingprep.com/stable"
-    )
+
+    raw_fmp_base_url = source.get("FMP_BASE_URL")
+    if raw_fmp_base_url is not None:
+        fmp_base_url = raw_fmp_base_url.strip()
+    else:
+        fmp_base_url = "https://financialmodelingprep.com/stable"
 
     return EnvironmentSettings(
         environment=environment,

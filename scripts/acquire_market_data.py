@@ -108,7 +108,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(args)
 
 
-def run_acquisition(args: argparse.Namespace) -> MarketDataAcquisitionReport:
+def run_acquisition(args: argparse.Namespace) -> tuple[MarketDataAcquisitionReport, int]:
     settings = load_environment()
     db_url = args.database_url.strip() or settings.database_url
 
