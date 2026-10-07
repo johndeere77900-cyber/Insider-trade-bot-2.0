@@ -31,8 +31,10 @@ def get_archive_backend(
     b_type = (backend_type or "filesystem").strip().lower()
     env = (environment or "").strip().lower()
 
+    from config.environment import EnvironmentConfigurationError
+
     if env in {"production", "staging"} and b_type == "filesystem":
-        raise ValueError(
+        raise EnvironmentConfigurationError(
             f"Archive backend 'filesystem' is prohibited in '{env}' environment. "
             "SEC archive backend must be explicitly configured as S3/R2."
         )

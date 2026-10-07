@@ -52,19 +52,20 @@ class SignalEngine:
         sell_count = feats.get("insider_sell_count", 0.0)
         tx_val = feats.get("total_transaction_value", 0.0)
 
-        # Simple deterministic rules-based placeholder logic for research evaluation
+        # Deterministic rules-based ranking score for research evaluation.
+        # Score is a research ranking metric, NOT a probability or expected return.
+        # Confidence is None because this placeholder rules engine is uncalibrated.
+        confidence = None
+
         if buy_count > sell_count:
             direction = "long"
             score = min(1.0, 0.5 + (buy_count * 0.1))
-            confidence = 0.8 if tx_val > 10000.0 else 0.5
         elif sell_count > buy_count:
             direction = "short"
             score = min(1.0, 0.5 + (sell_count * 0.1))
-            confidence = 0.8 if tx_val > 10000.0 else 0.5
         else:
             direction = "neutral"
             score = 0.0
-            confidence = 0.0
 
         # Deterministic signal ID generated using SHA-256 digest of stable inputs
         norm_snapshot = {k: round(v, 6) for k, v in sorted(feats.items())}

@@ -214,6 +214,8 @@ def test_s3_archive_cases_a_through_f(tmp_path) -> None:
             nonlocal fail_manifest_write
             if fail_manifest_write and Key.endswith(".json"):
                 raise ArchiveError("Simulated network failure on manifest upload")
+            if kwargs.get("IfNoneMatch") == "*" and Key in store:
+                raise Exception("PreconditionFailed 412")
             store[Key] = Body
 
         def delete_object(self, Bucket: str, Key: str):

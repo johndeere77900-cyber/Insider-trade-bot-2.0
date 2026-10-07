@@ -69,6 +69,34 @@ def test_verify_dataset_coverage_missing_rows_raises_integrity_error(tmp_path) -
         )
 
 
+def test_verify_dataset_coverage_dates_outside_requested_period_raises_error(tmp_path) -> None:
+    db_url = f"sqlite:///{tmp_path}/verify_coverage_dates_outside.db"
+    initialize_database(db_url)
+
+    # Ingestion_state claims 2024-Q1 COMPLETED, but rows actually belong to 2023-Q4
+    with connect(db_url) as conn:
+        conn.execute(
+            "INSERT INTO ingestion_state (period, status, records_inserted, completed_at) VALUES (?, ?, ?, ?)",
+            ("2024-Q1", "COMPLETED", 1, "2024-04-01T00:00:00Z"),
+        )
+        conn.execute(
+            """
+            INSERT INTO insider_transactions
+            (source, accession_number, issuer_cik, filing_date, transaction_date, record_hash, created_at)
+            VALUES
+            ('sec', 'acc1', 'cik1', '2023-12-15', '2023-12-10', 'hash1', 'now')
+            """
+        )
+        conn.commit()
+
+    with pytest.raises(DatasetIntegrityError, match="Dataset coverage verification failed"):
+        verify_dataset_coverage(
+            database_url=db_url,
+            dataset_type="sec",
+            period="2024-Q1",
+        )
+
+
 def test_verify_dataset_coverage_not_completed_status_raises_integrity_error(tmp_path) -> None:
     db_url = f"sqlite:///{tmp_path}/verify_coverage_incomplete_status.db"
     initialize_database(db_url)

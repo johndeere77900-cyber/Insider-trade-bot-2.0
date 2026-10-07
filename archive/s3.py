@@ -276,23 +276,38 @@ class S3SECArchive(SECArchiveInterface):
             zip_bytes = bytes(content)
 
         client = self._get_client()
-        try:
-            # Try conditional write if supported by client/mock
-            client.put_object(Bucket=self.bucket, Key=zip_key, Body=zip_bytes, IfNoneMatch="*")
-        except Exception as exc:
-            # Handle PreconditionFailed / 412 race condition where another worker created the object concurrently
-            exc_str = str(exc).lower()
-            if "412" in exc_str or "preconditionfailed" in exc_str or "precondition failed" in exc_str:
-                existing_meta = self.metadata(norm_period)
-                if existing_meta.sha256 == calc_sha256:
-                    return existing_meta
-                else:
-                    raise ArchiveExistsError(
-                        f"Concurrent upload conflict for period '{norm_period}': Archive already exists with different SHA-256."
-                    ) from exc
+        if not zip_exists:
+            try:
+                # Try conditional write if supported by client/mock
+                client.put_object(Bucket=self.bucket, Key=zip_key, Body=zip_bytes, IfNoneMatch="*")
+            except Exception as exc:
+                # Handle PreconditionFailed / 412 race condition where another worker created the object concurrently
+                exc_str = str(exc).lower()
+                if "412" in exc_str or "preconditionfailed" in exc_str or "precondition failed" in exc_str:
+                    try:
+                        existing_meta = self.metadata(norm_period)
+                        if existing_meta.sha256 == calc_sha256:
+                            return existing_meta
+                        else:
+                            raise ArchiveExistsError(
+                                f"Concurrent upload conflict for period '{norm_period}': Archive already exists with different SHA-256."
+                            ) from exc
+                    except ArchiveNotFoundError:
+                        # Manifest was not uploaded yet by racing worker, inspect ZIP bytes directly
+                        try:
+                            existing_obj = client.get_object(Bucket=self.bucket, Key=zip_key)
+                            existing_bytes = existing_obj["Body"].read()
+                            existing_sha, _ = self._compute_sha256(existing_bytes)
+                        except Exception as inner_exc:
+                            raise ArchiveError(f"Failed to inspect concurrent ZIP object '{zip_key}': {inner_exc}") from inner_exc
 
-            # If client does not accept IfNoneMatch parameter in mock, fail safely with ArchiveError rather than falling back to unconditional overwrite
-            raise ArchiveError(f"Failed to upload ZIP archive key '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
+                        if existing_sha != calc_sha256:
+                            raise ArchiveExistsError(
+                                f"Concurrent upload conflict for period '{norm_period}': ZIP exists with different SHA-256."
+                            ) from exc
+
+                else:
+                    raise ArchiveError(f"Failed to upload ZIP archive key '{zip_key}' in bucket '{self.bucket}': {exc}") from exc
 
         retrieved_at = datetime.now(timezone.utc).isoformat()
 
@@ -320,10 +335,21 @@ class S3SECArchive(SECArchiveInterface):
             )
 
         manifest_bytes = json.dumps(final_meta.to_dict(), indent=2).encode("utf-8")
-        try:
-            client.put_object(Bucket=self.bucket, Key=manifest_key, Body=manifest_bytes)
-        except Exception as exc:
-            raise ArchiveError(f"Failed to upload manifest key '{manifest_key}' in bucket '{self.bucket}': {exc}") from exc
+        if not manifest_exists:
+            try:
+                client.put_object(Bucket=self.bucket, Key=manifest_key, Body=manifest_bytes, IfNoneMatch="*")
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                if "412" in exc_str or "preconditionfailed" in exc_str or "precondition failed" in exc_str:
+                    existing_meta = self.metadata(norm_period)
+                    if existing_meta.sha256 == calc_sha256:
+                        return existing_meta
+                    else:
+                        raise ArchiveExistsError(
+                            f"Concurrent manifest upload conflict for period '{norm_period}': Manifest already exists with different SHA-256."
+                        ) from exc
+
+                raise ArchiveError(f"Failed to upload manifest key '{manifest_key}' in bucket '{self.bucket}': {exc}") from exc
 
         return final_meta
 

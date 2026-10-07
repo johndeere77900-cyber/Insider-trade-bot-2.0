@@ -128,9 +128,20 @@ def verify_dataset_coverage(
         else:
             raise ValueError(f"Unsupported dataset_type '{dataset_type}' for verification.")
 
+    q_start, q_end = _quarter_date_range(norm_period)
+
+    # Date range validation: records must exist and belong to requested quarter
+    has_valid_dates = (
+        first_date is not None
+        and last_date is not None
+        and first_date >= q_start
+        and last_date <= q_end
+    )
+
     is_complete = (
         status == "COMPLETED"
         and actual_records > 0
+        and has_valid_dates
         and (expected_records is None or actual_records >= expected_records)
     )
 

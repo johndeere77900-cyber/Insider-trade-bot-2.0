@@ -82,6 +82,7 @@ def test_research_pipeline_end_to_end_integrity() -> None:
     assert signal.direction == "long"
     assert signal.score > 0.0
     assert signal.signal_date == "2024-05-10"
+    assert signal.confidence is None
 
     # 7. Backtest execution using RAW prices on eligible future observation date
     backtest_trade = BacktestTrade(

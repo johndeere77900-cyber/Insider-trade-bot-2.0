@@ -46,10 +46,12 @@ class FeatureEngine:
             raise ValueError("Event must contain a valid event_date.")
 
         # Extract insider transactions if present in context or event
-        has_history = ("historical_transactions" in ctx) or ("historical_transactions" in event)
-        history = ctx.get("historical_transactions") if "historical_transactions" in ctx else event.get("historical_transactions")
-        if not has_history:
-            history = [event]
+        if "historical_transactions" in ctx:
+            history = ctx.get("historical_transactions")
+        elif "historical_transactions" in event:
+            history = event.get("historical_transactions")
+        else:
+            history = []
 
         insider_tx_count = 0.0
         insider_buy_count = 0.0
